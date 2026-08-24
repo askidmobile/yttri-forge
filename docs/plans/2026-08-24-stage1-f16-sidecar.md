@@ -118,8 +118,11 @@ mask.rs (реальные имена: linear_attn.in_proj_*/out_proj + self_attn
 main.rs (--f16-heavy/--list/--gguf/-o, BF16 clamp). Тест round-trip зелёный.
 УТОЧНЕНО ПО ФАКТУ: heavy = 24×5 DeltaNet + 8×4 attn = 152 тензора (не 9 групп имён).
 
-### Phase 2: Парсер в форке (estimate: 4h)
+### Phase 2: Парсер в форке (estimate: 4h) — ✅ ГОТОВО
 см. Layer 2. **Check:** юнит-тест round-trip.
+Реализовано: real/ytf16.rs (mmap Reader, manifest через serde_json::Value — без нового dep);
+tests/ytf16_compat.rs — независимый hand-built writer проверяет совместимость форматов. 2/2 green.
+Форк-коммит после c660591.
 
 ### Phase 3: Загрузчик + мапинг (estimate: 6h)
 см. Layer 3. **Check:** лог mapped/WARN.
