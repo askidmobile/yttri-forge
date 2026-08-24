@@ -102,6 +102,7 @@ fn run(args: &Args) -> Result<(), String> {
             index.insert(name.to_string(), vec![info.shape.len()]);
         }
     }
+    println!("safetensors index: {} tensors; sample: {:?}", index.len(), index.keys().take(3).collect::<Vec<_>>());
 
     // Классифицируем слои
     let mut layers_delta: Vec<u32> = Vec::new();
@@ -141,7 +142,7 @@ fn run(args: &Args) -> Result<(), String> {
             "linear_attn.in_proj_b.weight",
             "linear_attn.out_proj.weight",
         ] {
-            let st_name = format!("language_model.layers.{i}.{suffix}");
+            let st_name = format!("model.language_model.layers.{i}.{suffix}");
             if let Some(gguf_t) = mask::resolve(mask::LayerKind::DeltaNet, suffix) {
                 if index.contains_key(&st_name) {
                     plan.push(Plan {
@@ -162,7 +163,7 @@ fn run(args: &Args) -> Result<(), String> {
             "self_attn.v_proj.weight",
             "self_attn.o_proj.weight",
         ] {
-            let st_name = format!("language_model.layers.{i}.{suffix}");
+            let st_name = format!("model.language_model.layers.{i}.{suffix}");
             if let Some(gguf_t) = mask::resolve(mask::LayerKind::Attention, suffix) {
                 if index.contains_key(&st_name) {
                     plan.push(Plan {

@@ -40,7 +40,9 @@ pub enum LayerKind {
 /// Классифицировать тензор safetensors по имени.
 /// Возвращает (layer_index, kind, суффикс) или None если вне слоёв.
 pub fn classify(name: &str) -> Option<(u32, LayerKind, String)> {
-    let rest = name.strip_prefix("language_model.layers.")?;
+    let rest = name
+        .strip_prefix("model.language_model.layers.")
+        .or_else(|| name.strip_prefix("language_model.layers."))?;
     let dot = rest.find('.')?;
     let idx: u32 = rest[..dot].parse().ok()?;
     let suffix = &rest[dot + 1..];
