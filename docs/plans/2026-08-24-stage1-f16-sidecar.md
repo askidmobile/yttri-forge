@@ -124,8 +124,12 @@ main.rs (--f16-heavy/--list/--gguf/-o, BF16 clamp). Тест round-trip зелё
 tests/ytf16_compat.rs — независимый hand-built writer проверяет совместимость форматов. 2/2 green.
 Форк-коммит после c660591.
 
-### Phase 3: Загрузчик + мапинг (estimate: 6h)
+### Phase 3: Загрузчик + мапинг (estimate: 6h) — ✅ ГОТОВО
 см. Layer 3. **Check:** лог mapped/WARN.
+Реализовано: ModelWeights::attach_ytf16 (sha256 GGUF, per-layer Option<QMatMul> TensorF16,
+device из адаптера), вызов из adapter.load после загрузки модели.
+ВНИМАНИЕ (методология): сборка/тесты — на yttri-win через VS DevCmd (nvcc требует cl.exe);
+локальный test_ytf16.bat обёртка с окружением. Дубликат paged_window устранён.
 
 ### Phase 4: Dual-read prefill (estimate: 8h)
 см. Layer 4. **Check:** decode-regression нет.
