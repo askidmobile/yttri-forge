@@ -33,3 +33,23 @@ Host launch overhead снят CUDA graphs; остаток — скорость �
 | llama.cpp GGUF | K-quants/IQ + MMQ/MMVQ | эталон decode; их MMQ портирован у нас |
 | vLLM/AWQ | W4A16 pack + dequant-in-registers | готовые AWQ ядра для порта (этап 2) |
 | TensorRT-LLM | собственные форматы per-layer | доказывает жизнеспособность подхода «формат под железо» |
+
+
+## Этап 0: профиль префилла (gate R-TARGET) — ПРОЙДЕН (2026-08-24)
+
+Qwen3.5-4B Q4_K_M @8K, GPROF=3 sync-замеры (wall 2.71с с синками):
+
+| Фаза | мс | Доля |
+|---|---|---|
+| DeltaNet proj (matmul) | 790 | 35% |
+| DeltaNet head/ssm_out (matmul) | 543 | 24% |
+| DeltaNet fused (рекуррентность) | 563 | 25% |
+| Attention FA2 | 365 | 16% |
+| Прочее (attn proj/wo/kv) | 21 | 1% |
+
+**Matmul-проекции = 59% ≥ 40% gate.** F16-сайдкар попадает в цель.
+Открытие: ssm_out — скрытый matmul 24%, включён в дефолтную маску
+(`--f16-attn-all` → переименовать смысл в "все тяжёлые проекции":
+attn.wq/wk/wv/wo, deltanet.wqkv/wgate/w_beta/w_alpha/ssm_out).
+Рекуррентность (25%) и FA2 (16%) — вне scope этапа 1.
+Инструментация оставлена в форке под QWEN36_GPROF=3 ([pfp-delta]/[pfp-attn]).
