@@ -111,8 +111,12 @@ flowchart TD
 
 ## Implementation phases
 
-### Phase 1: Контейнер + конвертер (estimate: 6h)
+### Phase 1: Контейнер + конвертер (estimate: 6h) — ✅ ГОТОВО (c660591)
 см. Layer 1. **Check:** round-trip + --list.
+Реализовано: workspace forge-convert, container.rs (YTF1, стриминг+finalize-patch),
+mask.rs (реальные имена: linear_attn.in_proj_*/out_proj + self_attn.*_proj),
+main.rs (--f16-heavy/--list/--gguf/-o, BF16 clamp). Тест round-trip зелёный.
+УТОЧНЕНО ПО ФАКТУ: heavy = 24×5 DeltaNet + 8×4 attn = 152 тензора (не 9 групп имён).
 
 ### Phase 2: Парсер в форке (estimate: 4h)
 см. Layer 2. **Check:** юнит-тест round-trip.
