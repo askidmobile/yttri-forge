@@ -27,9 +27,16 @@ docs/
   plans/       планы реализации
 ```
 
-## Связанные репозитории
+## Структура движка
+
+`engine/` — полный candle-fork, мигрирован через git subtree
+(`a29344e9`, исходная точка 05aa926a). ВСЯ разработка движка теперь здесь.
+askidmobile/candle заморожен как референс.
+
+Сборка на yttri-win: `D:\Projects\yttri-inference\inference-build.bat`
+указывает на `<clone>/engine/qwen35-batch`.
 
 | Репо | Роль |
 |---|---|
-| askidmobile/candle (fork, master d614d47d) | движок, ядра |
+| askidmobile/candle (ЗАМОРОЖЕН на 05aa926a) | исторический референс |
 | askidmobile/qwen36-server (main ef76eb7) | сервер, планировщик |
