@@ -1,19 +1,12 @@
-# Project tasks
-
-> Managed by the `task-tracker` skill via `tasks.py`. Don't edit by hand.
-> CLI commands: `/tasks`, `/tasks active`, `/tasks add "..."`.
->
-> Keep this file small — it's read into context every session. Finished tasks
-> leave via `/tasks archive T-XXX` (or `archive-done`) into `TASKS_ARCHIVE.md`,
-> past years via `/tasks rotate-archive`. A backlog that outgrows the file
-> moves out with `/tasks split-backlog`.
+# TASKS
 
 ## 🚀 Active tasks
 
-| ID | Date | Task | Plan | Status |
-|----|------|------|------|--------|
+| # | Task | Status | Plan |
+|---|------|--------|------|
+| T-001 | 2026-08-24 | yttri-forge stage 1: F16 sidecar converter + dual-read loader | [`2026-08-24-stage1-f16-sidecar.md`](docs/plans/2026-08-24-stage1-f16-sidecar.md) | 📝 Planning |
 
-## 📦 Backlog
+## ✅ Done
 
-| ID | Date | Task | Plan | Note |
-|----|------|------|------|------|
+| # | Task | Status | Plan |
+|---|------|--------|------|
