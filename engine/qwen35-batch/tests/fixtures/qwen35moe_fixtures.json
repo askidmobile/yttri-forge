@@ -1,0 +1,214 @@
+{
+  "schema_version": "qwen36-fixtures-v1",
+  "description": "Fixture prompts for Qwen3.6 35B-A3B MoE parity, benchmark, and stability validation. Used by Phase 8 (JSONL parity), Phase 9 (comparative benchmark), and Phase 10/11 (hardware acceptance). Each fixture has a stable name, purpose, and deterministic prompt text.",
+  "fixtures": [
+    {
+      "name": "short_deterministic",
+      "purpose": "Greedy parity: short prompt with a single deterministic continuation. Used for logit/token comparison against llama.cpp.",
+      "max_output_tokens": 32,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant. Answer concisely."
+        },
+        {
+          "role": "user",
+          "content": "What is the capital of France? Answer with one word."
+        }
+      ]
+    },
+    {
+      "name": "multi_chunk_prefill",
+      "purpose": "Exercise chunked prefill with a prompt exceeding one PREFILL_CHUNK boundary. Verifies output invariance across chunk sizes.",
+      "max_output_tokens": 64,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a technical writer. Summarize the following text in three bullet points."
+        },
+        {
+          "role": "user",
+          "content": "The Rust programming language is a systems programming language that runs blazingly fast, prevents segfaults, and guarantees thread safety. It has a rich type system with ownership and borrowing rules enforced at compile time. Rust's zero-cost abstractions allow high-level ergonomics without runtime overhead. The language has grown rapidly in adoption for embedded systems, web servers, command-line tools, and WebAssembly. Rust's package manager, Cargo, provides dependency management, testing, and documentation generation in a single tool. The compiler produces clear error messages that guide developers toward correct code. Rust's trait system enables ad-hoc polymorphism without the complexity of traditional object-oriented inheritance. Pattern matching, algebraic data types, and error handling via Result and Option are core ergonomic features. The async/await syntax enables efficient concurrent programming without thread overhead. Rust's borrow checker is the defining feature that ensures memory safety without a garbage collector. It enforces that each value has exactly one owner at a time, preventing use-after-free, double-free, and data races. Lifetimes track how long references are valid, and the compiler verifies that no reference outlives its referent. Interior mutability patterns like RefCell and Mutex allow controlled mutation when the borrow checker's default rules are too strict. Unsafe Rust provides an escape hatch for low-level operations like FFI and raw pointer manipulation, clearly marked and audited. The Rust standard library provides collections, I/O, concurrency primitives, and platform abstractions. The ecosystem includes Serde for serialization, Tokio for async runtime, and Actix for web frameworks. Rust's focus on correctness, performance, and developer productivity has made it a top choice for performance-critical and safety-critical software."
+        }
+      ]
+    },
+    {
+      "name": "tool_call",
+      "purpose": "Tool-calling parity: model selects a tool from a provided function list. Verifies tool call format across all three APIs.",
+      "max_output_tokens": 128,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "The city name."
+                }
+              },
+              "required": ["city"]
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the weather in Tokyo right now?"
+        }
+      ]
+    },
+    {
+      "name": "near_context_truncation",
+      "purpose": "Prompt that approaches the 81,920-token context limit. Verifies exact truncation: system prompt retained, oldest complete user/assistant pairs removed, truncated flag exposed.",
+      "max_output_tokens": 16,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a conversation assistant. Maintain context across the conversation."
+        },
+        {
+          "role": "user",
+          "content": "[TRUNCATION_FIXTURE_PLACEHOLDER: this fixture is populated at runtime with enough user/assistant pairs to approach the 81920-token limit. The harness generates N pairs of ~500 tokens each until the total prompt is within 2000 tokens of the limit, then adds a final user message asking for a one-sentence summary.]"
+        }
+      ],
+      "runtime_population": {
+        "instruction": "Generate N user/assistant pairs of approximately 500 tokens each until the total token count is within 2000 tokens of the 81920 context limit. The final user message asks: 'Summarize this conversation in one sentence.' The harness verifies that the system prompt is retained and that the response exposes truncated=true."
+      }
+    },
+    {
+      "name": "snapshot_reuse",
+      "purpose": "Reusable prefix for snapshot/prompt-cache parity. Two requests share the same long prefix; the second restores a compatible snapshot. Verifies logits match uncached execution.",
+      "max_output_tokens": 32,
+      "shared_prefix_messages": [
+        {
+          "role": "system",
+          "content": "You are a code reviewer. Review the following Rust function for correctness and suggest improvements."
+        },
+        {
+          "role": "user",
+          "content": "fn fibonacci(n: u64) -> u64 {\n    if n <= 1 { return n; }\n    fibonacci(n - 1) + fibonacci(n - 2)\n}\n\nReview this implementation and suggest improvements for performance and correctness."
+        }
+      ],
+      "suffix_a": {
+        "role": "user",
+        "content": "What is the time complexity of this implementation?"
+      },
+      "suffix_b": {
+        "role": "user",
+        "content": "How would you memoize this function?"
+      }
+    },
+    {
+      "name": "batch_shrink",
+      "purpose": "Continuous batching compaction: four slots start simultaneously, then slots finish/cancel one at a time. Verifies remaining slots produce outputs matching their isolated deterministic runs.",
+      "max_output_tokens": 64,
+      "slots": [
+        {
+          "slot_id": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Count from 1 to 20."
+            }
+          ],
+          "cancel_at_token": 10
+        },
+        {
+          "slot_id": 1,
+          "messages": [
+            {
+              "role": "user",
+              "content": "List five prime numbers."
+            }
+          ],
+          "finish_naturally": true
+        },
+        {
+          "slot_id": 2,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Name three European cities."
+            }
+          ],
+          "finish_naturally": true
+        },
+        {
+          "slot_id": 3,
+          "messages": [
+            {
+              "role": "user",
+              "content": "What is 2+2?"
+            }
+          ],
+          "cancel_at_token": 4
+        }
+      ]
+    },
+    {
+      "name": "long_generation_slot_0",
+      "purpose": "Four-slot long generation stability fixture — slot 0. One of four concurrent 8K-16K output generations for stability/memory telemetry.",
+      "max_output_tokens": 12288,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a creative writer. Write a detailed fantasy story."
+        },
+        {
+          "role": "user",
+          "content": "Write a long fantasy story about a kingdom of stone golems awakening after a thousand-year slumber. Include detailed descriptions of the world, characters, and conflicts. Write at least 12000 words."
+        }
+      ]
+    },
+    {
+      "name": "long_generation_slot_1",
+      "purpose": "Four-slot long generation stability fixture — slot 1.",
+      "max_output_tokens": 12288,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a technical instructor. Explain programming concepts in detail."
+        },
+        {
+          "role": "user",
+          "content": "Explain the Rust ownership and borrowing system in exhaustive detail, covering move semantics, borrow rules, lifetimes, interior mutability, and common patterns. Include code examples for each concept. Write at least 12000 words."
+        }
+      ]
+    },
+    {
+      "name": "long_generation_slot_2",
+      "purpose": "Four-slot long generation stability fixture — slot 2.",
+      "max_output_tokens": 12288,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a science educator. Explain physics topics clearly."
+        },
+        {
+          "role": "user",
+          "content": "Explain quantum mechanics from first principles, covering wave-particle duality, the Schrodinger equation, quantum entanglement, measurement problem, and interpretations. Include historical context and thought experiments. Write at least 12000 words."
+        }
+      ]
+    },
+    {
+      "name": "long_generation_slot_3",
+      "purpose": "Four-slot long generation stability fixture — slot 3.",
+      "max_output_tokens": 12288,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a historian. Write detailed historical narratives."
+        },
+        {
+          "role": "user",
+          "content": "Write a comprehensive history of the Byzantine Empire from its founding to its fall, covering major emperors, wars, cultural achievements, and the legacy of Byzantium. Write at least 12000 words."
+        }
+      ]
+    }
+  ]
+}

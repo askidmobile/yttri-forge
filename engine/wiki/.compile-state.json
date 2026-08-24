@@ -1,0 +1,20 @@
+{
+  "last_compiled": "2026-08-08",
+  "topics": ["project-overview", "qwen35-batch", "candle-core", "candle-examples", "infrastructure"],
+  "concepts": ["batch-axis-wall", "parity-first-prototyping"],
+  "source_locations": [
+    "README.md", "CHANGELOG.md", "Cargo.toml", "Makefile",
+    ".pre-commit-config.yaml",
+    ".github/workflows/rust-ci.yml", ".github/workflows/ci_cuda.yaml",
+    ".github/workflows/python.yml", ".github/workflows/maturin.yml",
+    "qwen35-batch/Cargo.toml", "qwen35-batch/REAL_MODEL.md",
+    "qwen35-batch/src/lib.rs", "qwen35-batch/src/model.rs",
+    "qwen35-batch/src/scheduler.rs", "qwen35-batch/src/slot.rs",
+    "qwen35-batch/src/real/adapter.rs",
+    "candle-core/README.md", "candle-nn/README.md",
+    "candle-transformers/README.md", "candle-examples/README.md",
+    "candle-pyo3/README.md", "candle-onnx/README.md",
+    "candle-wasm-examples/bert/README.md"
+  ],
+  "total_sources_scanned": 23
+}

@@ -1,0 +1,2 @@
+$j = Get-Content -Raw 'D:\Projects\yttri-build\inspect27iq.json' | ConvertFrom-Json
+$j.tensors | Where-Object { $_.dtype -eq 'IQ2_XXS' -and $_.name -like 'blk.0.*' } | ForEach-Object { $_.name + ' shape=' + ($_.shape -join 'x') }

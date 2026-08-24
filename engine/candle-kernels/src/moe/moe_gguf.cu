@@ -1,0 +1,172 @@
+/**
+ * @brief CUDA kernel for Mixture-of-Experts (MoE) GEMM using GGUF quantized weights.
+ *
+ * This kernel performs a dot-product between quantized input tokens and
+ * quantized expert weight matrices, accumulating into float outputs.
+ * It supports per-token top-k weighting and tiling along the K dimension
+ * for efficient vectorized execution.
+ *
+ * Adapted from: https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/moe_gemm_gguf.cu
+ */
+#include "gguf.cuh"
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdint>
+#include <type_traits>
+#include <cassert>
+constexpr int MATRIX_ROW_PADDING = 512;
+
+constexpr int pad(int size, int padding) {
+    if (padding == 0) return size;  // avoid divide-by-zero
+    return ((size + padding - 1) / padding) * padding;
+}
+
+// Optional helper if you want ceil division explicitly
+constexpr int ceil_div(int a, int b) {
+    return (a + b - 1) / b;
+}
+
+namespace vllm_rs {
+
+/*
+* Template Parameters:
+ * @tparam T                 Type of output elements (float, half, etc.)
+ * @tparam qk                Quantization block size for weights (e.g., 32)
+ * @tparam qi                Quantization block size for inputs (e.g., 32)
+ * @tparam block_q_t         Type of quantized weight block (e.g., block_q8_0)
+ * @tparam vdr               Vectorization factor (number of elements per lane)
+ * @tparam vec_dot_q_cuda    Function for computing vectorized dot-product between quantized blocks
+ *
+ * Kernel Parameters:
+ * @param all_weights         Pointer to all expert weight matrices, [num_experts, N, K] (quantized)
+ * @param all_inputs          Pointer to all input tokens, [M_total, K] (quantized)
+ * @param sorted_token_ids    Sorted token indices for batch processing
+ * @param expert_ids          Expert ID for each token
+ * @param topk_weights        Optional top-k MoE weight per token
+ * @param all_outputs         Output buffer [M_total, N] (float)
+ * @param num_experts         Number of experts
+ * @param topk                Top-k experts selected per token
+ * @param size_m              Number of tokens processed (M dimension)
+ * @param size_n              Output feature dimension (N dimension)
+ * @param size_k              Input feature dimension (K dimension)
+ * @param k_padded            Padded K dimension for GGUF stride
+*/
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+__device__ void moe_gemm_gguf_kernel(
+    const void * __restrict__ all_weights,       // [num_experts, N, K] (quantized)
+    const void * __restrict__ all_inputs,        // [M_total, K] (quantized, M_total is total tokens)
+    const int32_t* __restrict__ sorted_token_ids,// [M] (M = num tokens processed)
+    const int32_t* __restrict__ expert_ids,      // [M]
+    const float* __restrict__ topk_weights,      // [M]
+    float * __restrict__ all_outputs,            // [M_total, N] (float)
+    int num_experts,
+    int topk,
+    int size_m, int size_n, int size_k, // M, N, K are the logical dims
+    int k_padded // Padded K-dim for GGUF stride
+) {
+    const int laneId = threadIdx.x;
+    const int wrapId = threadIdx.y;
+    const int nWraps = blockDim.y;
+    const int row = blockIdx.x * nWraps + wrapId; // This is the 'n' dimension (output row)
+    const int m_idx = blockIdx.y; // This is the 'm' dimension (token index)
+    
+    // This block computes the dot product for `output[token_id][n_row]`
+    
+    if (row >= size_n || m_idx >= size_m) {
+        return;
+    }
+
+    // strides
+    const size_t weight_expert_stride_bytes = (size_t)(size_n * size_k) / qk * sizeof(block_q_t);
+    const size_t input_task_stride_bytes    = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
+    const size_t output_task_stride_elems   = (size_t)size_n;
+
+    const int token_id = sorted_token_ids[m_idx]; // The *actual* row in input/output tensors
+    const int expert = expert_ids[m_idx];
+    
+    // If expert is invalid, this token does not participate.
+    if (expert < 0 || expert >= num_experts) return;
+
+    // Get the scaling factor for this token/expert pair
+    const float scale = (topk_weights) ? topk_weights[token_id] : 1.0f;
+
+    const block_q_t * __restrict__ w_expert =
+        (const block_q_t *)((const char *)all_weights + (size_t)expert * weight_expert_stride_bytes);
+
+    const int input_index = topk_weights ? token_id : (token_id / topk);
+    const block_q8_1 * __restrict__ y_ptr =
+        (const block_q8_1 *)((const char *)all_inputs + (size_t)input_index * input_task_stride_bytes);
+
+    // dot-product tiling along k
+    const int blocks_per_row_x = size_k / qk;
+    const int blocks_per_iter  = vdr * WARP_SIZE / qi; // no nwarps factor: one warp per batch item
+
+    extern __shared__ int8_t shared_bytes[];
+    block_q_t* w_shared_row = reinterpret_cast<block_q_t*>(shared_bytes);
+    for (int i = laneId; i < blocks_per_row_x; i += WARP_SIZE) {
+        w_shared_row[wrapId * blocks_per_row_x + i] = w_expert[row * blocks_per_row_x + i];
+    }
+    __syncthreads();
+
+    // accumulators for rows_per_block rows (usually 1)
+    float acc = 0.0f;
+
+    #pragma unroll
+    for (int kbx = laneId / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (laneId % (qi / vdr));
+        acc += vec_dot_q_cuda(
+            // &w_expert[kbx + row * blocks_per_row_x],
+            &w_shared_row[wrapId * blocks_per_row_x + kbx],
+            &y_ptr[kby],
+            kqs);
+    }
+
+    float v = warp_reduce_sum(acc) * scale;
+    if (laneId == 0) {
+        float * __restrict__ out_ptr =
+            all_outputs + ((size_t)token_id) * output_task_stride_elems;
+        out_ptr[row] = v;
+    }
+}
+
+}
+
+#define LAUNCH_MOE_GGUF(qk, qi, block_q_t, vdr, vec_dot_q_cuda) \
+    vllm_rs::moe_gemm_gguf_kernel<qk, qi, block_q_t, vdr, vec_dot_q_cuda>(\
+        weights, y_q8_1,\
+        sorted_token_ids, expert_ids, topk_weights,\
+        outputs,\
+        num_experts, topk,\
+        size_m, size_n, size_k,\
+        kx_padded\
+    );\
+
+// Quantized GGUF MoE decode kernels (dynamic PTX entry points).
+// Inputs are already quantized to Q8_1 by the caller (quantize_q8_1).
+// Weights are GGUF-quantized expert matrices.
+#define DEFINE_MOE_GGUF_DECODE(NAME, QK, QI, BLOCK_T, VDR, VEC_DOT) \
+extern "C" __global__ void moe_gemm_gguf_##NAME( \
+    const void * __restrict__ weights, \
+    const void * __restrict__ y_q8_1, \
+    const int32_t* __restrict__ sorted_token_ids, \
+    const int32_t* __restrict__ expert_ids, \
+    const float* __restrict__ topk_weights, \
+    float * __restrict__ outputs, \
+    int num_experts, int topk, \
+    int size_m, int size_n, int size_k, \
+    int kx_padded \
+) { \
+    vllm_rs::moe_gemm_gguf_kernel<QK, QI, BLOCK_T, VDR, VEC_DOT>( \
+        weights, y_q8_1, sorted_token_ids, expert_ids, topk_weights, outputs, \
+        num_experts, topk, size_m, size_n, size_k, kx_padded \
+    ); \
+}
+
+DEFINE_MOE_GGUF_DECODE(q8_0, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1)
+DEFINE_MOE_GGUF_DECODE(q4_k, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
+DEFINE_MOE_GGUF_DECODE(q2_k, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1)
+DEFINE_MOE_GGUF_DECODE(q3_k, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1)
+DEFINE_MOE_GGUF_DECODE(q5_k, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
+DEFINE_MOE_GGUF_DECODE(q6_k, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)

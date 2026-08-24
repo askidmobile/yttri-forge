@@ -1,0 +1,143 @@
+[package]
+name = "qwen35-batch"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone continuous-batching prototype for Qwen3.5 on Candle (per-slot state + batched decode)"
+
+[dependencies]
+candle-core = { path = "../candle-core" }
+candle-nn = { path = "../candle-nn" }
+anyhow = "1"
+log = "0.4"
+half = "2.5.0"
+sha2 = { version = "0.10", optional = true }
+image = { workspace = true, optional = true }
+rand = "0.9.0"
+rayon = "1.7.0"
+
+# Реальная модель (GGUF) — только для integration-тестов/бёнча.
+memmap2 = { version = "0.9.3", features = ["stable_deref_trait"], optional = true }
+tokenizers = { version = "0.22.0", default-features = false, features = ["onig"], optional = true }
+env_logger = { version = "0.11", optional = true }
+serde_json = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-metal-kernels = { path = "../candle-metal-kernels" }
+objc2 = "0.6.3"
+objc2-metal = "0.3.2"
+objc2-foundation = "0.3.2"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+candle-kernels = { path = "../candle-kernels", optional = true }
+cudarc = { workspace = true, optional = true }
+candle-flash-attn = { path = "../candle-flash-attn", optional = true }
+
+[features]
+# Активировать адаптер реальной Qwen3.5 модели (GGUF loader + port quantized_qwen35).
+# Backend выбирается отдельно: `metal` на macOS или `cuda` на Windows/Linux.
+real-model = ["dep:memmap2", "dep:tokenizers", "dep:env_logger", "dep:serde_json", "dep:sha2", "dep:image"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "dep:candle-kernels",
+    "dep:cudarc",
+    "dep:candle-flash-attn",
+]
+
+[[test]]
+name = "fa2_paged"
+path = "tests/fa2_paged.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "scheduler_parity"
+path = "tests/scheduler_parity.rs"
+
+[[test]]
+name = "mtp_transaction"
+path = "tests/mtp_transaction.rs"
+
+[[test]]
+name = "real_qwen35_mtp"
+path = "tests/real_qwen35_mtp.rs"
+
+[[test]]
+name = "real_qwen35_batch"
+path = "tests/real_qwen35_batch.rs"
+required-features = ["real-model"]
+
+[[test]]
+name = "real_qwen35_quality"
+path = "tests/real_qwen35_quality.rs"
+required-features = ["real-model"]
+
+[[test]]
+name = "model_profile"
+path = "tests/model_profile.rs"
+required-features = ["real-model"]
+
+[[test]]
+name = "multimodal_processor"
+path = "tests/multimodal_processor.rs"
+required-features = ["real-model"]
+
+[[test]]
+name = "qwen35moe_reference"
+path = "tests/qwen35moe_reference.rs"
+required-features = ["real-model"]
+
+[[test]]
+name = "logits_compare_cli"
+path = "tests/logits_compare_cli.rs"
+required-features = ["real-model"]
+
+[[bin]]
+name = "qwen36_inspect"
+path = "src/bin/qwen36_inspect.rs"
+required-features = ["real-model"]
+
+[[bin]]
+name = "vocab_probe"
+path = "src/bin/vocab_probe.rs"
+required-features = ["real-model"]
+
+[[bin]]
+name = "qwen35_multimodal_probe"
+path = "src/bin/qwen35_multimodal_probe.rs"
+required-features = ["real-model"]
+
+[[bin]]
+name = "qwen35_multimodal_logits"
+path = "src/bin/qwen35_multimodal_logits.rs"
+required-features = ["real-model", "cuda"]
+
+[[bin]]
+name = "bench_candle_direct"
+path = "src/bin/bench_candle_direct.rs"
+required-features = ["real-model"]
+
+[[bin]]
+name = "qwen35_mtp_probe"
+path = "src/bin/qwen35_mtp_probe.rs"
+required-features = ["real-model", "cuda"]
+
+[[bin]]
+name = "qwen35_mtp_gate"
+path = "src/bin/qwen35_mtp_gate.rs"
+required-features = ["real-model", "cuda"]
+
+[[bin]]
+name = "qwen35moe_logits"
+path = "src/bin/qwen35moe_logits.rs"
+required-features = ["real-model", "cuda"]
+
+[[bin]]
+name = "qwen35moe_compare"
+path = "src/bin/qwen35moe_compare.rs"
+required-features = ["real-model"]
+
+[[bin]]
+name = "tok_encode_probe"
+path = "src/bin/tok_encode_probe.rs"
+required-features = ["real-model"]
