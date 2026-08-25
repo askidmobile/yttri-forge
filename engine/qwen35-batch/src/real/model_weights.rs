@@ -2273,29 +2273,24 @@ impl DeltaNetLayer {
         let dn_tp = std::time::Instant::now();
         // yttri-forge stage1 (dual-read): prefill-проекции через F16-сайдкар.
         #[cfg(not(target_os = "macos"))]
-        // Активация квантуется в q8_1 ОДИН раз на все четыре проекции: MMQ
-        // делает это внутри каждого forward, и на форме [512,2560] один такой
-        // проход стоит ~0.12 мс — столько же, сколько весь GEMM для b/a.
-        let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x)
-            .ok()
-            .flatten();
         let (qkv_t, z_t, beta_t, alpha_t) = match (
             &self.f16_wqkv,
             &self.f16_wgate,
             &self.f16_w_beta,
             &self.f16_w_alpha,
         ) {
-            (Some(fq), Some(fg), Some(fb), Some(fa)) => (
-                fq.forward_with_prequant(x, prequant.as_ref())?,
-                fg.forward_with_prequant(x, prequant.as_ref())?,
-                fb.forward_with_prequant(x, prequant.as_ref())?,
-                fa.forward_with_prequant(x, prequant.as_ref())?,
-            ),
+            (Some(fq), Some(fg), Some(fb), Some(fa)) => {
+                let qkv = fq.forward(x)?;
+                let z = fg.forward(x)?;
+                let b = fb.forward(x)?;
+                let a = fa.forward(x)?;
+                (qkv, z, b, a)
+            }
             _ => (
-                self.wqkv.forward_with_prequant(x, prequant.as_ref())?,
-                self.wgate.forward_with_prequant(x, prequant.as_ref())?,
-                self.w_beta.forward_with_prequant(x, prequant.as_ref())?,
-                self.w_alpha.forward_with_prequant(x, prequant.as_ref())?,
+                self.wqkv.forward(x)?,
+                self.wgate.forward(x)?,
+                self.w_beta.forward(x)?,
+                self.w_alpha.forward(x)?,
             ),
         };
         #[cfg(not(target_os = "macos"))]
@@ -3299,20 +3294,16 @@ impl GatedAttentionLayer {
         // yttri-forge stage1 (dual-read): prefill-проекции через F16-сайдкар,
         // если подключён. Decode-пути продолжают использовать GGUF-квант.
         #[cfg(not(target_os = "macos"))]
-        // Общий prequant на q/k/v (см. DeltaNet-ветку).
-        let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x)
-            .ok()
-            .flatten();
         let (qg, k, v) = match (&self.f16_q, &self.f16_k, &self.f16_v) {
             (Some(fq), Some(fk), Some(fv)) => (
-                fq.forward_with_prequant(x, prequant.as_ref())?,
-                fk.forward_with_prequant(x, prequant.as_ref())?,
-                fv.forward_with_prequant(x, prequant.as_ref())?,
+                fq.forward(x)?,
+                fk.forward(x)?,
+                fv.forward(x)?,
             ),
             _ => (
-                self.attention_wq.forward_with_prequant(x, prequant.as_ref())?,
-                self.attention_wk.forward_with_prequant(x, prequant.as_ref())?,
-                self.attention_wv.forward_with_prequant(x, prequant.as_ref())?,
+                self.attention_wq.forward(x)?,
+                self.attention_wk.forward(x)?,
+                self.attention_wv.forward(x)?,
             ),
         };
         let t_proj = t0.elapsed();
@@ -3862,20 +3853,12 @@ impl GatedAttentionLayer {
             candle_core::bail!("paged prefill: b_sz must be 1");
         }
         // 1. Проекции (F16-сайдкар если подключён — dual-read prefill)
-        // Общий prequant на q/k/v (см. DeltaNet-ветку).
-        let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x)
-            .ok()
-            .flatten();
         let (qg, k, v) = match (&self.f16_q, &self.f16_k, &self.f16_v) {
-            (Some(fq), Some(fk), Some(fv)) => (
-                fq.forward_with_prequant(x, prequant.as_ref())?,
-                fk.forward_with_prequant(x, prequant.as_ref())?,
-                fv.forward_with_prequant(x, prequant.as_ref())?,
-            ),
+            (Some(fq), Some(fk), Some(fv)) => (fq.forward(x)?, fk.forward(x)?, fv.forward(x)?),
             _ => (
-                self.attention_wq.forward_with_prequant(x, prequant.as_ref())?,
-                self.attention_wk.forward_with_prequant(x, prequant.as_ref())?,
-                self.attention_wv.forward_with_prequant(x, prequant.as_ref())?,
+                self.attention_wq.forward(x)?,
+                self.attention_wk.forward(x)?,
+                self.attention_wv.forward(x)?,
             ),
         };
 
@@ -4559,20 +4542,22 @@ impl HybridBlock {
                 // Fused GDN: проекции (F16 dual-read) → dispatch → ssm_out
                 let (b_sz, seq_len, _n_embd) = normed.dims3()?;
                 let _ = b_sz;
-                // Общий prequant на все четыре проекции (см. eager-ветку).
-                let prequant = candle_core::quantized::QTensor::prequantize_q8_1(&normed)
-                    .ok()
-                    .flatten();
-                let proj = |f16: &Option<QMatMul>, gguf: &QMatMul| -> Result<Tensor> {
-                    match f16 {
-                        Some(f) => f.forward_with_prequant(&normed, prequant.as_ref()),
-                        None => gguf.forward_with_prequant(&normed, prequant.as_ref()),
-                    }
+                let qkv_t = match &delta.f16_wqkv {
+                    Some(f) => f.forward(&normed)?,
+                    None => delta.wqkv.forward(&normed)?,
                 };
-                let qkv_t = proj(&delta.f16_wqkv, &delta.wqkv)?;
-                let z_t = proj(&delta.f16_wgate, &delta.wgate)?;
-                let beta_t = proj(&delta.f16_w_beta, &delta.w_beta)?;
-                let alpha_t = proj(&delta.f16_w_alpha, &delta.w_alpha)?;
+                let z_t = match &delta.f16_wgate {
+                    Some(f) => f.forward(&normed)?,
+                    None => delta.wgate.forward(&normed)?,
+                };
+                let beta_t = match &delta.f16_w_beta {
+                    Some(f) => f.forward(&normed)?,
+                    None => delta.w_beta.forward(&normed)?,
+                };
+                let alpha_t = match &delta.f16_w_alpha {
+                    Some(f) => f.forward(&normed)?,
+                    None => delta.w_alpha.forward(&normed)?,
+                };
 
                 let ctx_cuda = delta.cuda_ctx.as_mut().ok_or_else(|| {
                     candle_core::Error::Msg("paged prefill: cuda_ctx missing".into())
