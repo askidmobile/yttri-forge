@@ -3029,6 +3029,19 @@ struct KvMirror {
     valid_tokens: usize,
 }
 
+/// mean|gguf - sidecar| / mean|gguf| — относительная ошибка сайдкара.
+/// ~ошибка квантования (единицы процентов) = норма; десятки процентов = веса чужие.
+fn ytf16_rel_error(gguf: &QMatMul, sidecar: &QMatMul) -> Result<f32> {
+    let g = gguf.dequantize_f16()?.to_dtype(DType::F32)?;
+    let f = sidecar.dequantize_f16()?.to_dtype(DType::F32)?;
+    if g.dims() != f.dims() {
+        candle_core::bail!("форма {:?} != {:?}", g.dims(), f.dims());
+    }
+    let scale = g.abs()?.mean_all()?.to_scalar::<f32>()?;
+    let diff = (&g - &f)?.abs()?.mean_all()?.to_scalar::<f32>()?;
+    Ok(if scale > 0.0 { diff / scale } else { f32::INFINITY })
+}
+
 /// Сверка F16-сайдкара с деквантованным GGUF-весом: форма + max/mean |diff|.
 /// Ожидание: расхождение порядка ошибки квантования (Q4_K_M ~1e-2 отн.).
 fn audit_ytf16(name: &str, gguf: &QMatMul, sidecar: &QMatMul) {
@@ -7628,6 +7641,28 @@ impl ModelWeights {
                 _ => {}
             }
         }
+        // Постоянный сторож: сайдкар обязан совпадать с GGUF с точностью
+        // квантования. Относительный порог, чтобы работать и на IQ2 (там
+        // ошибка квантования крупнее). Ловит и сдвиг смещений, и чужой
+        // порядок голов — оба бага уже случались (2026-08-25).
+        if let Some(block) = self.blocks.first() {
+            let pair = match &block.layer {
+                HybridLayerType::DeltaNet(d) => d.f16_wqkv.as_ref().map(|f| (&d.wqkv, f)),
+                HybridLayerType::Attention(a) => a.f16_q.as_ref().map(|f| (&a.attention_wq, f)),
+            };
+            if let Some((gguf, f16)) = pair {
+                match ytf16_rel_error(gguf, f16) {
+                    Ok(rel) if rel > 0.25 => eprintln!(
+                        "[ytf] WARN сайдкар расходится с GGUF: относительная ошибка {rel:.0%} \
+                         (ожидается ~ошибка квантования). Веса блока 0 не совпадают — \
+                         проверьте конвертер; QWEN36_DISABLE_YTF16=1 отключает сайдкар."
+                    ),
+                    Ok(rel) => eprintln!("[ytf] blk.0 vs GGUF: относительная ошибка {rel:.1%}"),
+                    Err(e) => eprintln!("[ytf] WARN проверка сайдкара не удалась: {e}"),
+                }
+            }
+        }
+
         if audit {
             for (i, block) in self.blocks.iter().enumerate().take(2) {
                 match &block.layer {
