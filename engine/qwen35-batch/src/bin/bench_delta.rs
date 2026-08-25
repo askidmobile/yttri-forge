@@ -282,28 +282,53 @@ fn ref_chunked(
     (out, s)
 }
 
-fn max_rel(a: &[f32], b: &[f32]) -> f32 {
+/// Относительное расхождение. ВАЖНО: `f32::max(0, NaN)` возвращает 0, поэтому
+/// сравнение двух испорченных векторов молча даёт «идеальный ноль» — сначала
+/// проверяем финитность, иначе метрика врёт.
+fn max_rel(a: &[f32], b: &[f32]) -> String {
+    let bad_a = a.iter().filter(|x| !x.is_finite()).count();
+    let bad_b = b.iter().filter(|x| !x.is_finite()).count();
+    if bad_a > 0 || bad_b > 0 {
+        return format!("НЕ-ФИНИТНО ({bad_a}/{bad_b} из {})", a.len());
+    }
+    if a.len() != b.len() {
+        return format!("РАЗНАЯ ДЛИНА {} vs {}", a.len(), b.len());
+    }
     let scale = a.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-6);
-    a.iter()
+    let d = a
+        .iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
         .fold(0f32, f32::max)
-        / scale
+        / scale;
+    format!("{d:.2e}")
 }
 
 /// Сверка математики: ядро против последовательного CPU-эталона и chunked.
 fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
     let (n_v, hkd, hvd) = (N_V as usize, HKD as usize, HVD as usize);
     let d = Dims { t, n_v, hkd, hvd };
-    let (q, k, v) = (
-        fill(t * n_v * hkd, 1),
-        fill(t * n_v * hkd, 2),
-        fill(t * n_v * hvd, 3),
-    );
-    // Гейт отрицательный (затухание), как в модели: gate = -softplus(...).
-    let beta = fill(t * n_v, 4).iter().map(|x| x.abs() + 0.1).collect::<Vec<_>>();
+    // Вход должен повторять реальный путь, иначе рекуррентность расходится и
+    // сравнивать нечего: в модели k и q L2-нормированы (delta_l2_norm_prefill),
+    // beta ∈ (0,1), гейт отрицательный (затухание).
+    let l2 = |mut x: Vec<f32>, dim: usize| -> Vec<f32> {
+        for row in x.chunks_mut(dim) {
+            let n = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+            for v in row.iter_mut() {
+                *v /= n;
+            }
+        }
+        x
+    };
+    let q = l2(fill(t * n_v * hkd, 1), hkd);
+    let k = l2(fill(t * n_v * hkd, 2), hkd);
+    let v = fill(t * n_v * hvd, 3);
+    let beta = fill(t * n_v, 4)
+        .iter()
+        .map(|x| 1.0 / (1.0 + (-x * 4.0).exp()))
+        .collect::<Vec<_>>();
     let gate = fill(t * n_v, 5).iter().map(|x| -(x.abs()) - 0.01).collect::<Vec<_>>();
-    let s0 = fill(n_v * hvd * hvd, 6);
+    let s0 = fill(n_v * hvd * hvd, 6).iter().map(|x| x * 0.1).collect::<Vec<_>>();
 
     // GPU: текущее ядро.
     let p = params();
@@ -348,10 +373,13 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
     let gpu_head_state = &gpu_state[head * hkd * hvd..(head + 1) * hkd * hvd];
 
     println!("T={t} chunk={chunk} (голова {head})");
-    println!("  ядро vs последовательный CPU: out {:.2e}, state {:.2e}",
+    println!("  ядро vs последовательный CPU: out {}, state {}",
         max_rel(&gpu_head, &seq_out), max_rel(gpu_head_state, &seq_state));
-    println!("  chunked vs последовательный:  out {:.2e}, state {:.2e}",
+    println!("  chunked vs последовательный:  out {}, state {}",
         max_rel(&seq_out, &chk_out), max_rel(&seq_state, &chk_state));
+    println!("  масштаб: |out|max={:.3} |state|max={:.3}",
+        seq_out.iter().fold(0f32, |m, x| m.max(x.abs())),
+        seq_state.iter().fold(0f32, |m, x| m.max(x.abs())));
     Ok(())
 }
 
