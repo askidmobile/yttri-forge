@@ -430,11 +430,14 @@ pub fn dispatch_delta_rule_prefill(
         .unwrap_or(2); // FR-002 sweep: warps=2 optimal (1.8ms vs 2.8ms for warps=1)
     let t_p3_start = sync_t(dev);
     {
-        // v2 (умолчание): блок 1024 потока на 32 колонки, k/q через shared —
-        // в 32 раза меньше глобальных чтений при той же математике.
-        // QWEN36_DELTA_V1=1 возвращает старое ядро для сверки.
-        let v1 = std::env::var("QWEN36_DELTA_V1").as_deref() == Ok("1");
-        let (name, cfg) = if v1 {
+        // v2 (QWEN36_DELTA_V2=1) — блок 1024 потока на 32 колонки, k/q через
+        // shared. Замер 2026-08-25: МЕДЛЕННЕЕ v1 (1.23 против 1.14 с на
+        // 1910 токенах). Гипотеза про «2 ГБ лишних чтений» неверна: 128 варпов
+        // читают одни и те же 512 байт k/q, это попадания в L2 (~2 ТБ/с), а не
+        // DRAM. Зато v2 платит 1024 блочными синхронизациями на токен и
+        // занятостью (блок 1024 потока). Дефолт — v1.
+        let v2 = std::env::var("QWEN36_DELTA_V2").as_deref() == Ok("1");
+        let (name, cfg) = if !v2 {
             (
                 "delta_rule_prefill",
                 LaunchConfig {
