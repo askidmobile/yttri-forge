@@ -197,6 +197,46 @@ extern "C" void run_mha(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
+    // Упаковка GQA в измерение запросов (приём seqlenq_ngroups_swapped из FA2;
+    // поддержка в ядрах уже есть, не хватало только хостовой части).
+    //
+    // В декоде запрос ровно один, а M-тайл ядра равен 64 — 63 строки из 64
+    // считаются впустую. Вдобавок при h=16 и h_k=4 четыре блока читают один
+    // и тот же KV, то есть трафик вчетверо лишний. Если подставить группу GQA
+    // в seqlen_q, обе потери уходят разом: данные не двигаются, меняются
+    // только страйды.
+    static const bool gqa_swap_enabled = [] {
+        const char* e = std::getenv("QWEN36_FA_GQA");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    const bool is_decode = (seqlen_q == 1);
+    // При одном запросе маска ничего не режет: позиция запроса последняя,
+    // так что и is_causal, и правое окно 0 эквивалентны полному вниманию.
+    // Настоящее скользящее окно (window_size_left >= 0) так свернуть нельзя.
+    const bool mask_is_noop = (window_size_left < 0) && (window_size_right <= 0);
+    if (gqa_swap_enabled && is_decode && h > h_k && mask_is_noop &&
+        alibi_slopes_ptr == nullptr && d % 8 == 0) {
+        const int ngroups = h / h_k;
+        const auto q_head = params.q_head_stride;
+        const auto o_head = params.o_head_stride;
+        params.q_batch_stride = params.q_row_stride;
+        params.q_row_stride = q_head;
+        params.q_head_stride = q_head * ngroups;
+        params.o_batch_stride = params.o_row_stride;
+        params.o_row_stride = o_head;
+        params.o_head_stride = o_head * ngroups;
+        params.cu_seqlens_q = nullptr;
+        params.seqlen_q = ngroups;
+        params.seqlen_q_rounded = ((ngroups + 127) / 128) * 128;
+        params.h = h_k;
+        params.h_h_k_ratio = 1;
+        params.total_q = b * ngroups;
+        params.is_causal = false;
+        params.window_size_left = -1;
+        params.window_size_right = -1;
+        params.seqlenq_ngroups_swapped = true;
+    }
+
     // Число сплитов по K. QWEN36_FA_SPLITS=1 возвращает прежнее поведение.
     params.num_splits = 1;
     // QWEN36_FA_SPLITS: 1 — прежнее поведение без сплитов, N>1 — форсировать N,
@@ -220,9 +260,9 @@ extern "C" void run_mha(
         }();
         const int block_n = d <= 64 ? 256 : (d <= 128 ? 128 : 64);
         const int num_n_blocks = fa_ceildiv(seqlen_k, block_n);
-        const int num_m_blocks = fa_ceildiv(seqlen_q, 64);
+        const int num_m_blocks = fa_ceildiv(params.seqlen_q, 64);
         int ns;
-        if (seqlen_q == 1) {
+        if (is_decode) {
             // Декод: запрос один, поэтому без сплитов сетка это b*h блоков
             // (16-32 на 28 SM) и карта простаивает. Апстримная эвристика
             // считает «волны» в предположении, что блок делает много работы,
@@ -231,28 +271,29 @@ extern "C" void run_mha(
             // 32 — 53.0. Целимся в 9 волн (на b=1 h=16 это ровно 16 сплитов),
             // оставляя каждому сплиту не меньше двух блоков ключей.
             const int target = 9 * num_sms;
-            const int denom = std::max(1, int(b) * int(h) * num_m_blocks);
+            const int denom = std::max(1, params.b * params.h * num_m_blocks);
             ns = fa_ceildiv(target, denom);
             ns = std::min(ns, num_n_blocks / 2);
             ns = std::min(ns, 128);
             ns = std::max(ns, 1);
         } else {
-            ns = fa_num_splits_heuristic(b * h * num_m_blocks, num_sms, num_n_blocks, 128);
+            ns = fa_num_splits_heuristic(params.b * params.h * num_m_blocks, num_sms, num_n_blocks, 128);
         }
-        if (forced_splits > 1 && seqlen_q == 1) {
+        if (forced_splits > 1 && is_decode) {
             ns = std::min(forced_splits, num_n_blocks);
         }
         // Печатаем по одному разу для декода (seqlen_q==1) и для префилла.
         static bool reported_decode = false;
         static bool reported_prefill = false;
-        bool& reported = (seqlen_q == 1) ? reported_decode : reported_prefill;
+        bool& reported = is_decode ? reported_decode : reported_prefill;
         if (!reported && std::getenv("QWEN36_FA_DEBUG") != nullptr) {
             reported = true;
-            fprintf(stderr, "[fa] splits: b=%d h=%d seqlen_q=%d seqlen_k=%d n_blocks=%d sms=%d -> num_splits=%d\n",
-                    b, h, seqlen_q, seqlen_k, num_n_blocks, num_sms, ns);
+            fprintf(stderr, "[fa] splits: b=%d h=%d->%d seqlen_q=%d->%d seqlen_k=%d n_blocks=%d sms=%d gqa_swap=%d -> num_splits=%d\n",
+                    b, h, params.h, seqlen_q, params.seqlen_q, seqlen_k, num_n_blocks, num_sms,
+                    int(params.seqlenq_ngroups_swapped), ns);
         }
         if (ns > 1) {
-            const size_t lse_elems = (size_t)ns * b * h * seqlen_q;
+            const size_t lse_elems = (size_t)ns * params.b * params.h * params.seqlen_q;
             const size_t o_elems = lse_elems * d_rounded;
             if (cudaMallocAsync(&lseaccum, lse_elems * sizeof(float), stream) == cudaSuccess &&
                 cudaMallocAsync(&oaccum, o_elems * sizeof(float), stream) == cudaSuccess) {
