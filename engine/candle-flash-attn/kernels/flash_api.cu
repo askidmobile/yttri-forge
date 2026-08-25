@@ -231,7 +231,7 @@ extern "C" void run_mha(
             // Целимся примерно в 8 волн, оставляя каждому сплиту не меньше
             // двух блоков ключей.
             const int target = 8 * num_sms;
-            const int denom = std::max(1, b * h * num_m_blocks);
+            const int denom = std::max(1, int(b) * int(h) * num_m_blocks);
             ns = fa_ceildiv(target, denom);
             ns = std::min(ns, num_n_blocks / 2);
             ns = std::min(ns, 128);
