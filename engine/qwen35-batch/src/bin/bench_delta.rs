@@ -413,8 +413,7 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
     let out_c = dev.alloc_zeros::<f32>(t * n_v * hvd)?;
     let mut state_c = dev.clone_htod(&s0)?;
     {
-        const C: usize = 16;
-        const COLS: usize = 64;
+        let (c, cols) = chunked_shape("delta_rule_prefill_chunked").unwrap();
         const ROWGRP: usize = 4;
         let smem = (2 * c * hkd + 3 * c * cols + 2 * c * c + 2 * c + cols * ROWGRP) * 4;
         let f = dev.get_or_load_func("delta_rule_prefill_chunked", &candle_kernels::DELTA_RULE)?;
