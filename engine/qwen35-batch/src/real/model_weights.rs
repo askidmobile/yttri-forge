@@ -3043,10 +3043,18 @@ fn audit_ytf16(name: &str, gguf: &QMatMul, sidecar: &QMatMul) {
         let mean = d.mean_all()?.to_scalar::<f32>()?;
         let gmax = g.abs()?.max_all()?.to_scalar::<f32>()?;
         let fmax = f.abs()?.max_all()?.to_scalar::<f32>()?;
-        // Проверка на транспонированность: сравниваем с f^T, если веса квадратные
-        let extra = if g.dims().len() == 2 && g.dim(0)? == g.dim(1)? {
-            let dt = (&g - &f.t()?.contiguous()?)?.abs()?.max_all()?.to_scalar::<f32>()?;
-            format!(" max|g-fᵀ|={dt:.4}")
+        // Гипотеза «данные записаны транспонированно»: читаем буфер f как
+        // [in, out] и транспонируем — если совпало, у писателя перепутан layout.
+        let extra = if g.dims().len() == 2 {
+            let (o, i2) = (g.dim(0)?, g.dim(1)?);
+            let alt = f.reshape((i2, o))?.t()?.contiguous()?;
+            let dt = (&g - &alt)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            let g0: Vec<f32> = g.i((0, 0..6))?.to_vec1()?;
+            let gc: Vec<f32> = g.i((0..6, 0))?.to_vec1()?;
+            let f0: Vec<f32> = f.i((0, 0..6))?.to_vec1()?;
+            format!(
+                " max|g-fᵀ|={dt:.4}\n[ytf-audit]   g[0,..]={g0:?}\n[ytf-audit]   g[..,0]={gc:?}\n[ytf-audit]   f[0,..]={f0:?}"
+            )
         } else {
             String::new()
         };
