@@ -3075,49 +3075,6 @@ fn audit_ytf16(name: &str, gguf: &QMatMul, sidecar: &QMatMul) {
     }
 }
 
-/// Кросс-проверка v-хвоста fused qkv против z: если сайдкарный z совпал с
-/// GGUF-хвостом qkv (и наоборот) — конвертер перепутал местами v и z.
-fn audit_cross_vz(i: usize, g_qkv: &QMatMul, g_z: &QMatMul, f_qkv: &QMatMul, f_z: &QMatMul) {
-    let run = || -> Result<String> {
-        let gq = g_qkv.dequantize_f16()?.to_dtype(DType::F32)?;
-        let gz = g_z.dequantize_f16()?.to_dtype(DType::F32)?;
-        let fq = f_qkv.dequantize_f16()?.to_dtype(DType::F32)?;
-        let fz = f_z.dequantize_f16()?.to_dtype(DType::F32)?;
-        let rows = gz.dim(0)?; // 4096 = размер v-хвоста
-        let tail = gq.dim(0)? - rows;
-        let g_tail = gq.narrow(0, tail, rows)?;
-        let f_tail = fq.narrow(0, tail, rows)?;
-        let d_zz = (&gz - &fz)?.abs()?.mean_all()?.to_scalar::<f32>()?;
-        let d_tail_z = (&g_tail - &fz)?.abs()?.mean_all()?.to_scalar::<f32>()?;
-        let d_z_tail = (&gz - &f_tail)?.abs()?.mean_all()?.to_scalar::<f32>()?;
-        // Сопоставление голов v (по 128 строк) между GGUF и сайдкаром:
-        // сравниваем первую строку каждой головы — этого хватает, чтобы найти
-        // закон перестановки.
-        let hd = 128usize;
-        let heads = rows / hd;
-        let mut perm = String::new();
-        for hg in 0..heads.min(6) {
-            let gr = g_tail.i((hg * hd, ..))?;
-            let mut best = (0usize, f32::MAX);
-            for hf in 0..heads {
-                let fr = f_tail.i((hf * hd, ..))?;
-                let d = (&gr - &fr)?.abs()?.mean_all()?.to_scalar::<f32>()?;
-                if d < best.1 {
-                    best = (hf, d);
-                }
-            }
-            perm.push_str(&format!(" g_v{hg}<-f_v{}({:.5})", best.0, best.1));
-        }
-        Ok(format!(
-            "z↔z={d_zz:.5} qkv_tail↔f_z={d_tail_z:.5} g_z↔qkv_tail={d_z_tail:.5}\n[ytf-audit]   головы v:{perm}"
-        ))
-    };
-    match run() {
-        Ok(r) => eprintln!("[ytf-audit] blk.{i} cross v/z: {r}"),
-        Err(e) => eprintln!("[ytf-audit] blk.{i} cross v/z: FAILED {e}"),
-    }
-}
-
 /// Graph-префилл пишет в paged pool чистый F16 (пул и так F16) — с q8
 /// round-trip логиты расходились с eager на MAE 0.42, без него — бит-в-бит.
 /// QWEN36_PGRAPH_Q8KV=1 возвращает round-trip (точность как у батчевого q8-кэша).
@@ -7680,14 +7637,15 @@ impl ModelWeights {
                         }
                     }
                     HybridLayerType::DeltaNet(d) => {
-                        if let Some(f16) = d.f16_wqkv.as_ref() {
-                            audit_ytf16(&format!("blk.{i}.attn_qkv"), &d.wqkv, f16);
-                        }
-                        if let Some(f16) = d.f16_wgate.as_ref() {
-                            audit_ytf16(&format!("blk.{i}.attn_z"), &d.wgate, f16);
-                            // Кросс-проверка: не перепутаны ли v-хвост qkv и z?
-                            if let Some(fq) = d.f16_wqkv.as_ref() {
-                                audit_cross_vz(i, &d.wqkv, &d.wgate, fq, f16);
+                        for (name, gguf, f16) in [
+                            ("attn_qkv", &d.wqkv, &d.f16_wqkv),
+                            ("attn_z", &d.wgate, &d.f16_wgate),
+                            ("attn_b", &d.w_beta, &d.f16_w_beta),
+                            ("attn_a", &d.w_alpha, &d.f16_w_alpha),
+                            ("attn_out", &d.ssm_out, &d.f16_ssm_out),
+                        ] {
+                            if let Some(f16) = f16.as_ref() {
+                                audit_ytf16(&format!("blk.{i}.{name}"), gguf, f16);
                             }
                         }
                     }

@@ -95,6 +95,114 @@ fn find_tensor_info(
     None
 }
 
+/// Раскладка DeltaNet из config.json модели.
+#[derive(Debug, Clone, Copy)]
+pub struct DeltaLayout {
+    pub n_k: usize,
+    pub n_v: usize,
+    pub hk: usize,
+    pub hv: usize,
+}
+
+impl DeltaLayout {
+    /// Сколько v-голов приходится на одну k-голову.
+    pub fn n_per_k(&self) -> usize {
+        self.n_v / self.n_k.max(1)
+    }
+}
+
+/// Прочитать раскладку из config.json рядом с safetensors.
+fn read_delta_layout(dir: &Path) -> Option<DeltaLayout> {
+    let raw = std::fs::read(dir.join("config.json")).ok()?;
+    let cfg: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let t = cfg.get("text_config").unwrap_or(&cfg);
+    let get = |k: &str| t.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
+    Some(DeltaLayout {
+        n_k: get("linear_num_key_heads")?,
+        n_v: get("linear_num_value_heads")?,
+        hk: get("linear_key_head_dim")?,
+        hv: get("linear_value_head_dim")?,
+    })
+}
+
+/// HF пакует v/z/a/b по группам k-голов: индекс головы = g*n_per_k + j.
+/// GGUF (llama.cpp) ждёт j-major: индекс = j*n_k + g. Переставляем блоки.
+pub fn deinterleave_blocks(src: &[u8], n_k: usize, n_per_k: usize, block_bytes: usize) -> Vec<u8> {
+    let heads = n_k * n_per_k;
+    assert_eq!(src.len(), heads * block_bytes, "deinterleave: размер не бьётся");
+    let mut out = Vec::with_capacity(src.len());
+    for j in 0..n_per_k {
+        for g in 0..n_k {
+            let hf = g * n_per_k + j;
+            out.extend_from_slice(&src[hf * block_bytes..(hf + 1) * block_bytes]);
+        }
+    }
+    out
+}
+
+/// То же по столбцам: out_proj принимает v-пространство, порядок голов в его
+/// входной размерности обязан совпадать с порядком v.
+pub fn deinterleave_cols(
+    src: &[u8],
+    rows: usize,
+    n_k: usize,
+    n_per_k: usize,
+    col_block_bytes: usize,
+) -> Vec<u8> {
+    let heads = n_k * n_per_k;
+    let row_bytes = heads * col_block_bytes;
+    assert_eq!(src.len(), rows * row_bytes, "deinterleave_cols: размер не бьётся");
+    let mut out = Vec::with_capacity(src.len());
+    for r in 0..rows {
+        let base = r * row_bytes;
+        for j in 0..n_per_k {
+            for g in 0..n_k {
+                let hf = g * n_per_k + j;
+                let off = base + hf * col_block_bytes;
+                out.extend_from_slice(&src[off..off + col_block_bytes]);
+            }
+        }
+    }
+    out
+}
+
+/// Привести F16-байты HF-тензора к раскладке GGUF (только DeltaNet-проекции).
+fn repack_delta(gguf: &str, data: Vec<u8>, shape: &[usize], lay: Option<DeltaLayout>) -> Vec<u8> {
+    let Some(l) = lay else { return data };
+    let n_per_k = l.n_per_k();
+    if n_per_k <= 1 || shape.len() != 2 {
+        return data;
+    }
+    let (rows, cols) = (shape[0], shape[1]);
+    let row_bytes = cols * 2;
+    if gguf.ends_with("attn_qkv.weight") {
+        // [q(n_k*hk) | k(n_k*hk) | v(n_v*hv)] — переставляем только v-хвост.
+        let qk_rows = 2 * l.n_k * l.hk;
+        if rows != qk_rows + l.n_v * l.hv {
+            return data;
+        }
+        let split = qk_rows * row_bytes;
+        let mut out = data[..split].to_vec();
+        out.extend_from_slice(&deinterleave_blocks(
+            &data[split..],
+            l.n_k,
+            n_per_k,
+            l.hv * row_bytes,
+        ));
+        out
+    } else if gguf.ends_with("attn_z.weight") && rows == l.n_v * l.hv {
+        deinterleave_blocks(&data, l.n_k, n_per_k, l.hv * row_bytes)
+    } else if (gguf.ends_with("attn_a.weight") || gguf.ends_with("attn_b.weight"))
+        && rows == l.n_v
+    {
+        deinterleave_blocks(&data, l.n_k, n_per_k, row_bytes)
+    } else if gguf.ends_with("attn_out.weight") && cols == l.n_v * l.hv {
+        deinterleave_cols(&data, rows, l.n_k, n_per_k, l.hv * 2)
+    } else {
+        data
+    }
+}
+
 fn run(args: &Args) -> Result<(), String> {
     let shards = open_safetensors(&args.inputs)?;
 
@@ -237,6 +345,18 @@ fn run(args: &Args) -> Result<(), String> {
     };
     let mut w = container::ContainerWriter::create(out_file, pre).map_err(|e| format!("container create: {e}"))?;
 
+    // Раскладка DeltaNet: без неё v/z/a/b/out уедут в HF-порядке голов.
+    let delta_layout = args.inputs[0]
+        .parent()
+        .and_then(read_delta_layout);
+    match delta_layout {
+        Some(l) => println!(
+            "delta layout: n_k={} n_v={} head_k={} head_v={} (v-голов на k-голову: {})",
+            l.n_k, l.n_v, l.hk, l.hv, l.n_per_k()
+        ),
+        None => println!("delta layout: config.json не найден — перепаковка v/z/a/b/out НЕ выполняется"),
+    }
+
     // Стриминг: для каждого планового тензора — чтение шарда, cast→F16
     let t0 = std::time::Instant::now();
     let mut total_bytes = 0u64;
@@ -286,6 +406,7 @@ fn run(args: &Args) -> Result<(), String> {
                 ))
             }
         };
+        let f16_bytes = repack_delta(&p.gguf, f16_bytes, &shape, delta_layout);
         total_bytes += f16_bytes.len() as u64;
         w.add_tensor(&p.gguf, &shape, f16_bytes);
     }
@@ -330,5 +451,35 @@ mod tests {
         assert_eq!(&shards[found.shard].1[found.start..found.end], data.as_slice());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// HF-порядок голов (g*n_per_k + j) → GGUF-порядок (j*n_k + g).
+    #[test]
+    fn deinterleave_maps_hf_head_order_to_gguf() {
+        // 2 k-головы × 2 под-головы, блок = 1 байт: HF [g0j0, g0j1, g1j0, g1j1]
+        let src = [10u8, 11, 20, 21];
+        let out = deinterleave_blocks(&src, 2, 2, 1);
+        // GGUF ждёт [j0: g0, g1 | j1: g0, g1]
+        assert_eq!(out, vec![10, 20, 11, 21]);
+    }
+
+    #[test]
+    fn deinterleave_cols_permutes_within_each_row() {
+        // 2 строки × 4 головы по 1 байту
+        let src = [10u8, 11, 20, 21, 30, 31, 40, 41];
+        let out = deinterleave_cols(&src, 2, 2, 2, 1);
+        assert_eq!(out, vec![10, 20, 11, 21, 30, 40, 31, 41]);
+    }
+
+    /// Перепаковка qkv трогает только v-хвост: q и k остаются на месте.
+    #[test]
+    fn repack_qkv_keeps_q_and_k() {
+        let lay = DeltaLayout { n_k: 2, n_v: 4, hk: 1, hv: 1 };
+        // cols=1 (row_bytes=2): q(2 строки) k(2) v(4)
+        let data: Vec<u8> = (0u8..16).collect();
+        let out = repack_delta("blk.0.attn_qkv.weight", data.clone(), &[8, 1], Some(lay));
+        assert_eq!(&out[..8], &data[..8], "q/k не должны двигаться");
+        // v-строки HF [v0,v1,v2,v3] → GGUF [v0,v2,v1,v3]
+        assert_eq!(&out[8..], &[8u8, 9, 12, 13, 10, 11, 14, 15]);
     }
 }
