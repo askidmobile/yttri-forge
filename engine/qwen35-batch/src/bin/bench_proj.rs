@@ -55,6 +55,27 @@ fn main() -> Result<()> {
     };
     let x = Tensor::randn(0f32, 1f32, (1usize, m, K), &dev)?;
 
+    // FFN (по профилю — самая крупная статья): gate/up [9216, 2560] и
+    // down [2560, 9216]. K у down другой, поэтому у него свой вход.
+    for (name, n, k) in [("ffn_gate/up", 9216usize, K), ("ffn_down", 2560, 9216)] {
+        println!("{name} [{n}, {k}]:");
+        let w_cpu = Tensor::randn(0f32, 0.02f32, (n, k), &Device::Cpu)?;
+        let xk = Tensor::randn(0f32, 1f32, (1usize, m, k), &dev)?;
+        for (label, dtype) in [
+            ("Q4_K MMQ (GGUF)", GgmlDType::Q4K),
+            ("Q8_0 MMQ (сайдкар)", GgmlDType::Q8_0),
+        ] {
+            let q = QMatMul::from_qtensor(QTensor::quantize_onto(&w_cpu, dtype, &dev)?)?;
+            let ms = timed(&dev, ITERS, || {
+                q.forward(&xk)?;
+                Ok(())
+            })?;
+            let flops = 2.0 * m as f64 * n as f64 * k as f64;
+            println!("  {label:<24} {ms:7.3} мс   {:6.1} T(FL)OPS", flops / (ms * 1e-3) / 1e12);
+        }
+        println!();
+    }
+
     // Проекции DeltaNet одного слоя: qkv, z, b, a + ssm_out.
     for (name, n) in [("qkv", 8192usize), ("z", 4096), ("b", 32), ("a", 32)] {
         println!("{name} [{n}, {K}]:");
