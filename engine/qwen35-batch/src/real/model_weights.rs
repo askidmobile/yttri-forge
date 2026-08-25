@@ -4496,7 +4496,7 @@ impl HybridBlock {
         let residual = &x;
         let normed = self.ffn_norm.forward(&x)?;
         let ffn_out = self.ff.forward(&normed)?;
-        Ok(ffn_out + residual)
+        Ok((ffn_out + residual)?)
     }
 
     fn forward_decode_batch_paged(
