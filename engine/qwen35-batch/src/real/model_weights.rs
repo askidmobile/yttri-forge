@@ -7580,7 +7580,14 @@ impl ModelWeights {
             // SAFETY: F16 LE буфер выровнен 64B, lifetime покрыт mmap'ом Reader
             let ptr = bytes.as_ptr() as *const half::f16;
             let slice = unsafe { std::slice::from_raw_parts(ptr, n_elem) };
-            let t = match candle_core::Tensor::from_vec(slice.to_vec(), shape.to_vec(), device) {
+            // Тензор собираем на CPU: при квантовании F16 не должен попадать в
+            // VRAM — его страницы остаются в driver pool и съедают экономию
+            // (замер 2026-08-25: +2656 МиБ вместо +1322).
+            let t = match candle_core::Tensor::from_vec(
+                slice.to_vec(),
+                shape.to_vec(),
+                &candle_core::Device::Cpu,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("[ytf] WARN tensor {name}: {e}");
@@ -7592,18 +7599,25 @@ impl ModelWeights {
             // из GGUF, и матмуль идёт через готовое fused MMQ-ядро, а не через
             // F16-GEMM с F32-аккумуляцией (на Ampere он вдвое ниже пика).
             if std::env::var("QWEN36_YTF16_F16").as_deref() == Ok("1") {
-                return Some(QMatMul::TensorF16(t));
+                return match t.to_device(device) {
+                    Ok(t) => Some(QMatMul::TensorF16(t)),
+                    Err(e) => {
+                        eprintln!("[ytf] WARN upload {name}: {e}");
+                        None
+                    }
+                };
             }
-            match candle_core::quantized::QTensor::quantize(
+            match candle_core::quantized::QTensor::quantize_onto(
                 &t,
                 candle_core::quantized::GgmlDType::Q8_0,
+                device,
             )
             .and_then(QMatMul::from_qtensor)
             {
                 Ok(q) => Some(q),
                 Err(e) => {
                     eprintln!("[ytf] WARN quantize {name}: {e} — остаёмся на F16");
-                    Some(QMatMul::TensorF16(t))
+                    t.to_device(device).ok().map(QMatMul::TensorF16)
                 }
             }
         }
