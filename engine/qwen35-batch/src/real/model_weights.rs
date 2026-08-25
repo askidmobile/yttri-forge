@@ -7506,9 +7506,22 @@ impl ModelWeights {
             2048
         };
 
-        // Базовое окно: минимум из ограничения модели, доступной VRAM и потолка 32K (кратно PAGE_SIZE=64)
+        // Контекст, который сервер реально обслуживает. Без него окно берётся
+        // из нативного контекста GGUF (32K у Qwen3.5-4B) даже при CTX=4096, и
+        // пул впустую занимает ~1 ГБ VRAM на слот: замер на 4B показал 2172 МБ
+        // без ограничения, 1116 при 16K и 572 при 8K, время запроса одинаковое.
+        // CTX — переменная сервера (qwen36-server/src/config.rs), дефолт там
+        // 131072, так что при незаданном CTX поведение прежнее.
+        let served_ctx = std::env::var("CTX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+
+        // Базовое окно: минимум из ограничения модели, обслуживаемого контекста,
+        // доступной VRAM и потолка 32K (кратно PAGE_SIZE=64)
         let auto_window = max_tokens_by_vram
             .min(model_attn_window)
+            .min(served_ctx)
             .min(32768)
             .max(512); // минимум 512 токенов
         let ps = crate::real::paged_kv_cuda::PAGE_SIZE;
@@ -7524,7 +7537,7 @@ impl ModelWeights {
         let num_blocks = capacity_b * max_blocks;
         let pool_vram_mb = (num_blocks * ps * num_attn_layers * 2 * n_kv * hd * 2) / (1024 * 1024);
         log::info!(
-            "[qwen35-batch] auto paged decode: window={window} (max_blocks={max_blocks}, pool_vram={pool_vram_mb}MB, free_vram={:.0}MB)",
+            "[qwen35-batch] auto paged decode: window={window} (max_blocks={max_blocks}, pool_vram={pool_vram_mb}MB, served_ctx={served_ctx}, model_window={model_attn_window}, free_vram={:.0}MB)",
             free_vram as f64 / (1024.0 * 1024.0)
         );
 
