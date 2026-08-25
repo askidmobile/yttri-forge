@@ -7616,6 +7616,19 @@ impl ModelWeights {
                     return None;
                 }
             };
+            // Узкие тензоры (attn_a/attn_b: 32 строки) не проходят гейт
+            // `n % 128 == 0` в mul_mat_q_mma и уходят в dequantize_matmul —
+            // 0.129 мс против 0.052 у F16 при 0.003 мс полезной работы.
+            // Держим их в F16: и быстрее, и точнее Q8_0.
+            if shape.first().map(|n| n % 128 != 0).unwrap_or(false) {
+                return match t.to_device(device) {
+                    Ok(t) => Some(QMatMul::TensorF16(t)),
+                    Err(e) => {
+                        eprintln!("[ytf] WARN upload {name}: {e}");
+                        None
+                    }
+                };
+            }
             // Формат сайдкара в VRAM: Q8_0 (умолчание) или F16 (QWEN36_YTF16_F16=1).
             // Q8_0 вдвое компактнее F16, ошибка весов 0.58% против 3.9% у Q4_K
             // из GGUF, и матмуль идёт через готовое fused MMQ-ядро, а не через
