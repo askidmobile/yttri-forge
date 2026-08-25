@@ -61,6 +61,45 @@ fn run(
     let out = dev.alloc_zeros::<f32>(t * n_v * hvd)?;
     let state0 = fill(n_v * hvd * hvd, 6);
 
+    if kernel == "delta_rule_prefill_chunked" {
+        // Блок ведёт 64 столбца состояния одной головы; поток держит 32 строки
+        // своего столбца в регистрах. Shared: K,Q [32×128], δ [32×64],
+        // две матрицы [32×32] и мелочь — около 49 КБ, нужен opt-in.
+        const C: usize = 32;
+        const COLS: usize = 64;
+        const ROWGRP: usize = 4;
+        let smem = (2 * C * hkd + C * COLS + 2 * C * C + 2 * C + COLS * ROWGRP) * 4;
+        let func = dev.get_or_load_func(kernel, &candle_kernels::DELTA_RULE)?;
+        func.set_attribute(
+            candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem as i32,
+        )
+        .map_err(|e| anyhow!("set_attribute: {e:?}"))?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_v as u32, (hvd / COLS) as u32, 1),
+            block_dim: (COLS as u32, ROWGRP as u32, 1),
+            shared_mem_bytes: smem as u32,
+        };
+        let t_u32 = t as u32;
+        let mut state = dev.clone_htod(&state0)?;
+        let mut launch = |state: &mut _| -> Result<()> {
+            let mut b = func.builder();
+            b.arg(&q); b.arg(&k); b.arg(&v); b.arg(&beta); b.arg(&gate);
+            b.arg(&*state); b.arg(&out); b.arg(&p); b.arg(&t_u32);
+            unsafe { b.launch(cfg) }.map_err(|e| anyhow!("launch {kernel}: {e:?}"))?;
+            Ok(())
+        };
+        launch(&mut state)?;
+        dev.cuda_stream().synchronize()?;
+        let reference = dev.clone_dtoh(&out)?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            launch(&mut state)?;
+        }
+        dev.cuda_stream().synchronize()?;
+        return Ok((t0.elapsed().as_secs_f64() * 1e3 / iters as f64, reference));
+    }
+
     // Ядро параметризовано по blockDim.y: warp ведёт одну колонку состояния,
     // блок — `warps` колонок. У v2 k/q грузятся в shared один раз на блок,
     // поэтому чем больше warps, тем меньше повторных чтений — но тем хуже
@@ -415,6 +454,7 @@ fn main() -> Result<()> {
         ("delta_rule_prefill_probe1", 2),
         // Диагностика: без редукций вообще.
         ("delta_rule_prefill_probe0", 2),
+        ("delta_rule_prefill_chunked", 0),
     ];
     for (kernel, warps) in variants {
         let kernel_label = format!("{kernel} warps={warps}");

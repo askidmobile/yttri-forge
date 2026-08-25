@@ -578,6 +578,180 @@ extern "C" __global__ void delta_rule_prefill_v2(
     }
 }
 
+// P3-chunked: рекуррентность блоками по C токенов.
+//
+// Вывод (S — состояние [hkd × hvd], c_t — лог-кумулята гейта внутри блока):
+//     S_t = exp(c_t) [ S_0 + Σ_{i≤t} (k_i/exp(c_i)) δ_iᵀ ]
+//     δ_t = β_t ( v_t − S_0ᵀ k̂_t − Σ_{i<t} exp(c_t−c_i)(k_i·k_t) δ_i )
+//     o_t = exp(c_t) S_0ᵀ q_t + Σ_{i≤t} exp(c_t−c_i)(k_i·q_t) δ_i
+//     S_C = exp(c_C) S_0 + Σ_i exp(c_C−c_i) k_i δ_iᵀ
+// Все множители входят как exp(c_t−c_i) при t ≥ i, то есть ≤ 1 — отдельно
+// k/exp(c_i) не считаем, иначе при затухающем гейте f32 переполняется.
+//
+// Раскладка: блок ведёт COLS столбцов состояния одной головы. Поток владеет
+// 32 строками своего столбца в регистрах, поэтому Sᵀk и Sᵀq считаются локально
+// (нужна лишь 4-сторонняя редукция по группам строк), а warp-редукций на
+// каждый токен, которые съедали 41% времени в последовательном ядре, нет.
+// grid = (n_v_heads, hvd/COLS), block = (COLS, ROWGRP).
+#define DR_CHUNK 32
+#define DR_COLS 64
+#define DR_ROWGRP 4
+
+extern "C" __global__ void delta_rule_prefill_chunked(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ beta,
+    const float* __restrict__ gate,
+    float* __restrict__ ssm_state,
+    float* __restrict__ output,
+    const DeltaParams params,
+    const unsigned int T
+) {
+    extern __shared__ float smem[];
+    const unsigned int hkd = params.head_k_dim;   // 128
+    const unsigned int hvd = params.head_v_dim;   // 128
+    const unsigned int n_v = params.n_v_heads;
+    const unsigned int head = blockIdx.x;
+    const unsigned int col0 = blockIdx.y * DR_COLS;
+
+    const unsigned int col_l = threadIdx.x;              // 0..COLS-1
+    const unsigned int rowgrp = threadIdx.y;             // 0..ROWGRP-1
+    const unsigned int tid = rowgrp * DR_COLS + col_l;
+    const unsigned int nthreads = DR_COLS * DR_ROWGRP;
+    const unsigned int rows_per = hkd / DR_ROWGRP;       // 32
+    const unsigned int row0 = rowgrp * rows_per;
+    const unsigned int col = col0 + col_l;
+
+    float* sk = smem;                                    // [C][hkd]
+    float* sq = sk + DR_CHUNK * hkd;                     // [C][hkd]
+    float* sd = sq + DR_CHUNK * hkd;                     // [C][COLS]  (δ)
+    float* sa = sd + DR_CHUNK * DR_COLS;                 // [C][C]     (k_i·k_t)
+    float* sbq = sa + DR_CHUNK * DR_CHUNK;               // [C][C]     (k_i·q_t)
+    float* sc = sbq + DR_CHUNK * DR_CHUNK;               // [C] лог-кумулята
+    float* sbeta = sc + DR_CHUNK;                        // [C]
+    float* sred = sbeta + DR_CHUNK;                      // [COLS][ROWGRP]
+
+    // Состояние: строки [row0, row0+rows_per) своего столбца — в регистрах.
+    float st[32];
+    #pragma unroll
+    for (unsigned int r = 0; r < 32; r++) {
+        st[r] = ssm_state[head * hkd * hvd + (row0 + r) * hvd + col];
+    }
+
+    for (unsigned int t0 = 0; t0 < T; t0 += DR_CHUNK) {
+        const unsigned int C = min((unsigned int)DR_CHUNK, T - t0);
+
+        // 1. K/Q блока в shared + гейт/бета.
+        for (unsigned int idx = tid; idx < C * hkd; idx += nthreads) {
+            const unsigned int i = idx / hkd, d = idx % hkd;
+            const unsigned int base = ((t0 + i) * n_v + head) * hkd;
+            sk[i * hkd + d] = k[base + d];
+            sq[i * hkd + d] = q[base + d];
+        }
+        if (tid == 0) {
+            float acc = 0.0f;
+            for (unsigned int i = 0; i < C; i++) {
+                acc += gate[(t0 + i) * n_v + head];
+                sc[i] = acc;
+                sbeta[i] = beta[(t0 + i) * n_v + head];
+            }
+        }
+        __syncthreads();
+
+        // 2. Матрицы попарных скалярных произведений с затуханием.
+        for (unsigned int idx = tid; idx < C * C; idx += nthreads) {
+            const unsigned int t = idx / C, i = idx % C;
+            if (i > t) {
+                sa[idx] = 0.0f;
+                sbq[idx] = 0.0f;
+                continue;
+            }
+            float dk = 0.0f, dq = 0.0f;
+            for (unsigned int d = 0; d < hkd; d++) {
+                const float ki = sk[i * hkd + d];
+                dk += ki * sk[t * hkd + d];
+                dq += ki * sq[t * hkd + d];
+            }
+            const float decay = __expf(sc[t] - sc[i]);
+            sa[idx] = (i < t) ? decay * dk : 0.0f;   // строго нижняя
+            sbq[idx] = decay * dq;                   // включая диагональ
+        }
+        __syncthreads();
+
+        // 3. W = β (v − exp(c_t) S₀ᵀ k_t) и прямая подстановка по строкам.
+        for (unsigned int t = 0; t < C; t++) {
+            float part = 0.0f;
+            #pragma unroll
+            for (unsigned int r = 0; r < 32; r++) {
+                part += st[r] * sk[t * hkd + row0 + r];
+            }
+            sred[col_l * DR_ROWGRP + rowgrp] = part;
+            __syncthreads();
+            if (rowgrp == 0) {
+                float s0k = 0.0f;
+                #pragma unroll
+                for (unsigned int g = 0; g < DR_ROWGRP; g++) {
+                    s0k += sred[col_l * DR_ROWGRP + g];
+                }
+                const unsigned int vb = ((t0 + t) * n_v + head) * hvd;
+                float w = v[vb + col] - __expf(sc[t]) * s0k;
+                // − Σ_{i<t} A[t][i] δ_i, затем умножение на β.
+                float acc = 0.0f;
+                for (unsigned int i = 0; i < t; i++) {
+                    acc += sa[t * DR_CHUNK + i] * sd[i * DR_COLS + col_l];
+                }
+                sd[t * DR_COLS + col_l] = sbeta[t] * (w - acc);
+            }
+            __syncthreads();
+        }
+
+        // 4. Выход блока: exp(c_t) S₀ᵀ q_t + Σ_{i≤t} B[t][i] δ_i.
+        for (unsigned int t = 0; t < C; t++) {
+            float part = 0.0f;
+            #pragma unroll
+            for (unsigned int r = 0; r < 32; r++) {
+                part += st[r] * sq[t * hkd + row0 + r];
+            }
+            sred[col_l * DR_ROWGRP + rowgrp] = part;
+            __syncthreads();
+            if (rowgrp == 0) {
+                float s0q = 0.0f;
+                #pragma unroll
+                for (unsigned int g = 0; g < DR_ROWGRP; g++) {
+                    s0q += sred[col_l * DR_ROWGRP + g];
+                }
+                float o = __expf(sc[t]) * s0q;
+                for (unsigned int i = 0; i <= t; i++) {
+                    o += sbq[t * DR_CHUNK + i] * sd[i * DR_COLS + col_l];
+                }
+                output[((t0 + t) * n_v + head) * hvd + col] = o;
+            }
+            __syncthreads();
+        }
+
+        // 5. Состояние: S ← exp(c_C) S + Σ_i exp(c_C − c_i) k_i δ_iᵀ.
+        const float gc = sc[C - 1];
+        #pragma unroll
+        for (unsigned int r = 0; r < 32; r++) {
+            st[r] *= __expf(gc);
+        }
+        for (unsigned int i = 0; i < C; i++) {
+            const float w = __expf(gc - sc[i]) * sd[i * DR_COLS + col_l];
+            #pragma unroll
+            for (unsigned int r = 0; r < 32; r++) {
+                st[r] += w * sk[i * hkd + row0 + r];
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (unsigned int r = 0; r < 32; r++) {
+        ssm_state[head * hkd * hvd + (row0 + r) * hvd + col] = st[r];
+    }
+}
+
 // ДИАГНОСТИКА (не для продакшена): те же обращения к памяти и та же
 // арифметика, но с одной warp-редукцией на токен (probe1) и без редукций
 // вовсе (probe0). Результат заведомо неверен — ядра нужны, чтобы измерить,
