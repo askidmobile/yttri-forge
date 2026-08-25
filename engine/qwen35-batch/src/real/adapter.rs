@@ -309,6 +309,16 @@ impl Qwen35BatchAdapter {
             let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
         }
 
+        // F16-GEMM сайдкара по умолчанию аккумулирует в F32 (как в pytorch).
+        // На Ampere это вдвое медленнее F16-аккумуляции. QWEN36_F16_FAST_ACC=1
+        // включает CUBLAS_COMPUTE_16F — быстрее, но копит ошибку по K=2560;
+        // сторож [pfa] WARN non-finite logits ловит срыв.
+        #[cfg(feature = "cuda")]
+        if std::env::var("QWEN36_F16_FAST_ACC").as_deref() == Ok("1") {
+            candle_core::cuda_backend::set_gemm_reduced_precision_f16(true);
+            log::info!("[ytf] F16 GEMM: аккумуляция F16 (fast)");
+        }
+
         #[cfg(feature = "cuda")]
         let graphs_on = {
             let want = std::env::var("QWEN36_CUDA_GRAPHS").as_deref() == Ok("1");
