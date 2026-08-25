@@ -13,15 +13,13 @@ use tokenizers::Tokenizer;
 
 use super::multimodal::{self, IMAGE_PAD_TOKEN_ID, VIDEO_PAD_TOKEN_ID};
 
-/// Загрузить tokenizer напрямую из GGUF-файла (читается только header + metadata
-/// через mmap; веса не трогаются). Удобно для тестов, не зависящих от адаптера.
+/// Загрузить tokenizer напрямую из файла модели (читается только header +
+/// metadata через mmap; веса не трогаются). Формат — GGUF или самостоятельный
+/// контейнер .ytf: у второго внутри лежит готовый tokenizer.json, и читатель
+/// разворачивает его в тот же ключ `tokenizer.huggingface.json`.
 pub fn load_from_gguf_path(path: &std::path::Path) -> Result<Tokenizer> {
-    use std::io::Cursor;
-    let file = std::fs::File::open(path).map_err(|e| anyhow!("open GGUF: {e}"))?;
-    let mmap =
-        unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| anyhow!("mmap GGUF: {e}"))?;
-    let mut c = Cursor::new(mmap.as_ref());
-    let ct = gguf_file::Content::read(&mut c).map_err(|e| anyhow!("read GGUF: {e}"))?;
+    let (ct, _mmap) = super::ytf16::content_any_path(path)
+        .map_err(|e| anyhow!("read model: {e}"))?;
     load_from_gguf(&ct.metadata)
 }
 
