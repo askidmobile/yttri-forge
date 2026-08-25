@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 #[command(name = "forge-convert", version)]
 struct Args {
     /// safetensors файлы модели (BASE). Шарды — через пробел.
-    #[arg(required_unless_present = "list")]
+    #[arg(required_unless_present_any = ["list", "verify_ytf"])]
     inputs: Vec<PathBuf>,
 
     /// Режим heavy: 9 групп проекций DeltaNet+Attention
@@ -64,10 +64,26 @@ struct Args {
     /// tokenizer.json для встраивания (умолчание — рядом с первым входом)
     #[arg(long)]
     tokenizer: Option<PathBuf>,
+
+    /// Сверить готовый .ytf с эталонным GGUF потензорно (значения, не только
+    /// имена и формы) и напечатать худшие расхождения.
+    #[arg(long)]
+    verify_ytf: Option<PathBuf>,
 }
 
 fn main() {
     let args = Args::parse();
+    if let Some(ytf) = args.verify_ytf.clone() {
+        let Some(gguf) = args.gguf.clone() else {
+            eprintln!("error: --verify-ytf требует --gguf <эталон>");
+            std::process::exit(2);
+        };
+        if let Err(e) = pack::verify(&ytf, &gguf, 15) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if !args.f16_heavy && !args.pack {
         eprintln!("error: нужен --f16-heavy (сайдкар) или --pack (самостоятельный контейнер)");
         std::process::exit(2);

@@ -293,3 +293,93 @@ mod tests {
         assert_eq!(hf_to_gguf("model.language_model.layers.1.something.weight"), None);
     }
 }
+
+/// Сверить готовый контейнер с эталонным GGUF потензорно.
+///
+/// Оба файла квантованы из одних весов, поэтому расхождение должно быть на
+/// уровне шума квантования (единицы процентов). Десятки и сотни процентов
+/// означают, что тензор попал не туда или не в той раскладке — именно такую
+/// ошибку не ловят проверки имён и форм.
+pub fn verify(ytf: &Path, ref_gguf: &Path, top: usize) -> Result<(), String> {
+    let cont = container::Reader::open(ytf)?;
+    let mut gf = std::fs::File::open(ref_gguf)
+        .map_err(|e| format!("open {}: {e}", ref_gguf.display()))?;
+    let ct = gguf_file::Content::read(&mut gf).map_err(|e| format!("read ref gguf: {e}"))?;
+    let gguf_mmap = {
+        let f = std::fs::File::open(ref_gguf).map_err(|e| format!("open: {e}"))?;
+        unsafe { memmap2::MmapOptions::new().map(&f) }.map_err(|e| format!("mmap: {e}"))?
+    };
+
+    let dev = Device::Cpu;
+    let mut rows: Vec<(f64, String, String)> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for entry in &cont.manifest.tensors {
+        if entry.dtype == "RAW" {
+            continue;
+        }
+        let Some(info) = ct.tensor_infos.get(&entry.name) else {
+            missing.push(entry.name.clone());
+            continue;
+        };
+        let want = info
+            .read_from_slice(&gguf_mmap, ct.tensor_data_offset, &dev)
+            .map_err(|e| format!("{}: чтение эталона: {e}", entry.name))?
+            .dequantize(&dev)
+            .map_err(|e| format!("{}: деквант эталона: {e}", entry.name))?
+            .flatten_all()
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| format!("{}: вектор эталона: {e}", entry.name))?;
+
+        let (bytes, shape) = cont
+            .tensor(&entry.name)
+            .ok_or_else(|| format!("{}: нет в контейнере", entry.name))?;
+        let dt = match entry.dtype.as_str() {
+            "F32" => GgmlDType::F32,
+            "F16" => GgmlDType::F16,
+            "Q4_K" => GgmlDType::Q4K,
+            "Q5_K" => GgmlDType::Q5K,
+            "Q6_K" => GgmlDType::Q6K,
+            "Q8_0" => GgmlDType::Q8_0,
+            other => return Err(format!("{}: тип {other} не поддержан сверкой", entry.name)),
+        };
+        let got = candle_core::quantized::ggml_file::qtensor_from_ggml(dt, bytes, shape.to_vec(), &dev)
+            .map_err(|e| format!("{}: разбор блоков: {e}", entry.name))?
+            .dequantize(&dev)
+            .map_err(|e| format!("{}: деквант: {e}", entry.name))?
+            .flatten_all()
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| format!("{}: вектор: {e}", entry.name))?;
+
+        if got.len() != want.len() {
+            rows.push((f64::INFINITY, entry.name.clone(), format!("длина {} vs {}", got.len(), want.len())));
+            continue;
+        }
+        let mut num = 0f64;
+        let mut den = 0f64;
+        for (a, b) in got.iter().zip(want.iter()) {
+            num += (*a as f64 - *b as f64).abs();
+            den += (*b as f64).abs();
+        }
+        let rel = 100.0 * num / den.max(1e-12);
+        rows.push((rel, entry.name.clone(), format!("{:?}", shape)));
+    }
+
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    println!("сверено тензоров: {}", rows.len());
+    if !missing.is_empty() {
+        println!("нет в эталоне: {} ({:?})", missing.len(), &missing[..missing.len().min(5)]);
+    }
+    println!("худшие расхождения (относительная ошибка значений):");
+    for (rel, name, shape) in rows.iter().take(top) {
+        println!("  {rel:8.2}%  {name}  {shape}");
+    }
+    let bad = rows.iter().filter(|r| r.0 > 15.0).count();
+    println!(
+        "медиана {:.2}%, выше 15%: {bad}",
+        rows.get(rows.len() / 2).map(|r| r.0).unwrap_or(0.0)
+    );
+    if bad > 0 {
+        return Err(format!("{bad} тензоров расходятся с эталоном сильнее шума квантования"));
+    }
+    Ok(())
+}
