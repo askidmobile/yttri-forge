@@ -1,0 +1,113 @@
+//! bench_proj — потолок проекций префилла на реальных формах Qwen3.5-4B.
+//!
+//! Меряет один matmul [M,K] × [N,K]ᵀ для путей, которые у нас есть, и считает
+//! эффективные TOPS/TFLOPS. Заодно сравнивает 4 раздельные проекции DeltaNet
+//! (qkv/z/b/a) с одной слитой — это то, что даёт наш формат и чего не даёт GGUF.
+//!
+//! Запуск: bench_proj [M] (умолчание 512 — размер чанка префилла).
+
+use anyhow::Result;
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+use candle_core::{DType, Device, Module, Tensor};
+
+const K: usize = 2560; // hidden_size
+const ITERS: usize = 20;
+
+fn timed(dev: &Device, iters: usize, mut f: impl FnMut() -> Result<()>) -> Result<f64> {
+    for _ in 0..3 {
+        f()?;
+    }
+    dev.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        f()?;
+    }
+    dev.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() * 1e3 / iters as f64)
+}
+
+/// Отчёт: время и эффективная производительность (2*M*N*K флопов на matmul).
+fn report(name: &str, m: usize, n: usize, ms: f64) {
+    let flops = 2.0 * m as f64 * n as f64 * K as f64;
+    println!(
+        "  {name:<28} {ms:7.3} мс   {:6.1} T(FL)OPS",
+        flops / (ms * 1e-3) / 1e12
+    );
+}
+
+fn qmatmul(w_cpu: &Tensor, dtype: GgmlDType, dev: &Device) -> Result<QMatMul> {
+    Ok(QMatMul::from_qtensor(QTensor::quantize_onto(
+        w_cpu, dtype, dev,
+    )?)?)
+}
+
+fn main() -> Result<()> {
+    let m: usize = std::env::args()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
+    let dev = Device::new_cuda(0)?;
+    println!("bench_proj: M={m} K={K} (чанк префилла), {ITERS} итераций\n");
+
+    // Веса собираем на CPU: quantize_onto кладёт квант сразу в VRAM.
+    let mk_w = |n: usize| -> Result<Tensor> {
+        Ok(Tensor::randn(0f32, 0.02f32, (n, K), &Device::Cpu)?)
+    };
+    let x = Tensor::randn(0f32, 1f32, (1usize, m, K), &dev)?;
+
+    // Проекции DeltaNet одного слоя: qkv, z, b, a + ssm_out.
+    for (name, n) in [("qkv", 8192usize), ("z", 4096), ("b", 32), ("a", 32)] {
+        println!("{name} [{n}, {K}]:");
+        let w_cpu = mk_w(n)?;
+        for (label, dtype) in [("Q4_K MMQ (GGUF)", GgmlDType::Q4K), ("Q8_0 MMQ", GgmlDType::Q8_0)] {
+            let q = qmatmul(&w_cpu, dtype, &dev)?;
+            let ms = timed(&dev, ITERS, || {
+                q.forward(&x)?;
+                Ok(())
+            })?;
+            report(label, m, n, ms);
+        }
+        let w_f16 = w_cpu.to_device(&dev)?.to_dtype(DType::F16)?;
+        let qm = QMatMul::TensorF16(w_f16);
+        for (label, fast) in [("F16 GEMM (acc F32)", false), ("F16 GEMM (acc F16)", true)] {
+            candle_core::cuda_backend::set_gemm_reduced_precision_f16(fast);
+            let ms = timed(&dev, ITERS, || {
+                qm.forward(&x)?;
+                Ok(())
+            })?;
+            report(label, m, n, ms);
+        }
+        candle_core::cuda_backend::set_gemm_reduced_precision_f16(false);
+        println!();
+    }
+
+    // Слитая проекция: qkv+z+b+a одним тензором — экономия запусков и один
+    // проход по активациям вместо четырёх.
+    let fused_n = 8192 + 4096 + 32 + 32;
+    println!("слитая qkv+z+b+a [{fused_n}, {K}] против четырёх раздельных:");
+    let w_cpu = mk_w(fused_n)?;
+    for (label, dtype) in [("Q4_K MMQ", GgmlDType::Q4K), ("Q8_0 MMQ", GgmlDType::Q8_0)] {
+        let fused = qmatmul(&w_cpu, dtype, &dev)?;
+        let ms_fused = timed(&dev, ITERS, || {
+            fused.forward(&x)?;
+            Ok(())
+        })?;
+        let parts: Vec<QMatMul> = [8192usize, 4096, 32, 32]
+            .iter()
+            .map(|&n| qmatmul(&mk_w(n).unwrap(), dtype, &dev))
+            .collect::<Result<_>>()?;
+        let ms_split = timed(&dev, ITERS, || {
+            for p in &parts {
+                p.forward(&x)?;
+            }
+            Ok(())
+        })?;
+        println!(
+            "  {label:<12} слитая {ms_fused:7.3} мс | раздельные {ms_split:7.3} мс | выигрыш {:+.1}%",
+            100.0 * (ms_split - ms_fused) / ms_split
+        );
+    }
+
+    println!("\nПик RTX 3060 (GA106): F16 c F32-акк ~25.6 TFLOPS, int8 ~51.2 TOPS.");
+    Ok(())
+}

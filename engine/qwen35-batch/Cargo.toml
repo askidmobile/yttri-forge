@@ -113,6 +113,11 @@ path = "src/bin/qwen35_multimodal_logits.rs"
 required-features = ["real-model", "cuda"]
 
 [[bin]]
+name = "bench_proj"
+path = "src/bin/bench_proj.rs"
+required-features = ["real-model", "cuda"]
+
+[[bin]]
 name = "bench_candle_direct"
 path = "src/bin/bench_candle_direct.rs"
 required-features = ["real-model"]
