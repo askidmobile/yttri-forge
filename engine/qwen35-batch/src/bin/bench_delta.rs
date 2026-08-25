@@ -98,9 +98,11 @@ fn run(
     dev.cuda_stream().synchronize()?;
     let reference = dev.clone_dtoh(&out)?;
 
+    // H2D состояния (2 МБ) держим ВНЕ замера: внутри цикла оно добавляло
+    // ~0.5 мс фиксированной платы и искажало масштабирование по T.
+    let mut state = dev.clone_htod(&state0)?;
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        let mut state = dev.clone_htod(&state0)?;
         launch(&mut state)?;
     }
     dev.cuda_stream().synchronize()?;
@@ -122,12 +124,12 @@ fn main() -> Result<()> {
     let mut base: Option<Vec<f32>> = None;
     let variants: Vec<(&str, u32)> = vec![
         ("delta_rule_prefill", 2),
-        ("delta_rule_prefill", 4),
-        ("delta_rule_prefill", 8),
-        ("delta_rule_prefill_v2", 4),
         ("delta_rule_prefill_v2", 8),
-        ("delta_rule_prefill_v2", 16),
-        ("delta_rule_prefill_v2", 32),
+        // Диагностика: одна warp-редукция на токен вместо двух (математика
+        // неверна, меряем только цену редукций).
+        ("delta_rule_prefill_probe1", 2),
+        // Диагностика: без редукций вообще.
+        ("delta_rule_prefill_probe0", 2),
     ];
     for (kernel, warps) in variants {
         let kernel_label = format!("{kernel} warps={warps}");
