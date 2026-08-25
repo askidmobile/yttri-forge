@@ -4488,7 +4488,7 @@ impl HybridBlock {
                 }
             }
             HybridLayerType::Attention(attn) => {
-                attn.forward_attn_prefill_paged(&normed, ctx, rope_pos_dev)?
+                attn.forward_attn_prefill_paged(&normed, ctx, rope_pos_dev)
             }
         };
         let x = (layer_out + residual)?;
