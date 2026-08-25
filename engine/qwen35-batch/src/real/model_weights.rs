@@ -3049,31 +3049,18 @@ fn audit_ytf16(name: &str, gguf: &QMatMul, sidecar: &QMatMul) {
             let (o, i2) = (g.dim(0)?, g.dim(1)?);
             let alt = f.reshape((i2, o))?.t()?.contiguous()?;
             let dt = (&g - &alt)?.abs()?.max_all()?.to_scalar::<f32>()?;
-            // Ищем, какой строке GGUF соответствует строка сайдкара: если это
-            // перестановка строк, найдётся точное совпадение (в пределах ошибки
-            // квантования), и индексы покажут закон перестановки.
-            let ncols = i2 as f32;
-            let mut rows = String::new();
-            for r in [0usize, 1, 2, 64, 1024] {
-                if r >= o {
-                    continue;
-                }
-                let fr = f.i((r, ..))?.unsqueeze(0)?;
-                let d = match g.broadcast_sub(&fr) {
-                    Ok(d) => d.abs()?.sum(1)?,
-                    Err(e) => {
-                        rows.push_str(&format!("\n[ytf-audit]   row {r}: {e}"));
-                        continue;
-                    }
-                };
-                let idx = d.argmin(0)?.to_scalar::<u32>()? as usize;
-                let best = d.i(idx)?.to_scalar::<f32>()? / ncols;
-                let same = d.i(r)?.to_scalar::<f32>()? / ncols;
-                rows.push_str(&format!(
-                    "\n[ytf-audit]   f[{r}] ближе всего к g[{idx}] (avg|diff|={best:.5}), на своём месте {same:.5}"
-                ));
+            // Средняя ошибка по восьми блокам строк: сразу видно, какая часть
+            // тензора не совпадает (q/k/v-блоки фьюженных проекций).
+            let chunks = 8usize;
+            let rows_per = o / chunks;
+            let mut per = String::new();
+            for c in 0..chunks {
+                let gd = g.narrow(0, c * rows_per, rows_per)?;
+                let fd = f.narrow(0, c * rows_per, rows_per)?;
+                let m = (gd - fd)?.abs()?.mean_all()?.to_scalar::<f32>()?;
+                per.push_str(&format!(" {}k={m:.5}", c * rows_per / 1024));
             }
-            format!(" max|g-fᵀ|={dt:.4}{rows}")
+            format!(" max|g-fᵀ|={dt:.4}\n[ytf-audit]   по блокам строк:{per}")
         } else {
             String::new()
         };
