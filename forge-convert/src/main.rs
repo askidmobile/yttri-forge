@@ -35,6 +35,15 @@ struct Args {
     /// Только показать найденные heavy-тензоры
     #[arg(long)]
     list: bool,
+
+    /// Эмулировать FP8 (E4M3, поблочный масштаб) поверх F16-хранения:
+    /// проверка качества без нативных FP8-ядер (их нет на Ampere).
+    #[arg(long)]
+    fp8_emulate: bool,
+
+    /// Размер блока масштабирования для --fp8-emulate
+    #[arg(long, default_value_t = 128)]
+    fp8_block: usize,
 }
 
 fn main() {
@@ -93,6 +102,47 @@ fn find_tensor_info(
         }
     }
     None
+}
+
+/// Округление до E4M3 (1-4-3, max 448) и обратно в f32.
+/// Субнормали прижаты к 2^-9; NaN/inf → 0 (в весах их не бывает).
+pub fn e4m3_round(x: f32) -> f32 {
+    if !x.is_finite() || x == 0.0 {
+        return 0.0;
+    }
+    let a = x.abs().min(448.0);
+    if a < 2f32.powi(-9) {
+        return 0.0;
+    }
+    // Экспонента с полом на минимальной нормали E4M3 (2^-6): ниже — субнормали
+    // с фиксированным шагом.
+    let e = a.log2().floor().max(-6.0);
+    let step = (e - 3.0).exp2(); // 3 бита мантиссы
+    let q = (a / step).round() * step;
+    q.min(448.0).copysign(x)
+}
+
+/// Поблочное FP8-квантование (E4M3) F16-буфера: блок = `block` подряд идущих
+/// значений, масштаб = amax/448. Возвращает (новые байты, сумма |Δ|, сумма |w|).
+pub fn fp8_emulate_f16(bytes: &[u8], block: usize) -> (Vec<u8>, f64, f64) {
+    let n = bytes.len() / 2;
+    let mut vals: Vec<f32> = Vec::with_capacity(n);
+    for c in bytes.chunks_exact(2) {
+        vals.push(half::f16::from_le_bytes([c[0], c[1]]).to_f32());
+    }
+    let (mut sum_err, mut sum_abs) = (0f64, 0f64);
+    let mut out = Vec::with_capacity(bytes.len());
+    for chunk in vals.chunks(block) {
+        let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let scale = if amax > 0.0 { amax / 448.0 } else { 1.0 };
+        for &v in chunk {
+            let q = e4m3_round(v / scale) * scale;
+            sum_err += (v - q).abs() as f64;
+            sum_abs += v.abs() as f64;
+            out.extend_from_slice(&half::f16::from_f32(q).to_le_bytes());
+        }
+    }
+    (out, sum_err, sum_abs)
 }
 
 /// Раскладка DeltaNet из config.json модели.
@@ -360,6 +410,7 @@ fn run(args: &Args) -> Result<(), String> {
     // Стриминг: для каждого планового тензора — чтение шарда, cast→F16
     let t0 = std::time::Instant::now();
     let mut total_bytes = 0u64;
+    let (mut fp8_err, mut fp8_abs) = (0f64, 0f64);
     for p in &plan {
         let found = find_tensor_info(&shards, &p.st_name)
             .ok_or_else(|| format!("tensor vanished: {}", p.st_name))?;
@@ -407,10 +458,25 @@ fn run(args: &Args) -> Result<(), String> {
             }
         };
         let f16_bytes = repack_delta(&p.gguf, f16_bytes, &shape, delta_layout);
+        let f16_bytes = if args.fp8_emulate {
+            let (q, err, abs) = fp8_emulate_f16(&f16_bytes, args.fp8_block);
+            fp8_err += err;
+            fp8_abs += abs;
+            q
+        } else {
+            f16_bytes
+        };
         total_bytes += f16_bytes.len() as u64;
         w.add_tensor(&p.gguf, &shape, f16_bytes);
     }
 
+    if args.fp8_emulate {
+        println!(
+            "fp8 emulate (E4M3, блок {}): относительная ошибка весов {:.3}%",
+            args.fp8_block,
+            100.0 * fp8_err / fp8_abs.max(1e-9)
+        );
+    }
     w.finalize().map_err(|e| format!("finalize: {e}"))?;
     let secs = t0.elapsed().as_secs_f64();
     println!(
@@ -469,6 +535,36 @@ mod tests {
         let src = [10u8, 11, 20, 21, 30, 31, 40, 41];
         let out = deinterleave_cols(&src, 2, 2, 2, 1);
         assert_eq!(out, vec![10, 20, 11, 21, 30, 40, 31, 41]);
+    }
+
+    /// E4M3 держит 3 бита мантиссы: относительная ошибка ≤ ~6%, знак и
+    /// порядок сохраняются, ноль остаётся нулём.
+    #[test]
+    fn e4m3_round_keeps_scale_and_sign() {
+        for x in [0.5f32, -0.5, 1.0, 3.14159, -0.0625, 100.0, 447.0] {
+            let q = e4m3_round(x);
+            assert_eq!(q.signum(), x.signum(), "знак {x}");
+            let rel = (q - x).abs() / x.abs();
+            assert!(rel <= 0.07, "x={x} q={q} rel={rel}");
+        }
+        assert_eq!(e4m3_round(0.0), 0.0);
+        assert_eq!(e4m3_round(1e6), 448.0, "клампится в максимум E4M3");
+        // Ниже минимальной субнормали (2^-9) E4M3 обнуляет — ровно поэтому
+        // веса масштабируются поблочно, а не квантуются «как есть».
+        assert_eq!(e4m3_round(0.001234), 0.0);
+    }
+
+    /// Поблочный масштаб спасает мелкие значения рядом с крупным выбросом.
+    #[test]
+    fn fp8_block_scaling_survives_outlier() {
+        let mut vals = vec![half::f16::from_f32(0.01); 127];
+        vals.push(half::f16::from_f32(400.0));
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let (out, err, abs) = fp8_emulate_f16(&bytes, 128);
+        assert_eq!(out.len(), bytes.len());
+        assert!(err / abs < 0.5, "ошибка блока {}", err / abs);
+        let first = half::f16::from_le_bytes([out[0], out[1]]).to_f32();
+        assert!(first > 0.0, "мелкое значение не должно обнуляться: {first}");
     }
 
     /// Перепаковка qkv трогает только v-хвост: q и k остаются на месте.
