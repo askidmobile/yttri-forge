@@ -221,7 +221,24 @@ extern "C" void run_mha(
         const int block_n = d <= 64 ? 256 : (d <= 128 ? 128 : 64);
         const int num_n_blocks = fa_ceildiv(seqlen_k, block_n);
         const int num_m_blocks = fa_ceildiv(seqlen_q, 64);
-        int ns = fa_num_splits_heuristic(b * h * num_m_blocks, num_sms, num_n_blocks, 128);
+        int ns;
+        if (seqlen_q == 1) {
+            // Декод: запрос один, поэтому без сплитов сетка это b*h блоков
+            // (16-32 на 28 SM) и карта простаивает. Апстримная эвристика
+            // считает «волны» в предположении, что блок делает много работы,
+            // и даёт всего 3. Замер на 12K (Qwen3.5-4B, RTX 3060):
+            // 1 сплит 45.4 ток/с, 3 — 46.0, 8 — 52.0, 16 — 55.5, 32 — 53.0.
+            // Целимся примерно в 8 волн, оставляя каждому сплиту не меньше
+            // двух блоков ключей.
+            const int target = 8 * num_sms;
+            const int denom = std::max(1, b * h * num_m_blocks);
+            ns = fa_ceildiv(target, denom);
+            ns = std::min(ns, num_n_blocks / 2);
+            ns = std::min(ns, 128);
+            ns = std::max(ns, 1);
+        } else {
+            ns = fa_num_splits_heuristic(b * h * num_m_blocks, num_sms, num_n_blocks, 128);
+        }
         if (forced_splits > 1 && seqlen_q == 1) {
             ns = std::min(forced_splits, num_n_blocks);
         }
