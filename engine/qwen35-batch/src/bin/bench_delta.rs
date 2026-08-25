@@ -16,6 +16,17 @@ const N_V: u32 = 32;
 const HKD: u32 = 128;
 const HVD: u32 = 128;
 
+/// Конфигурация chunked-варианта по имени ядра: (токенов в блоке, столбцов).
+fn chunked_shape(name: &str) -> Option<(usize, usize)> {
+    match name {
+        "delta_rule_prefill_chunked" => Some((16, 64)),
+        "delta_rule_prefill_chunked_c8" => Some((8, 64)),
+        "delta_rule_prefill_chunked_c16w32" => Some((16, 32)),
+        "delta_rule_prefill_chunked_c32w32" => Some((32, 32)),
+        _ => None,
+    }
+}
+
 fn params() -> DeltaParams {
     DeltaParams {
         n_k_heads: 16,
@@ -61,14 +72,13 @@ fn run(
     let out = dev.alloc_zeros::<f32>(t * n_v * hvd)?;
     let state0 = fill(n_v * hvd * hvd, 6);
 
-    if kernel == "delta_rule_prefill_chunked" {
+    if let Some((c, cols)) = chunked_shape(kernel) {
         // Блок ведёт 64 столбца состояния одной головы; поток держит 32 строки
         // своего столбца в регистрах. Shared: K,Q [32×128], δ [32×64],
         // две матрицы [32×32] и мелочь — около 49 КБ, нужен opt-in.
-        const C: usize = 16;
-        const COLS: usize = 64;
+        let (c, cols) = (c, cols);
         const ROWGRP: usize = 4;
-        let smem = (2 * C * hkd + 3 * C * COLS + 2 * C * C + 2 * C + COLS * ROWGRP) * 4;
+        let smem = (2 * c * hkd + 3 * c * cols + 2 * c * c + 2 * c + cols * ROWGRP) * 4;
         let func = dev.get_or_load_func(kernel, &candle_kernels::DELTA_RULE)?;
         func.set_attribute(
             candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -76,8 +86,8 @@ fn run(
         )
         .map_err(|e| anyhow!("set_attribute: {e:?}"))?;
         let cfg = LaunchConfig {
-            grid_dim: (n_v as u32, (hvd / COLS) as u32, 1),
-            block_dim: (COLS as u32, ROWGRP as u32, 1),
+            grid_dim: (n_v as u32, (hvd / cols) as u32, 1),
+            block_dim: (cols as u32, ROWGRP as u32, 1),
             shared_mem_bytes: smem as u32,
         };
         let t_u32 = t as u32;
@@ -406,15 +416,15 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
         const C: usize = 16;
         const COLS: usize = 64;
         const ROWGRP: usize = 4;
-        let smem = (2 * C * hkd + 3 * C * COLS + 2 * C * C + 2 * C + COLS * ROWGRP) * 4;
+        let smem = (2 * c * hkd + 3 * c * cols + 2 * c * c + 2 * c + cols * ROWGRP) * 4;
         let f = dev.get_or_load_func("delta_rule_prefill_chunked", &candle_kernels::DELTA_RULE)?;
         f.set_attribute(
             candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             smem as i32,
         ).map_err(|e| anyhow!("set_attribute: {e:?}"))?;
         let cfg = LaunchConfig {
-            grid_dim: (N_V, (hvd / COLS) as u32, 1),
-            block_dim: (COLS as u32, ROWGRP as u32, 1),
+            grid_dim: (N_V, (hvd / cols) as u32, 1),
+            block_dim: (cols as u32, ROWGRP as u32, 1),
             shared_mem_bytes: smem as u32,
         };
         let mut b = f.builder();
@@ -490,6 +500,9 @@ fn main() -> Result<()> {
         // Диагностика: без редукций вообще.
         ("delta_rule_prefill_probe0", 2),
         ("delta_rule_prefill_chunked", 0),
+        ("delta_rule_prefill_chunked_c8", 0),
+        ("delta_rule_prefill_chunked_c16w32", 0),
+        ("delta_rule_prefill_chunked_c32w32", 0),
     ];
     for (kernel, warps) in variants {
         let kernel_label = format!("{kernel} warps={warps}");

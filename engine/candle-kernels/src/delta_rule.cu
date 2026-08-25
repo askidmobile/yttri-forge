@@ -593,11 +593,10 @@ extern "C" __global__ void delta_rule_prefill_v2(
 // (нужна лишь 4-сторонняя редукция по группам строк), а warp-редукций на
 // каждый токен, которые съедали 41% времени в последовательном ядре, нет.
 // grid = (n_v_heads, hvd/COLS), block = (COLS, ROWGRP).
-#define DR_CHUNK 16
-#define DR_COLS 64
 #define DR_ROWGRP 4
 
-extern "C" __global__ void delta_rule_prefill_chunked(
+template <int DR_CHUNK, int DR_COLS>
+__device__ __forceinline__ void delta_rule_chunked_impl(
     const float* __restrict__ q,
     const float* __restrict__ k,
     const float* __restrict__ v,
@@ -759,6 +758,25 @@ extern "C" __global__ void delta_rule_prefill_chunked(
         ssm_state[head * hkd * hvd + (row0 + r) * hvd + col] = st[r];
     }
 }
+
+
+// Инстанцирования: (блок токенов, столбцов на блок). Занятость SM определяется
+// объёмом shared, поэтому вариантов несколько — выбор по замеру bench_delta.
+#define DR_CHUNKED_KERNEL(NAME, C, COLS)                                        \
+extern "C" __global__ void NAME(                                                \
+    const float* __restrict__ q, const float* __restrict__ k,                   \
+    const float* __restrict__ v, const float* __restrict__ beta,                \
+    const float* __restrict__ gate, float* __restrict__ ssm_state,              \
+    float* __restrict__ output, const DeltaParams params, const unsigned int T) \
+{                                                                               \
+    delta_rule_chunked_impl<C, COLS>(q, k, v, beta, gate, ssm_state, output,    \
+                                     params, T);                                \
+}
+
+DR_CHUNKED_KERNEL(delta_rule_prefill_chunked, 16, 64)
+DR_CHUNKED_KERNEL(delta_rule_prefill_chunked_c8, 8, 64)
+DR_CHUNKED_KERNEL(delta_rule_prefill_chunked_c16w32, 16, 32)
+DR_CHUNKED_KERNEL(delta_rule_prefill_chunked_c32w32, 32, 32)
 
 // ДИАГНОСТИКА (не для продакшена): те же обращения к памяти и та же
 // арифметика, но с одной warp-редукцией на токен (probe1) и без редукций
