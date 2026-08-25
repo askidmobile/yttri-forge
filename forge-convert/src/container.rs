@@ -1,15 +1,20 @@
-//! Контейнер .ytf16 (формат v1).
+//! Контейнер .ytf16.
 //!
 //! Layout:
 //!   [0..4)   magic "YTF1" (LE)
-//!   [4..8)   version u32 = 1
+//!   [4..8)   version u32: 1 — сайдкар, 2 — самостоятельная модель
 //!   [8..12)  manifest_len u32 (= RESERVE_MANIFEST, окно с нулевым паддингом)
 //!   [12..12+mlen)      manifest JSON (UTF-8), патчится при finalize
-//!   [12+mlen..)        данные тензоров: F16 LE, выравнивание буферов 64B
+//!   [12+mlen..)        данные тензоров, выравнивание буферов 64B
 //!
 //! Двухпроходная схема: заголовок резервирует фиксированное окно манифеста,
 //! finalize перезаписывает окно полным списком entries. Стриминг без знания
 //! полного списка заранее.
+//!
+//! v1 — F16-дамп избранных проекций поверх GGUF (сайдкар, dual-read).
+//! v2 — самостоятельная модель: у каждого тензора свой GGML-тип, данные лежат
+//! готовыми блоками, поэтому загрузка это mmap → VRAM без переквантования на
+//! CPU. Гиперпараметры и токенизатор едут внутри, GGUF рядом не нужен.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -18,6 +23,8 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 4] = b"YTF1";
 pub const VERSION: u32 = 1;
+/// Самостоятельная модель: типизированные тензоры + конфиг + токенизатор.
+pub const VERSION_STANDALONE: u32 = 2;
 pub const RESERVE_MANIFEST: u32 = 16 * 1024 * 1024;
 const ALIGN: u64 = 64;
 
@@ -29,6 +36,13 @@ pub struct TensorEntry {
     pub offset: u64,
     /// Размер в байтах
     pub len: u64,
+    /// GGML-тип данных: "F16" (умолчание, v1), "F32", "Q4_K", "Q6_K", "Q8_0"…
+    #[serde(default = "dtype_f16")]
+    pub dtype: String,
+}
+
+fn dtype_f16() -> String {
+    "F16".to_string()
 }
 
 #[derive(serde::Deserialize, Debug, Default, Clone)]
@@ -45,6 +59,10 @@ pub struct FinalManifest {
     pub source_dtype_counts: BTreeMap<String, u32>,
     #[serde(default)]
     pub clamped_bf16: u64,
+    /// v2: гиперпараметры модели в терминах ключей GGUF-метаданных
+    /// (`qwen35.block_count` и т.д.). Пусто у сайдкара.
+    #[serde(default)]
+    pub config: BTreeMap<String, serde_json::Value>,
     pub tensors: Vec<TensorEntry>,
 }
 
@@ -52,6 +70,8 @@ pub struct FinalManifest {
 pub struct ContainerWriter<W: Write> {
     file: W,
     pre: ManifestPre,
+    version: u32,
+    config: BTreeMap<String, serde_json::Value>,
     dtype_counts: BTreeMap<String, u32>,
     clamped_bf16: u64,
     entries: Vec<TensorEntry>,
@@ -59,12 +79,28 @@ pub struct ContainerWriter<W: Write> {
 }
 
 impl<W: Write + Seek> ContainerWriter<W> {
-    pub fn create(mut file: W, pre: ManifestPre) -> std::io::Result<Self> {
+    pub fn create(file: W, pre: ManifestPre) -> std::io::Result<Self> {
+        Self::create_versioned(file, pre, VERSION)
+    }
+
+    /// Писатель самостоятельной модели (v2): типизированные тензоры + конфиг.
+    pub fn create_standalone(
+        file: W,
+        pre: ManifestPre,
+        config: BTreeMap<String, serde_json::Value>,
+    ) -> std::io::Result<Self> {
+        let mut w = Self::create_versioned(file, pre, VERSION_STANDALONE)?;
+        w.config = config;
+        Ok(w)
+    }
+
+    fn create_versioned(mut file: W, pre: ManifestPre, version: u32) -> std::io::Result<Self> {
         let mut mb = serde_json::to_vec_pretty(&FinalManifest {
             gguf_sha256: pre.gguf_sha256.clone(),
             mask: pre.mask.clone(),
             source_dtype_counts: BTreeMap::new(),
             clamped_bf16: 0,
+            config: BTreeMap::new(),
             tensors: Vec::new(),
         })
         .expect("serialize");
@@ -74,12 +110,14 @@ impl<W: Write + Seek> ContainerWriter<W> {
         );
         mb.extend(std::iter::repeat(0u8).take(RESERVE_MANIFEST as usize - mb.len()));
         file.write_all(MAGIC)?;
-        file.write_all(&VERSION.to_le_bytes())?;
+        file.write_all(&version.to_le_bytes())?;
         file.write_all(&RESERVE_MANIFEST.to_le_bytes())?;
         file.write_all(&mb)?;
         Ok(Self {
             file,
             pre,
+            version,
+            config: BTreeMap::new(),
             dtype_counts: BTreeMap::new(),
             clamped_bf16: 0,
             entries: Vec::new(),
@@ -89,15 +127,21 @@ impl<W: Write + Seek> ContainerWriter<W> {
 
     /// Добавить тензор F16 LE. Возвращает data-offset.
     pub fn add_tensor(&mut self, name: &str, shape: &[usize], f16_le: Vec<u8>) -> u64 {
+        self.add_typed(name, shape, "F16", &f16_le)
+    }
+
+    /// Добавить тензор произвольного GGML-типа (v2). Возвращает data-offset.
+    pub fn add_typed(&mut self, name: &str, shape: &[usize], dtype: &str, bytes: &[u8]) -> u64 {
         let pad = ((ALIGN - (self.buffer.len() as u64 % ALIGN)) % ALIGN) as usize;
         self.buffer.extend(std::iter::repeat(0u8).take(pad));
         let off = self.buffer.len() as u64;
-        self.buffer.extend_from_slice(&f16_le);
+        self.buffer.extend_from_slice(bytes);
         self.entries.push(TensorEntry {
             name: name.to_string(),
             shape: shape.to_vec(),
             offset: off,
-            len: f16_le.len() as u64,
+            len: bytes.len() as u64,
+            dtype: dtype.to_string(),
         });
         off
     }
@@ -116,6 +160,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
             mask: self.pre.mask.clone(),
             source_dtype_counts: self.dtype_counts,
             clamped_bf16: self.clamped_bf16,
+            config: self.config,
             tensors: self.entries,
         };
         let mut mb = serde_json::to_vec_pretty(&final_manifest)?;
@@ -138,6 +183,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
 pub struct Reader {
     mmap: memmap2::Mmap,
     pub manifest: FinalManifest,
+    pub version: u32,
     data_start: u64,
 }
 
@@ -150,7 +196,7 @@ impl Reader {
             return Err("not a YTF1 container".into());
         }
         let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
-        if version != VERSION {
+        if version != VERSION && version != VERSION_STANDALONE {
             return Err(format!("unsupported ytf16 version {version}"));
         }
         let mlen = u32::from_le_bytes(mmap[8..12].try_into().unwrap()) as usize;
@@ -163,7 +209,7 @@ impl Reader {
         let json_end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         let manifest: FinalManifest = serde_json::from_slice(&raw[..json_end])
             .map_err(|e| format!("manifest parse: {e}"))?;
-        Ok(Self { mmap, manifest, data_start: end as u64 })
+        Ok(Self { mmap, manifest, version, data_start: end as u64 })
     }
 
     /// Байты тензора по имени (F16 LE) + форма.

@@ -7,6 +7,7 @@
 
 pub mod container;
 pub mod mask;
+pub mod pack;
 
 use clap::Parser;
 use std::collections::BTreeMap;
@@ -53,12 +54,22 @@ struct Args {
     /// 31.7% времени префилла; цена — размер сайдкара примерно ×2.
     #[arg(long)]
     f16_ffn: bool,
+
+    /// Собрать САМОСТОЯТЕЛЬНЫЙ контейнер .ytf (v2) вместо сайдкара: вся
+    /// языковая модель, типы тензоров и метаданные с эталонного GGUF,
+    /// токенизатор внутри. Рантайму GGUF после этого не нужен.
+    #[arg(long)]
+    pack: bool,
+
+    /// tokenizer.json для встраивания (умолчание — рядом с первым входом)
+    #[arg(long)]
+    tokenizer: Option<PathBuf>,
 }
 
 fn main() {
     let args = Args::parse();
-    if !args.f16_heavy {
-        eprintln!("error: сейчас поддерживается только --f16-heavy");
+    if !args.f16_heavy && !args.pack {
+        eprintln!("error: нужен --f16-heavy (сайдкар) или --pack (самостоятельный контейнер)");
         std::process::exit(2);
     }
     if let Err(e) = run(&args) {
@@ -273,20 +284,157 @@ fn repack_delta(gguf: &str, data: Vec<u8>, shape: &[usize], lay: Option<DeltaLay
             l.hv * row_bytes,
         ));
         out
-    } else if gguf.ends_with("attn_z.weight") && rows == l.n_v * l.hv {
+    } else if (gguf.ends_with("attn_z.weight") || gguf.ends_with("attn_gate.weight"))
+        && rows == l.n_v * l.hv
+    {
         deinterleave_blocks(&data, l.n_k, n_per_k, l.hv * row_bytes)
-    } else if (gguf.ends_with("attn_a.weight") || gguf.ends_with("attn_b.weight"))
+    } else if (gguf.ends_with("attn_a.weight")
+        || gguf.ends_with("attn_b.weight")
+        || gguf.ends_with("ssm_alpha.weight")
+        || gguf.ends_with("ssm_beta.weight"))
         && rows == l.n_v
     {
         deinterleave_blocks(&data, l.n_k, n_per_k, row_bytes)
-    } else if gguf.ends_with("attn_out.weight") && cols == l.n_v * l.hv {
+    } else if (gguf.ends_with("attn_out.weight") || gguf.ends_with("ssm_out.weight"))
+        && cols == l.n_v * l.hv
+    {
         deinterleave_cols(&data, rows, l.n_k, n_per_k, l.hv * 2)
     } else {
         data
     }
 }
 
+/// Прочитать тензор safetensors в f32 (BF16/F16/F32 на входе).
+fn read_tensor_f32(
+    shards: &[(String, memmap2::Mmap)],
+    name: &str,
+) -> Result<(Vec<f32>, Vec<usize>), String> {
+    let found = find_tensor_info(shards, name).ok_or_else(|| format!("нет тензора {name}"))?;
+    let raw: &[u8] = &shards[found.shard].1[found.start..found.end];
+    let n: usize = found.shape.iter().product();
+    let values = match found.dtype {
+        safetensors::Dtype::BF16 => {
+            if raw.len() != n * 2 {
+                return Err(format!("{name}: BF16 длина {} != {}", raw.len(), n * 2));
+            }
+            raw.chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect()
+        }
+        safetensors::Dtype::F16 => {
+            if raw.len() != n * 2 {
+                return Err(format!("{name}: F16 длина {} != {}", raw.len(), n * 2));
+            }
+            raw.chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        }
+        safetensors::Dtype::F32 => {
+            if raw.len() != n * 4 {
+                return Err(format!("{name}: F32 длина {} != {}", raw.len(), n * 4));
+            }
+            raw.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }
+        other => return Err(format!("{name}: dtype {other:?} не поддерживается")),
+    };
+    Ok((values, found.shape))
+}
+
+fn run_pack(args: &Args) -> Result<(), String> {
+    let shards = open_safetensors(&args.inputs)?;
+    let dir = args.inputs[0].parent().unwrap_or(Path::new("."));
+
+    // Полный список имён из всех шардов
+    let mut hf_names: Vec<String> = Vec::new();
+    for (_, mmap) in &shards {
+        let (_off, meta) = safetensors::SafeTensors::read_metadata(mmap)
+            .map_err(|e| format!("safetensors meta: {e}"))?;
+        for (name, _) in meta.tensors() {
+            hf_names.push(name.to_string());
+        }
+    }
+    hf_names.sort();
+    hf_names.dedup();
+
+    let ref_gguf = args
+        .gguf
+        .clone()
+        .ok_or_else(|| "--pack требует --gguf <эталон> (типы тензоров и метаданные)".to_string())?;
+    let tokenizer = args
+        .tokenizer
+        .clone()
+        .unwrap_or_else(|| dir.join("tokenizer.json"));
+    if !tokenizer.exists() {
+        return Err(format!("нет tokenizer.json: {}", tokenizer.display()));
+    }
+    let out_path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| dir.to_path_buf())
+        .join(
+            ref_gguf
+                .file_stem()
+                .map(|s| format!("{}.ytf", s.to_string_lossy()))
+                .unwrap_or_else(|| "model.ytf".into()),
+        );
+
+    let delta_layout = read_delta_layout(dir);
+    match delta_layout {
+        Some(l) => println!(
+            "раскладка DeltaNet: n_k={} n_v={} head_k={} head_v={} (v-голов на k-голову: {})",
+            l.n_k, l.n_v, l.hk, l.hv, l.n_per_k()
+        ),
+        None => println!("раскладка DeltaNet: config.json не найден — перепаковка НЕ выполняется"),
+    }
+
+    let t0 = std::time::Instant::now();
+    let stats = pack::pack(
+        &shards,
+        &hf_names,
+        &ref_gguf,
+        &tokenizer,
+        &out_path,
+        delta_layout,
+        &read_tensor_f32,
+        &repack_delta,
+    )?;
+    println!(
+        "упаковано {} тензоров, {:.2} ГиБ, за {:.1} с → {}",
+        stats.tensors,
+        stats.bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        t0.elapsed().as_secs_f64(),
+        out_path.display()
+    );
+    for (dt, n) in &stats.by_dtype {
+        println!("  {dt}: {n}");
+    }
+    // Пропущенное — это видео-башня и MTP; их в v2 пока нет. Печатаем счётчик,
+    // чтобы молчаливая потеря языкового тензора была видна.
+    let lm_skipped: Vec<&String> = stats
+        .skipped
+        .iter()
+        .filter(|n| n.starts_with("model.language_model."))
+        .collect();
+    println!(
+        "пропущено {} тензоров (видео/MTP), из них языковых: {}",
+        stats.skipped.len(),
+        lm_skipped.len()
+    );
+    if !lm_skipped.is_empty() {
+        for n in lm_skipped.iter().take(10) {
+            println!("  ВНИМАНИЕ пропущен языковой тензор: {n}");
+        }
+        return Err("в контейнер не попали языковые тензоры".into());
+    }
+    Ok(())
+}
+
 fn run(args: &Args) -> Result<(), String> {
+    if args.pack {
+        return run_pack(args);
+    }
     let shards = open_safetensors(&args.inputs)?;
 
     // Индекс всех тензоров

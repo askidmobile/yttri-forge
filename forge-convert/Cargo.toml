@@ -19,3 +19,5 @@ sha2 = "0.10"
 half = { version = "2", features = ["num-traits"] }
 memmap2 = "0.9"
 clap = { version = "4", features = ["derive"] }
+# Свой форк candle (BD-001): квантование в GGML-блоки и чтение эталонного GGUF.
+candle-core = { path = "../engine/candle-core", default-features = false }

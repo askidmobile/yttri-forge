@@ -1,3 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["forge-convert"]
+# engine/ — отдельный воркспейс (форк candle). Без exclude корневой воркспейс
+# затягивает его пакеты к себе и ломает у них `edition.workspace = true`.
+exclude = ["engine"]

@@ -261,9 +261,20 @@ impl Qwen35BatchAdapter {
             .map_err(|e| anyhow!("mmap GGUF: {e}"))?;
         let mmap = Arc::new(mmap);
 
-        // Один проход чтения GGUF: EOS + vocab (из token_embd.weight shape[0]) + веса.
-        let mut c = std::io::Cursor::new(mmap.as_ref());
-        let ct = gguf_file::Content::read(&mut c).map_err(|e| anyhow!("read GGUF: {e}"))?;
+        // Самостоятельный контейнер .ytf (v2) против GGUF. Дальше по коду
+        // разницы нет: у контейнера тензоры уже лежат готовыми GGML-блоками,
+        // а метаданные и токенизатор развёрнуты в тот же `Content`.
+        let standalone = crate::real::ytf16::container_version(mmap.as_ref())
+            == Some(crate::real::ytf16::VERSION_STANDALONE);
+        let ct = if standalone {
+            log::info!("[qwen35-batch] самостоятельный контейнер .ytf — GGUF не нужен");
+            crate::real::ytf16::content_from_standalone(mmap.as_ref())
+                .map_err(|e| anyhow!("read ytf: {e}"))?
+        } else {
+            // Один проход чтения GGUF: EOS + vocab (из token_embd.weight shape[0]) + веса.
+            let mut c = std::io::Cursor::new(mmap.as_ref());
+            gguf_file::Content::read(&mut c).map_err(|e| anyhow!("read GGUF: {e}"))?
+        };
 
         // Phase 1 preflight: validate architecture, metadata, and tensor contracts
         // BEFORE heavy tensor loading. Fail-fast with aggregated errors.
@@ -385,9 +396,13 @@ impl Qwen35BatchAdapter {
         // выделяем сразу после загрузки весов, пока dedicated VRAM свободна,
         // иначе страницы уходят в WDDM shared и декод падает на PCIe.
         // yttri-forge stage1: F16-сайдкар тяжёлых проекций (dual-read prefill)
-        a.model
-            .attach_ytf16(gguf_path, &a.device)
-            .map_err(|e| anyhow!("attach_ytf16: {e}"))?;
+        // Сайдкар нужен только GGUF-пути: у самостоятельного контейнера веса
+        // уже нашего формата, вторая копия в VRAM была бы бессмысленной.
+        if !standalone {
+            a.model
+                .attach_ytf16(gguf_path, &a.device)
+                .map_err(|e| anyhow!("attach_ytf16: {e}"))?;
+        }
         // Q8_0-квантование сайдкара идёт через F16-тензор на GPU: после
         // сжатия его страницы остаются в driver pool (~1.2 ГиБ на 4B).
         // Trim возвращает их ОС — иначе экономия VRAM съедается слаком.
