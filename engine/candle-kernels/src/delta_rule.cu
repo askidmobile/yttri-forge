@@ -486,6 +486,98 @@ extern "C" __global__ void delta_rule_prefill(
     }
 }
 
+// P3-v2: тот же delta rule, но блок 1024 потоков ведёт 32 колонки состояния,
+// а k/q токена кладутся в shared ОДИН раз на блок. В v1 каждая колонка читала
+// k и q заново: 128 колонок × 512 токенов × 1 КБ = ~2 ГБ глобальных чтений на
+// запуск, что при 360 ГБ/с и давало измеренные 4.12 мс — ядро упиралось в
+// память, а не в последовательность. Здесь трафик в 32 раза меньше.
+// Математика колонки не меняется (тот же порядок FMA и warp-редукций) →
+// результат бит-в-бит совпадает с v1.
+// grid = (n_v_heads, hd/32), block = (32, 32): col = blockIdx.y*32 + threadIdx.y.
+extern "C" __global__ void delta_rule_prefill_v2(
+    const float* __restrict__ q,     // [T * n_v * hkd]
+    const float* __restrict__ k,     // [T * n_v * hkd]
+    const float* __restrict__ v,     // [T * n_v * hvd]
+    const float* __restrict__ beta,  // [T * n_v]
+    const float* __restrict__ gate,  // [T * n_v]
+    float* __restrict__ ssm_state,   // [n_v * hd * hd] persistent
+    float* __restrict__ output,      // [T * n_v * hvd]
+    const DeltaParams params,
+    const unsigned int T
+) {
+    extern __shared__ float smem[];          // [hkd] k + [hkd] q
+    const unsigned int head = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int warp = threadIdx.y;
+    const unsigned int col = blockIdx.y * blockDim.y + warp;
+    const unsigned int hd = params.head_v_dim;   // 128
+    const unsigned int n_v = params.n_v_heads;
+    const unsigned int hkd = params.head_k_dim;
+    constexpr unsigned int ROWS = 4;             // hd / warp_size = 128/32
+    const unsigned int tid = warp * blockDim.x + lane;
+    const unsigned int nthreads = blockDim.x * blockDim.y;
+
+    float* sk = smem;
+    float* sq = smem + hkd;
+
+    const unsigned int state_base = head * hd * hd;
+    float s[ROWS];
+    #pragma unroll
+    for (unsigned int r = 0; r < ROWS; r++) {
+        const unsigned int row = r * 32 + lane;
+        s[r] = ssm_state[state_base + row * hd + col];
+    }
+
+    for (unsigned int t = 0; t < T; t++) {
+        const unsigned int kv_base = (t * n_v + head) * hkd;
+        const unsigned int out_base = (t * n_v + head) * hd;
+
+        __syncthreads();                          // прошлый токен дочитан
+        for (unsigned int i = tid; i < hkd; i += nthreads) {
+            sk[i] = k[kv_base + i];
+            sq[i] = q[kv_base + i];
+        }
+        __syncthreads();
+
+        const float g = __expf(gate[t * n_v + head]);
+        const float beta_h = beta[t * n_v + head];
+
+        float k_reg[ROWS], q_reg[ROWS];
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS; r++) {
+            const unsigned int row = r * 32 + lane;
+            k_reg[r] = sk[row];
+            q_reg[r] = sq[row];
+        }
+
+        float kv_part = 0.0f;
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS; r++) kv_part += s[r] * k_reg[r];
+        float kv_col = kv_part;
+        for (int o = 16; o > 0; o >>= 1) kv_col += __shfl_down_sync(0xffffffff, kv_col, o);
+        kv_col = __shfl_sync(0xffffffff, kv_col, 0);
+
+        const float v_col = v[out_base + col];
+        const float delta_col = (v_col - g * kv_col) * beta_h;
+
+        float attn_part = 0.0f;
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS; r++) {
+            s[r] = g * s[r] + k_reg[r] * delta_col;
+            attn_part += s[r] * q_reg[r];
+        }
+        float attn_col = attn_part;
+        for (int o = 16; o > 0; o >>= 1) attn_col += __shfl_down_sync(0xffffffff, attn_col, o);
+        if (lane == 0) output[out_base + col] = attn_col;
+    }
+
+    #pragma unroll
+    for (unsigned int r = 0; r < ROWS; r++) {
+        const unsigned int row = r * 32 + lane;
+        ssm_state[state_base + row * hd + col] = s[r];
+    }
+}
+
 // P4: group RMS norm + SiLU(z) gate across the full sequence.
 // grid = (n_v_heads, T), block = (head_v_dim).
 extern "C" __global__ void delta_norm_gate_prefill(
