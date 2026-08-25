@@ -191,6 +191,60 @@ fn apply_hf_transforms(
     values
 }
 
+/// Рецепт квантования: тип на каждый тензор.
+///
+/// Декод упирается в полосу памяти (68% GPU-времени шага — чтение весов),
+/// поэтому скорость определяют байты, а не формат вычислений. Значит выбор
+/// рецепта — это торговля «перплексия против байтов», и мерить надо оба.
+///
+/// Одномерные тензоры (нормы, ssm_a, dt_bias) в GGUF лежат в F32 и рецептом
+/// не трогаются: они крошечные, а их огрубление бьёт по качеству сильнее
+/// всего.
+pub fn recipe_dtype(recipe: &str, gguf_name: &str, mirror: GgmlDType) -> GgmlDType {
+    if matches!(mirror, GgmlDType::F32 | GgmlDType::F16) {
+        return mirror;
+    }
+    let is = |suffix: &str| gguf_name.ends_with(suffix);
+    let is_delta_proj = is("attn_qkv.weight")
+        || is("attn_gate.weight")
+        || is("ssm_beta.weight")
+        || is("ssm_alpha.weight")
+        || is("ssm_out.weight");
+    let is_ffn = is("ffn_gate.weight") || is("ffn_up.weight") || is("ffn_down.weight");
+    match recipe {
+        // Как в эталонном GGUF — базовая точка отсчёта.
+        "mirror" => mirror,
+        // Всё в Q4_K: минимум байтов, максимум скорости декода.
+        "q4" => GgmlDType::Q4K,
+        // Внимание и DeltaNet точнее, FFN (основной объём весов) в Q4_K.
+        "q5-attn" => {
+            if is_ffn {
+                GgmlDType::Q4K
+            } else {
+                GgmlDType::Q5K
+            }
+        }
+        // Голова точнее остального: она читается каждый шаг целиком.
+        "q6-head" => {
+            if gguf_name == "token_embd.weight" {
+                GgmlDType::Q6K
+            } else {
+                mirror
+            }
+        }
+        // Точечный int8 на проекциях DeltaNet — идея «int8 бесплатен по
+        // компьюту»; проверяем, стоит ли он удвоения байтов на этой группе.
+        "q8-delta" => {
+            if is_delta_proj {
+                GgmlDType::Q8_0
+            } else {
+                mirror
+            }
+        }
+        _ => mirror,
+    }
+}
+
 /// Сверка формы с эталоном. HF держит conv1d как [C, 1, K], GGUF — как [C, K].
 /// Единичные измерения схлопываем, но только если порядок и число элементов
 /// совпали: иначе это настоящее расхождение раскладки, и молчать нельзя.
@@ -237,6 +291,7 @@ pub fn pack(
     out_path: &Path,
     delta_layout: Option<crate::DeltaLayout>,
     fuse_in_proj: bool,
+    recipe: &str,
     read_tensor_f32: &dyn Fn(&[(String, memmap2::Mmap)], &str) -> Result<(Vec<f32>, Vec<usize>), String>,
     repack: &dyn Fn(&str, Vec<u8>, &[usize], Option<crate::DeltaLayout>) -> Vec<u8>,
 ) -> Result<PackStats, String> {
@@ -326,8 +381,9 @@ pub fn pack(
         } else {
             values
         };
-        let bytes = quantize_bytes(values, &shape, info.ggml_dtype)?;
-        let dn = dtype_name(info.ggml_dtype);
+        let dt = recipe_dtype(recipe, &gguf_name, info.ggml_dtype);
+        let bytes = quantize_bytes(values, &shape, dt)?;
+        let dn = dtype_name(dt);
         w.add_typed(&gguf_name, &shape, dn, &bytes)
             .map_err(|e| format!("{gguf_name}: запись: {e}"))?;
         written.insert(gguf_name.clone(), hf.clone());
@@ -356,7 +412,7 @@ pub fn pack(
                 let hf = &written[n];
                 let info = ct.tensor_infos.get(n).unwrap();
                 if i == 0 {
-                    dt = info.ggml_dtype;
+                    dt = recipe_dtype(recipe, n, info.ggml_dtype);
                     cols = info.shape.dims()[1];
                 }
                 let (v, sh) = prepare(hf, info.shape.dims())?;
@@ -402,7 +458,48 @@ pub const TOKENIZER_BLOB: &str = "__tokenizer_json";
 
 #[cfg(test)]
 mod tests {
-    use super::hf_to_gguf;
+    use super::{hf_to_gguf, recipe_dtype};
+    use candle_core::quantized::GgmlDType;
+
+    /// Одномерные тензоры (нормы, ssm_a, dt_bias) лежат в F32 и рецептом не
+    /// трогаются: они крошечные, а огрубление бьёт по качеству сильнее всего.
+    #[test]
+    fn recipes_never_quantize_f32_scalars() {
+        for r in ["mirror", "q4", "q5-attn", "q6-head", "q8-delta"] {
+            assert_eq!(
+                recipe_dtype(r, "blk.0.attn_norm.weight", GgmlDType::F32),
+                GgmlDType::F32,
+                "рецепт {r} тронул норму"
+            );
+            assert_eq!(
+                recipe_dtype(r, "blk.0.ssm_a", GgmlDType::F32),
+                GgmlDType::F32,
+                "рецепт {r} тронул ssm_a"
+            );
+        }
+    }
+
+    #[test]
+    fn recipes_do_what_they_claim() {
+        let ffn = "blk.7.ffn_down.weight";
+        let qkv = "blk.7.attn_qkv.weight";
+        let head = "token_embd.weight";
+        // mirror ничего не меняет
+        assert_eq!(recipe_dtype("mirror", ffn, GgmlDType::Q6K), GgmlDType::Q6K);
+        // q4 сводит всё квантуемое к Q4_K
+        assert_eq!(recipe_dtype("q4", ffn, GgmlDType::Q6K), GgmlDType::Q4K);
+        // q5-attn: FFN остаётся Q4_K, внимание и DeltaNet поднимаются до Q5_K
+        assert_eq!(recipe_dtype("q5-attn", ffn, GgmlDType::Q6K), GgmlDType::Q4K);
+        assert_eq!(recipe_dtype("q5-attn", qkv, GgmlDType::Q4K), GgmlDType::Q5K);
+        // q6-head трогает только голову
+        assert_eq!(recipe_dtype("q6-head", head, GgmlDType::Q4K), GgmlDType::Q6K);
+        assert_eq!(recipe_dtype("q6-head", ffn, GgmlDType::Q4K), GgmlDType::Q4K);
+        // q8-delta — точечный int8 только на проекциях DeltaNet
+        assert_eq!(recipe_dtype("q8-delta", qkv, GgmlDType::Q4K), GgmlDType::Q8_0);
+        assert_eq!(recipe_dtype("q8-delta", ffn, GgmlDType::Q4K), GgmlDType::Q4K);
+        // неизвестное имя не должно молча портить модель — ведёт себя как mirror
+        assert_eq!(recipe_dtype("нет-такого", ffn, GgmlDType::Q6K), GgmlDType::Q6K);
+    }
 
     /// Карта имён сверена по `build_model_common`, а не по маске сайдкара.
     /// Разница неочевидная и молчаливая: у сайдкара `attn_z`/`attn_a`/`attn_b`/

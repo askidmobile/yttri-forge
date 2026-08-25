@@ -74,6 +74,11 @@ struct Args {
     /// (дополненным до кратности 128). Движок использует её, если найдёт.
     #[arg(long)]
     fuse_in_proj: bool,
+
+    /// Рецепт квантования: mirror (как в эталонном GGUF), q4, q5-attn,
+    /// q6-head, q8-delta. Имя рецепта попадает в имя выходного файла.
+    #[arg(long, default_value = "mirror")]
+    recipe: String,
 }
 
 fn main() {
@@ -397,7 +402,13 @@ fn run_pack(args: &Args) -> Result<(), String> {
         .join(
             ref_gguf
                 .file_stem()
-                .map(|s| format!("{}.ytf", s.to_string_lossy()))
+                .map(|s| {
+                    if args.recipe == "mirror" {
+                        format!("{}.ytf", s.to_string_lossy())
+                    } else {
+                        format!("{}.{}.ytf", s.to_string_lossy(), args.recipe)
+                    }
+                })
                 .unwrap_or_else(|| "model.ytf".into()),
         );
 
@@ -419,6 +430,7 @@ fn run_pack(args: &Args) -> Result<(), String> {
         &out_path,
         delta_layout,
         args.fuse_in_proj,
+        &args.recipe,
         &read_tensor_f32,
         &repack_delta,
     )?;
