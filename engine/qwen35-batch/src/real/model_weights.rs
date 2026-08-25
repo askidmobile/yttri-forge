@@ -7653,11 +7653,12 @@ impl ModelWeights {
             if let Some((gguf, f16)) = pair {
                 match ytf16_rel_error(gguf, f16) {
                     Ok(rel) if rel > 0.25 => eprintln!(
-                        "[ytf] WARN сайдкар расходится с GGUF: относительная ошибка {rel:.0%} \
+                        "[ytf] WARN сайдкар расходится с GGUF: относительная ошибка {:.0}% \
                          (ожидается ~ошибка квантования). Веса блока 0 не совпадают — \
-                         проверьте конвертер; QWEN36_DISABLE_YTF16=1 отключает сайдкар."
+                         проверьте конвертер; QWEN36_DISABLE_YTF16=1 отключает сайдкар.",
+                        rel * 100.0
                     ),
-                    Ok(rel) => eprintln!("[ytf] blk.0 vs GGUF: относительная ошибка {rel:.1%}"),
+                    Ok(rel) => eprintln!("[ytf] blk.0 vs GGUF: относительная ошибка {:.1}%", rel * 100.0),
                     Err(e) => eprintln!("[ytf] WARN проверка сайдкара не удалась: {e}"),
                 }
             }
