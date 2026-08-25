@@ -3029,6 +3029,38 @@ struct KvMirror {
     valid_tokens: usize,
 }
 
+/// Сверка F16-сайдкара с деквантованным GGUF-весом: форма + max/mean |diff|.
+/// Ожидание: расхождение порядка ошибки квантования (Q4_K_M ~1e-2 отн.).
+fn audit_ytf16(name: &str, gguf: &QMatMul, sidecar: &QMatMul) {
+    let report = || -> Result<String> {
+        let g = gguf.dequantize_f16()?.to_dtype(DType::F32)?;
+        let f = sidecar.dequantize_f16()?.to_dtype(DType::F32)?;
+        if g.dims() != f.dims() {
+            return Ok(format!("shape MISMATCH gguf={:?} sidecar={:?}", g.dims(), f.dims()));
+        }
+        let d = (&g - &f)?.abs()?;
+        let max = d.max_all()?.to_scalar::<f32>()?;
+        let mean = d.mean_all()?.to_scalar::<f32>()?;
+        let gmax = g.abs()?.max_all()?.to_scalar::<f32>()?;
+        let fmax = f.abs()?.max_all()?.to_scalar::<f32>()?;
+        // Проверка на транспонированность: сравниваем с f^T, если веса квадратные
+        let extra = if g.dims().len() == 2 && g.dim(0)? == g.dim(1)? {
+            let dt = (&g - &f.t()?.contiguous()?)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            format!(" max|g-fᵀ|={dt:.4}")
+        } else {
+            String::new()
+        };
+        Ok(format!(
+            "shape={:?} max|diff|={max:.4} mean|diff|={mean:.5} max|gguf|={gmax:.3} max|f16|={fmax:.3}{extra}",
+            g.dims()
+        ))
+    };
+    match report() {
+        Ok(r) => eprintln!("[ytf-audit] {name}: {r}"),
+        Err(e) => eprintln!("[ytf-audit] {name}: FAILED {e}"),
+    }
+}
+
 /// Graph-префилл пишет в paged pool чистый F16 (пул и так F16) — с q8
 /// round-trip логиты расходились с eager на MAE 0.42, без него — бит-в-бит.
 /// QWEN36_PGRAPH_Q8KV=1 возвращает round-trip (точность как у батчевого q8-кэша).
@@ -7530,11 +7562,18 @@ impl ModelWeights {
             }
         }
 
+        // QWEN36_YTF16_MASK=all|attn|delta|none — бисект групп проекций.
+        let mask = std::env::var("QWEN36_YTF16_MASK").unwrap_or_else(|_| "all".into());
+        let want_attn = mask == "all" || mask == "attn";
+        let want_delta = mask == "all" || mask == "delta";
+        // QWEN36_YTF16_AUDIT=1 — сверка сайдкара с деквантованным GGUF по blk.0.
+        let audit = std::env::var("QWEN36_YTF16_AUDIT").as_deref() == Ok("1");
+
         let mut mapped = 0usize;
         let mut total_bytes = 0u64;
         for (i, block) in self.blocks.iter_mut().enumerate() {
             match &mut block.layer {
-                HybridLayerType::Attention(a) => {
+                HybridLayerType::Attention(a) if want_attn => {
                     for (field, suffix) in [
                         (&mut a.f16_q, "q.weight"),
                         (&mut a.f16_k, "k.weight"),
@@ -7552,7 +7591,7 @@ impl ModelWeights {
                         }
                     }
                 }
-                HybridLayerType::DeltaNet(d) => {
+                HybridLayerType::DeltaNet(d) if want_delta => {
                     let dev = device.clone();
                     for (field, suffix) in [
                         (&mut d.f16_wqkv, "qkv.weight"),
@@ -7569,6 +7608,23 @@ impl ModelWeights {
                                 .tensor_bytes(&name)
                                 .map(|(b, _)| b.len())
                                 .unwrap_or(0) as u64;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if audit {
+            for (i, block) in self.blocks.iter().enumerate().take(2) {
+                match &block.layer {
+                    HybridLayerType::Attention(a) => {
+                        if let Some(f16) = a.f16_q.as_ref() {
+                            audit_ytf16(&format!("blk.{i}.attn_q"), &a.attention_wq, f16);
+                        }
+                    }
+                    HybridLayerType::DeltaNet(d) => {
+                        if let Some(f16) = d.f16_wqkv.as_ref() {
+                            audit_ytf16(&format!("blk.{i}.attn_qkv"), &d.wqkv, f16);
                         }
                     }
                 }
