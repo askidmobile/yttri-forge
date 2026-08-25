@@ -381,6 +381,13 @@ impl Qwen35BatchAdapter {
         a.model
             .attach_ytf16(gguf_path, &a.device)
             .map_err(|e| anyhow!("attach_ytf16: {e}"))?;
+        // Q8_0-квантование сайдкара идёт через F16-тензор на GPU: после
+        // сжатия его страницы остаются в driver pool (~1.2 ГиБ на 4B).
+        // Trim возвращает их ОС — иначе экономия VRAM съедается слаком.
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(c) = &a.device {
+            let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+        }
 
         if let Some(tokens) = std::env::var("QWEN36_KV_MIRROR_PREPARE")
             .ok()
