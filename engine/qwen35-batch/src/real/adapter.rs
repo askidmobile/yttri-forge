@@ -768,9 +768,13 @@ impl BatchModel for Qwen35BatchAdapter {
             };
             let (ag, ae) = (argmax(g), argmax(&logits_f32));
             eprintln!(
-                "[pg] parity T={} len={n} mae={:.3e} max={max:.3e} argmax g={ag} e={ae} {}",
+                "[pg] parity T={} len={n} mae={:.3e} max={max:.3e} argmax g={ag}({:.2}/{:.2}) e={ae}({:.2}/{:.2}) {}",
                 chunk.tokens.len(),
                 sum / n.max(1) as f64,
+                g[ag],
+                logits_f32[ag],
+                g[ae],
+                logits_f32[ae],
                 if ag == ae { "OK" } else { "MISMATCH" }
             );
         }

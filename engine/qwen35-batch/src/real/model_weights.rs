@@ -3029,6 +3029,14 @@ struct KvMirror {
     valid_tokens: usize,
 }
 
+/// QWEN36_PGRAPH_F16KV=1 — graph-префилл пишет в пул чистый F16 без q8
+/// round-trip (диагностика: вклад q8 в расхождение с eager-префиллом).
+#[cfg(feature = "cuda")]
+fn pgraph_f16_kv() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QWEN36_PGRAPH_F16KV").as_deref() == Ok("1"))
+}
+
 impl GatedAttentionLayer {
     /// Stage-2 (P1): f16-view префикса из инкрементального зеркала. None =
     /// зеркало недоступно (не-CUDA / бюджет исчерпан / не влезает рост).
@@ -3816,17 +3824,32 @@ impl GatedAttentionLayer {
         let q_rope = self.apply_partial_rotary_emb_with(&q_all, &cos_t, &sin_t)?;
         let k_rope = self.apply_partial_rotary_emb_with(&k_all, &cos_t, &sin_t)?;
 
-        // 4. head-last + q8 round-trip (паритет с eager)
+        // 4. head-last + q8 round-trip: пул F16, но decode держит KV в q8 —
+        //    round-trip уравнивает точность с батчевым кэшем. QWEN36_PGRAPH_F16KV=1
+        //    пишет чистый F16 (диагностика вклада q8 в расхождение с eager).
         let k_hl = k_rope.transpose(1, 2)?.contiguous()?; // [B, T, n_kv, hd]
         let v_hl = v_all.transpose(1, 2)?.contiguous()?;
-        let (kq, ks) = q8_quantize_rows(&k_hl)?;
-        let (vq, vs) = q8_quantize_rows(&v_hl)?;
-        let k_rows = q8_dequantize_rows(&kq, &ks)?
-            .reshape((b_sz * seq_len, self.n_kv_head, self.head_dim))?
-            .contiguous()?;
-        let v_rows = q8_dequantize_rows(&vq, &vs)?
-            .reshape((b_sz * seq_len, self.n_kv_head, self.head_dim))?
-            .contiguous()?;
+        let (k_rows, v_rows) = if pgraph_f16_kv() {
+            (
+                k_hl.to_dtype(DType::F16)?
+                    .reshape((b_sz * seq_len, self.n_kv_head, self.head_dim))?
+                    .contiguous()?,
+                v_hl.to_dtype(DType::F16)?
+                    .reshape((b_sz * seq_len, self.n_kv_head, self.head_dim))?
+                    .contiguous()?,
+            )
+        } else {
+            let (kq, ks) = q8_quantize_rows(&k_hl)?;
+            let (vq, vs) = q8_quantize_rows(&v_hl)?;
+            (
+                q8_dequantize_rows(&kq, &ks)?
+                    .reshape((b_sz * seq_len, self.n_kv_head, self.head_dim))?
+                    .contiguous()?,
+                q8_dequantize_rows(&vq, &vs)?
+                    .reshape((b_sz * seq_len, self.n_kv_head, self.head_dim))?
+                    .contiguous()?,
+            )
+        };
 
         // 5. Append T строк в paged pool
         let pool = self.paged_pool.as_ref().ok_or_else(|| {
