@@ -3841,7 +3841,7 @@ impl GatedAttentionLayer {
         // append записал строки, но kv_len ещё не инкрементирован → seqlens_k считаем сами:
         // используем cumsum от kv_len+T через отдельный staging... MVP: seqlens_k_t патчим host-side вне графа.
         let seqlens_q = ctx.seqlens_q(b_sz)?;
-        let seqlens_k = ctx.seqlens_k_for_prefill(seq_len)?;
+        let seqlens_k = ctx.seqlens_k_for_prefill(seq_len, seq_len)?;
         let block_table = ctx.block_table(b_sz)?;
         let out = candle_flash_attn::flash_attn_varlen_paged_windowed(
             &q_f16,
@@ -3851,7 +3851,7 @@ impl GatedAttentionLayer {
             &seqlens_k,
             &block_table,
             None,
-            seq_len as u32,
+            seq_len,
             window,
             scale,
             None,

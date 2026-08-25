@@ -188,8 +188,6 @@ pub fn launch_increment_t(&self, b: usize, t: usize) -> Result<()> {
         let mut builder = func.builder();
         builder.arg(&self.kv_len_dev);
         builder.arg(&self.slots_dev);
-        builder.arg(&b_i32);
-        builder.arg(&t_i32);
         unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
         Ok(())
     }
