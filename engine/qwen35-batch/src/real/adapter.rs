@@ -192,6 +192,12 @@ pub struct Qwen35BatchAdapter {
     /// LRU графов префилла (QWEN36_PGRAPH), ключ — (T, slot); хвост = свежий.
     #[cfg(feature = "cuda")]
     prefill_graphs: Vec<PrefillGraphState>,
+    /// Слот, чьё состояние сейчас лежит в single-slot буферах (DeltaNet
+    /// cuda_ctx + attention kv_cache), и позиция, на которой оно остановилось.
+    /// Пока владелец не сменился, snapshot/restore между чанками не нужны:
+    /// декод работает по batched-буферам и single-slot state не трогает.
+    /// Замер 2026-08-25: снимок+восстановление стоили ~25 мс на чанк.
+    state_owner: Option<(usize, usize)>,
     /// Слот, KV которого лежит ТОЛЬКО в paged pool (graph-prefill режим on):
     /// eager-decode по batched-кэшу дал бы мусор — путь закрыт явной ошибкой.
     #[cfg(feature = "cuda")]
@@ -356,6 +362,7 @@ impl Qwen35BatchAdapter {
             decode_graph: None,
             #[cfg(feature = "cuda")]
             paged_dirty: vec![true; num_slots],
+            state_owner: None,
             #[cfg(feature = "cuda")]
             prefill_graphs: Vec::new(),
             #[cfg(feature = "cuda")]
@@ -487,6 +494,7 @@ impl Qwen35BatchAdapter {
     /// Полный сброс (все слоты) — только для тестов / teardown.
     #[allow(dead_code)]
     fn clear_all_state(&mut self) {
+        self.state_owner = None;
         self.model.clear_state();
         self.model.clear_state_batched(&self.device);
         for s in self.slot_snaps.iter_mut() {
@@ -625,6 +633,7 @@ impl BatchModel for Qwen35BatchAdapter {
         }
         if chunk.reset_first {
             // Keep installed media for first chunk; reset only model state.
+            self.state_owner = None;
             self.model.clear_state();
             self.slot_snaps[sidx] = None;
             self.slot_seeded[sidx] = false;
@@ -636,8 +645,19 @@ impl BatchModel for Qwen35BatchAdapter {
             if self.multimodal[sidx].is_none() {
                 self.rope_deltas[sidx] = 0;
             }
-        } else if let Some(snap) = self.slot_snaps[sidx].as_ref() {
-            // Продолжение prefill после чанка: восстанавливаем single-slot state.
+        } else if self.state_owner.map(|(s, _)| s) == Some(sidx) {
+            // Состояние слота всё ещё в буферах — восстанавливать нечего.
+        } else if self.slot_snaps[sidx].is_some() {
+            // Владелец сменился: сначала сохраняем состояние прежнего слота
+            // (его снимок отложен), затем восстанавливаем своё.
+            if let Some((prev, prev_pos)) = self.state_owner {
+                let snap = self
+                    .model
+                    .snapshot_state(&self.device, prev_pos)
+                    .map_err(|e| anyhow!("prefill snapshot (передача владения слоту {sidx}): {e}"))?;
+                self.slot_snaps[prev] = Some(snap);
+            }
+            let snap = self.slot_snaps[sidx].as_ref().unwrap();
             self.model
                 .restore_state(&self.device, snap)
                 .map_err(|e| anyhow!("prefill restore: {e}"))?;
@@ -809,17 +829,18 @@ impl BatchModel for Qwen35BatchAdapter {
             );
         }
 
-        // Сохранить snapshot state слота на позиции start_pos + tokens.len().
+        // Промежуточные чанки снимок НЕ делают: состояние остаётся в буферах,
+        // владелец — этот слот. Снимок берётся лениво — либо на финальном чанке
+        // (нужен для seed), либо при передаче владения другому слоту.
         let new_pos = chunk.start_pos + chunk.tokens.len();
+        self.state_owner = Some((sidx, new_pos));
         let pf_s0 = std::time::Instant::now();
-        let snap = self
-            .model
-            .snapshot_state(&self.device, new_pos)
-            .map_err(|e| anyhow!("prefill snapshot: {e}"))?;
-        self.slot_snaps[sidx] = Some(snap);
-        // Seed only final prompt boundary; intermediate chunks restore through
-        // single-slot snapshot on next prefill call.
         if chunk.is_final {
+            let snap = self
+                .model
+                .snapshot_state(&self.device, new_pos)
+                .map_err(|e| anyhow!("prefill snapshot: {e}"))?;
+            self.slot_snaps[sidx] = Some(snap);
             self.model
                 .seed_slot_batched(
                     &self.device,
@@ -830,6 +851,9 @@ impl BatchModel for Qwen35BatchAdapter {
                 )
                 .map_err(|error| anyhow!("prefill seed slot {sidx}: {error}"))?;
             self.slot_seeded[sidx] = true;
+            // Владение снимается: ниже KV single-slot пути очищается, и
+            // пропускать restore для следующего чанка этого слота нельзя.
+            self.state_owner = None;
             // Single-slot F16 KV больше не нужен (decode через batched q8):
             // освобождаем ~480 MiB @24K, иначе карта уходит в 97%+ и декод
             // падает в WDDM shared (обрыв 6K→12K, 2026-08-23).
