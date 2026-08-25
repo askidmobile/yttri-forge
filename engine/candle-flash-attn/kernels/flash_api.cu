@@ -199,10 +199,13 @@ extern "C" void run_mha(
 
     // Число сплитов по K. QWEN36_FA_SPLITS=1 возвращает прежнее поведение.
     params.num_splits = 1;
-    static const bool force_single = [] {
+    // QWEN36_FA_SPLITS: 1 — прежнее поведение без сплитов, N>1 — форсировать N,
+    // не задано — эвристика апстрима.
+    static const int forced_splits = [] {
         const char* e = std::getenv("QWEN36_FA_SPLITS");
-        return e != nullptr && e[0] == '1' && e[1] == '\0';
+        return e != nullptr ? std::atoi(e) : 0;
     }();
+    const bool force_single = (forced_splits == 1);
     void* oaccum = nullptr;
     void* lseaccum = nullptr;
     if (!force_single) {
@@ -218,7 +221,10 @@ extern "C" void run_mha(
         const int block_n = d <= 64 ? 256 : (d <= 128 ? 128 : 64);
         const int num_n_blocks = fa_ceildiv(seqlen_k, block_n);
         const int num_m_blocks = fa_ceildiv(seqlen_q, 64);
-        const int ns = fa_num_splits_heuristic(b * h * num_m_blocks, num_sms, num_n_blocks, 128);
+        int ns = fa_num_splits_heuristic(b * h * num_m_blocks, num_sms, num_n_blocks, 128);
+        if (forced_splits > 1 && seqlen_q == 1) {
+            ns = std::min(forced_splits, num_n_blocks);
+        }
         // Печатаем по одному разу для декода (seqlen_q==1) и для префилла.
         static bool reported_decode = false;
         static bool reported_prefill = false;
