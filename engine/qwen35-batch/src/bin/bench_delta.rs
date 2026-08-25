@@ -89,7 +89,7 @@ fn run(dev: &CudaDevice, kernel: &str, t: usize, iters: usize) -> Result<(f64, V
     // Прогрев + эталонный выход (состояние каждый раз одно и то же).
     let mut state = dev.clone_htod(&state0)?;
     launch(&mut state)?;
-    dev.synchronize()?;
+    dev.cuda_stream().synchronize()?;
     let reference = dev.clone_dtoh(&out)?;
 
     let t0 = std::time::Instant::now();
@@ -97,7 +97,7 @@ fn run(dev: &CudaDevice, kernel: &str, t: usize, iters: usize) -> Result<(f64, V
         let mut state = dev.clone_htod(&state0)?;
         launch(&mut state)?;
     }
-    dev.synchronize()?;
+    dev.cuda_stream().synchronize()?;
     let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
     Ok((ms, reference))
 }
