@@ -65,7 +65,7 @@ fn run(
         // Блок ведёт 64 столбца состояния одной головы; поток держит 32 строки
         // своего столбца в регистрах. Shared: K,Q [32×128], δ [32×64],
         // две матрицы [32×32] и мелочь — около 49 КБ, нужен opt-in.
-        const C: usize = 32;
+        const C: usize = 16;
         const COLS: usize = 64;
         const ROWGRP: usize = 4;
         let smem = (2 * C * hkd + 3 * C * COLS + 2 * C * C + 2 * C + COLS * ROWGRP) * 4;
@@ -403,7 +403,7 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
     let out_c = dev.alloc_zeros::<f32>(t * n_v * hvd)?;
     let mut state_c = dev.clone_htod(&s0)?;
     {
-        const C: usize = 32;
+        const C: usize = 16;
         const COLS: usize = 64;
         const ROWGRP: usize = 4;
         let smem = (2 * C * hkd + 3 * C * COLS + 2 * C * C + 2 * C + COLS * ROWGRP) * 4;

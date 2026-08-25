@@ -593,7 +593,7 @@ extern "C" __global__ void delta_rule_prefill_v2(
 // (нужна лишь 4-сторонняя редукция по группам строк), а warp-редукций на
 // каждый токен, которые съедали 41% времени в последовательном ядре, нет.
 // grid = (n_v_heads, hvd/COLS), block = (COLS, ROWGRP).
-#define DR_CHUNK 32
+#define DR_CHUNK 16
 #define DR_COLS 64
 #define DR_ROWGRP 4
 
