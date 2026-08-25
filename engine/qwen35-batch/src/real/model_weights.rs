@@ -4483,12 +4483,12 @@ impl HybridBlock {
                 ).map_err(|e| candle_core::Error::Msg(format!("delta fused: {e}")))?;
                 let head_in = gated_all;
                 match &delta.f16_ssm_out {
-                    Some(fo) => fo.forward(&head_in),
-                    None => delta.ssm_out.forward(&head_in),
+                    Some(fo) => fo.forward(&head_in)?,
+                    None => delta.ssm_out.forward(&head_in)?,
                 }
             }
             HybridLayerType::Attention(attn) => {
-                attn.forward_attn_prefill_paged(&normed, ctx, rope_pos_dev)
+                attn.forward_attn_prefill_paged(&normed, ctx, rope_pos_dev)?
             }
         };
         let x = (layer_out + residual)?;
