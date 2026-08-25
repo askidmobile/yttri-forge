@@ -399,6 +399,33 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
     let gpu_out = dev.clone_dtoh(&out)?;
     let gpu_state = dev.clone_dtoh(&state)?;
 
+    // Тот же вход — через chunked-ядро.
+    let out_c = dev.alloc_zeros::<f32>(t * n_v * hvd)?;
+    let mut state_c = dev.clone_htod(&s0)?;
+    {
+        const C: usize = 32;
+        const COLS: usize = 64;
+        const ROWGRP: usize = 4;
+        let smem = (2 * C * hkd + C * COLS + 2 * C * C + 2 * C + COLS * ROWGRP) * 4;
+        let f = dev.get_or_load_func("delta_rule_prefill_chunked", &candle_kernels::DELTA_RULE)?;
+        f.set_attribute(
+            candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem as i32,
+        ).map_err(|e| anyhow!("set_attribute: {e:?}"))?;
+        let cfg = LaunchConfig {
+            grid_dim: (N_V, (hvd / COLS) as u32, 1),
+            block_dim: (COLS as u32, ROWGRP as u32, 1),
+            shared_mem_bytes: smem as u32,
+        };
+        let mut b = f.builder();
+        b.arg(&dq); b.arg(&dk); b.arg(&dv); b.arg(&db); b.arg(&dg);
+        b.arg(&state_c); b.arg(&out_c); b.arg(&p); b.arg(&t_u32);
+        unsafe { b.launch(cfg) }.map_err(|e| anyhow!("launch chunked: {e:?}"))?;
+    }
+    dev.cuda_stream().synchronize()?;
+    let gpu_c_out = dev.clone_dtoh(&out_c)?;
+    let gpu_c_state = dev.clone_dtoh(&state_c)?;
+
     let head = 0usize;
     let (seq_out, seq_state) = ref_sequential(&q, &k, &v, &beta, &gate, &s0, &d, head);
     let (chk_out, chk_state) = ref_chunked(&q, &k, &v, &beta, &gate, &s0, &d, head, chunk);
@@ -416,6 +443,14 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
         max_rel(&gpu_head, &seq_out), max_rel(gpu_head_state, &seq_state));
     println!("  chunked vs последовательный:  out {}, state {}",
         max_rel(&seq_out, &chk_out), max_rel(&seq_state, &chk_state));
+    let mut gpu_c_head = vec![0f32; t * hvd];
+    for tt in 0..t {
+        let b = (tt * n_v + head) * hvd;
+        gpu_c_head[tt * hvd..(tt + 1) * hvd].copy_from_slice(&gpu_c_out[b..b + hvd]);
+    }
+    println!("  ЯДРО chunked vs последовательный: out {}, state {}",
+        max_rel(&gpu_c_head, &seq_out),
+        max_rel(&gpu_c_state[head * hkd * hvd..(head + 1) * hkd * hvd], &seq_state));
     println!("  масштаб: |out|max={:.3} |state|max={:.3}",
         seq_out.iter().fold(0f32, |m, x| m.max(x.abs())),
         seq_state.iter().fold(0f32, |m, x| m.max(x.abs())));
