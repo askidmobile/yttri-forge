@@ -3049,12 +3049,31 @@ fn audit_ytf16(name: &str, gguf: &QMatMul, sidecar: &QMatMul) {
             let (o, i2) = (g.dim(0)?, g.dim(1)?);
             let alt = f.reshape((i2, o))?.t()?.contiguous()?;
             let dt = (&g - &alt)?.abs()?.max_all()?.to_scalar::<f32>()?;
-            let g0: Vec<f32> = g.i((0, 0..6))?.to_vec1()?;
-            let gc: Vec<f32> = g.i((0..6, 0))?.to_vec1()?;
-            let f0: Vec<f32> = f.i((0, 0..6))?.to_vec1()?;
-            format!(
-                " max|g-fᵀ|={dt:.4}\n[ytf-audit]   g[0,..]={g0:?}\n[ytf-audit]   g[..,0]={gc:?}\n[ytf-audit]   f[0,..]={f0:?}"
-            )
+            // Ищем, какой строке GGUF соответствует строка сайдкара: если это
+            // перестановка строк, найдётся точное совпадение (в пределах ошибки
+            // квантования), и индексы покажут закон перестановки.
+            let ncols = i2 as f32;
+            let mut rows = String::new();
+            for r in [0usize, 1, 2, 64, 1024] {
+                if r >= o {
+                    continue;
+                }
+                let fr = f.i((r, ..))?.unsqueeze(0)?;
+                let d = match g.broadcast_sub(&fr) {
+                    Ok(d) => d.abs()?.sum(1)?,
+                    Err(e) => {
+                        rows.push_str(&format!("\n[ytf-audit]   row {r}: {e}"));
+                        continue;
+                    }
+                };
+                let idx = d.argmin(0)?.to_scalar::<u32>()? as usize;
+                let best = d.i(idx)?.to_scalar::<f32>()? / ncols;
+                let same = d.i(r)?.to_scalar::<f32>()? / ncols;
+                rows.push_str(&format!(
+                    "\n[ytf-audit]   f[{r}] ближе всего к g[{idx}] (avg|diff|={best:.5}), на своём месте {same:.5}"
+                ));
+            }
+            format!(" max|g-fᵀ|={dt:.4}{rows}")
         } else {
             String::new()
         };
@@ -7623,7 +7642,7 @@ impl ModelWeights {
             }
         }
         if audit {
-            for (i, block) in self.blocks.iter().enumerate().take(2) {
+            for (i, block) in self.blocks.iter().enumerate().take(5) {
                 match &block.layer {
                     HybridLayerType::Attention(a) => {
                         if let Some(f16) = a.f16_q.as_ref() {
