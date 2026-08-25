@@ -363,11 +363,16 @@ impl PagedKvPool {
         let t_i32 = t as i32;
         builder.arg(&b_i32);
         builder.arg(&t_i32);
-        builder.arg(&(n_kv as i32));
-        builder.arg(&(hd as i32));
-        builder.arg(&(PAGE_SIZE as i32));
-        builder.arg(&(ctx.max_blocks as i32));
-        builder.arg(&(window as i32));
+        let n_kv_i32 = n_kv as i32;
+        let hd_i32 = hd as i32;
+        let page_i32 = PAGE_SIZE as i32;
+        let max_blocks_i32 = ctx.max_blocks as i32;
+        let window_i32 = window as i32;
+        builder.arg(&n_kv_i32);
+        builder.arg(&hd_i32);
+        builder.arg(&page_i32);
+        builder.arg(&max_blocks_i32);
+        builder.arg(&window_i32);
         unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
         Ok(())
     }
