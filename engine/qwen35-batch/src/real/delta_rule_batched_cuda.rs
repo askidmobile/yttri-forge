@@ -305,6 +305,10 @@ pub fn dispatch_delta_rule_batched(
 
     // ── Kernel 3: delta_rule_kernel_batched ──
     // grid=(n_v, B, 1), block=(head_v_dim, 1, 1)
+    // Ядро держит столбец состояния в регистрах (DR_MAX_HD=128 в .cu).
+    if hvd > 128 {
+        candle_core::bail!("delta decode: head_v_dim={hvd} > 128 не поддерживается ядром");
+    }
     {
         let func = dev.get_or_load_func(
             "delta_rule_kernel_batched",

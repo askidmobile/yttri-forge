@@ -290,6 +290,9 @@ extern "C" __global__ void delta_l2_norm_expand_batched(
 // Shared memory reduction внутри блока (= один (head, slot)), изоляция автоматична.
 // ═══════════════════════════════════════════════════════════════
 
+// Максимум строк состояния, поднимаемых в регистры (head_v_dim у Qwen3.5/3.6 = 128).
+#define DR_MAX_HD 128
+
 // Тело рекуррентного шага для одной строки. `state` — тайл [hd×hd] ОДНОЙ головы
 // (указатель в global slot-регион ЛИБО в smem — generic pointer, инструкции
 // идентичны → бит-эксактность между вариантами). Каждый поток читает/пишет
@@ -316,41 +319,34 @@ __device__ __forceinline__ void delta_rule_row_state(
     const unsigned int slot_head = bidx * n_v + head;                     // temp beta/gate (batch_idx)
     const unsigned int vec_base = bidx * n_v * hd + head * hd;              // temp q/k/v/output (batch_idx)
 
-    // ── 1. Decay: state[row][col] *= exp(gate[slot][head]) ──
-    float gate_exp = __expf(gate[slot_head]);
-    for (unsigned int row = 0; row < hd; row++) {
-        state[row * hd + col] *= gate_exp;
-    }
-    // Барьер не нужен: каждый поток читает/пишет только свой столбец.
+    // Столбец состояния целиком в регистрах: раньше по нему шли четыре прохода
+    // (затухание rw, Sᵀk r, rank-1 rw, Sᵀq r) — 384 КБ трафика на голову вместо
+    // необходимых 128, и ядро сидело в 7 раз выше предела памяти. Плюс уходит
+    // круг через shared: поток писал shared_sk[col] и читал ОБРАТНО СВОЁ же
+    // значение, ради чего стояли два __syncthreads().
+    // Порядок арифметики на элемент не меняется → результат бит-в-бит.
+    const float gate_exp = __expf(gate[slot_head]);
+    const float beta_h = beta[slot_head];
+    float st[DR_MAX_HD];
 
-    // ── 2. sk[col] = sum_row(state[row][col] * k[slot][head][row]) ──
     float sk_val = 0.0f;
     for (unsigned int row = 0; row < hd; row++) {
-        sk_val += state[row * hd + col] * k[vec_base + row];
-    }
-    shared_sk[col] = sk_val;
-
-    __syncthreads();
-
-    // ── 3. d[col] = (v[slot][head][col] - sk[col]) * beta[slot][head] ──
-    float beta_h = beta[slot_head];
-    float d_val = (v[vec_base + col] - shared_sk[col]) * beta_h;
-    shared_d[col] = d_val;
-
-    __syncthreads();
-
-    // ── 4. Rank-1 update: state[row][col] += k[slot][head][row] * d[col] ──
-    float d_col = shared_d[col];
-    for (unsigned int row = 0; row < hd; row++) {
-        state[row * hd + col] += k[vec_base + row] * d_col;
+        const float sv = state[row * hd + col] * gate_exp;
+        st[row] = sv;
+        sk_val += sv * k[vec_base + row];
     }
 
-    // ── 5. out[slot][head][col] = sum_row(state[row][col] * q[slot][head][row]) ──
+    const float d_col = (v[vec_base + col] - sk_val) * beta_h;
+
     float out_val = 0.0f;
     for (unsigned int row = 0; row < hd; row++) {
-        out_val += state[row * hd + col] * q[vec_base + row];
+        const float sv = st[row] + k[vec_base + row] * d_col;
+        state[row * hd + col] = sv;
+        out_val += sv * q[vec_base + row];
     }
     output[vec_base + col] = out_val;
+    (void)shared_sk;
+    (void)shared_d;
 }
 
 // Global-state обёртка (обычный batched decode и _seq без smem).
