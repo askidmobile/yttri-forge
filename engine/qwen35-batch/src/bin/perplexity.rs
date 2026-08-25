@@ -10,7 +10,13 @@
 //! варианта (как у llama.cpp) здесь нет — зато процедура одинакова для всех
 //! сравниваемых конфигураций, а именно это и требуется.
 //!
-//! Запуск: perplexity <model.gguf|model.ytf> <text.txt> [n_tokens]
+//! Запуск: perplexity <model.gguf|model.ytf> <text.txt> [n_tokens] [tokenizer.json]
+//!
+//! Четвёртый аргумент обязателен при сравнении форматов: GGUF собирает
+//! токенизатор из `tokenizer.ggml.tokens`+merges, а .ytf несёт готовый
+//! `tokenizer.json`, и разбиение получается разным. При разном разбиении
+//! перплексии просто несравнимы — замер без общего токенизатора давал
+//! «выигрыш 6.8%» там, где веса отличались на 0.16%.
 
 use anyhow::{bail, Context, Result};
 use candle_core::Device;
@@ -40,10 +46,15 @@ fn main() -> Result<()> {
         .next()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2048);
+    let tokenizer_override = args.next().map(PathBuf::from);
 
     let text = std::fs::read_to_string(&text_path)
         .with_context(|| format!("чтение {}", text_path.display()))?;
-    let tok = tokenizer::load_from_gguf_path(&model)?;
+    let tok = match &tokenizer_override {
+        Some(p) => tokenizers::Tokenizer::from_file(p)
+            .map_err(|e| anyhow::anyhow!("токенизатор {}: {e}", p.display()))?,
+        None => tokenizer::load_from_gguf_path(&model)?,
+    };
     let encoded = tok
         .encode(text.as_str(), false)
         .map_err(|e| anyhow::anyhow!("токенизация: {e}"))?;
