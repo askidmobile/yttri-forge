@@ -75,7 +75,10 @@ pub struct ContainerWriter<W: Write> {
     dtype_counts: BTreeMap<String, u32>,
     clamped_bf16: u64,
     entries: Vec<TensorEntry>,
-    buffer: Vec<u8>,
+    /// Сколько байтов данных уже записано (offset следующего тензора).
+    /// Данные пишутся сразу в файл: копить контейнер в памяти нельзя —
+    /// на 27B это десятки гигабайт.
+    data_len: u64,
 }
 
 impl<W: Write + Seek> ContainerWriter<W> {
@@ -121,21 +124,40 @@ impl<W: Write + Seek> ContainerWriter<W> {
             dtype_counts: BTreeMap::new(),
             clamped_bf16: 0,
             entries: Vec::new(),
-            buffer: Vec::with_capacity(128 << 20),
+            data_len: 0,
         })
     }
 
     /// Добавить тензор F16 LE. Возвращает data-offset.
-    pub fn add_tensor(&mut self, name: &str, shape: &[usize], f16_le: Vec<u8>) -> u64 {
+    pub fn add_tensor(
+        &mut self,
+        name: &str,
+        shape: &[usize],
+        f16_le: Vec<u8>,
+    ) -> std::io::Result<u64> {
         self.add_typed(name, shape, "F16", &f16_le)
     }
 
     /// Добавить тензор произвольного GGML-типа (v2). Возвращает data-offset.
-    pub fn add_typed(&mut self, name: &str, shape: &[usize], dtype: &str, bytes: &[u8]) -> u64 {
-        let pad = ((ALIGN - (self.buffer.len() as u64 % ALIGN)) % ALIGN) as usize;
-        self.buffer.extend(std::iter::repeat(0u8).take(pad));
-        let off = self.buffer.len() as u64;
-        self.buffer.extend_from_slice(bytes);
+    ///
+    /// Пишет сразу в файл: заголовок и окно манифеста уже зарезервированы, а
+    /// сам манифест патчится при finalize. Промежуточный буфер в памяти
+    /// означал бы весь контейнер в RAM — для 27B это неподъёмно.
+    pub fn add_typed(
+        &mut self,
+        name: &str,
+        shape: &[usize],
+        dtype: &str,
+        bytes: &[u8],
+    ) -> std::io::Result<u64> {
+        let pad = ((ALIGN - (self.data_len % ALIGN)) % ALIGN) as usize;
+        if pad > 0 {
+            self.file.write_all(&[0u8; ALIGN as usize][..pad])?;
+            self.data_len += pad as u64;
+        }
+        let off = self.data_len;
+        self.file.write_all(bytes)?;
+        self.data_len += bytes.len() as u64;
         self.entries.push(TensorEntry {
             name: name.to_string(),
             shape: shape.to_vec(),
@@ -143,7 +165,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
             len: bytes.len() as u64,
             dtype: dtype.to_string(),
         });
-        off
+        Ok(off)
     }
 
     pub fn note_dtype(&mut self, dt: &str) {
@@ -170,10 +192,9 @@ impl<W: Write + Seek> ContainerWriter<W> {
         );
         mb.extend(std::iter::repeat(0u8).take(RESERVE_MANIFEST as usize - mb.len()));
         self.file.seek(SeekFrom::Start(12))?;
-        // mlen уже записан в create() — пишем только JSON-окно
+        // mlen уже записан в create() — пишем только JSON-окно.
+        // Данные тензоров уже в файле (add_typed пишет их сразу).
         self.file.write_all(&mb)?;
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&self.buffer)?;
         self.file.flush()?;
         Ok(())
     }

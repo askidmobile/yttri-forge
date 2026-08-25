@@ -707,7 +707,8 @@ fn run(args: &Args) -> Result<(), String> {
             f16_bytes
         };
         total_bytes += f16_bytes.len() as u64;
-        w.add_tensor(&p.gguf, &shape, f16_bytes);
+        w.add_tensor(&p.gguf, &shape, f16_bytes)
+            .map_err(|e| format!("{}: запись: {e}", p.gguf))?;
     }
 
     if args.q8_emulate {

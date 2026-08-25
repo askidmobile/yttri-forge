@@ -328,7 +328,8 @@ pub fn pack(
         };
         let bytes = quantize_bytes(values, &shape, info.ggml_dtype)?;
         let dn = dtype_name(info.ggml_dtype);
-        w.add_typed(&gguf_name, &shape, dn, &bytes);
+        w.add_typed(&gguf_name, &shape, dn, &bytes)
+            .map_err(|e| format!("{gguf_name}: запись: {e}"))?;
         written.insert(gguf_name.clone(), hf.clone());
         stats.tensors += 1;
         stats.bytes += bytes.len() as u64;
@@ -370,7 +371,8 @@ pub fn pack(
             fused.resize(padded * cols, 0.0);
             let bytes = quantize_bytes(fused, &[padded, cols], dt)?;
             let name = format!("blk.{blk}.attn_in_proj.weight");
-            w.add_typed(&name, &[padded, cols], dtype_name(dt), &bytes);
+            w.add_typed(&name, &[padded, cols], dtype_name(dt), &bytes)
+                .map_err(|e| format!("{name}: запись: {e}"))?;
             stats.bytes += bytes.len() as u64;
             stats.tensors += 1;
             if layers == 0 {
@@ -387,12 +389,8 @@ pub fn pack(
 
     let tok = std::fs::read(tokenizer_json)
         .map_err(|e| format!("read {}: {e}", tokenizer_json.display()))?;
-    w.add_typed(
-        crate::pack::TOKENIZER_BLOB,
-        &[tok.len()],
-        "RAW",
-        &tok,
-    );
+    w.add_typed(crate::pack::TOKENIZER_BLOB, &[tok.len()], "RAW", &tok)
+        .map_err(|e| format!("токенизатор: запись: {e}"))?;
     stats.bytes += tok.len() as u64;
 
     w.finalize().map_err(|e| format!("finalize: {e}"))?;
