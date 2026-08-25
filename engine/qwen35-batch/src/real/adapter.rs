@@ -782,6 +782,19 @@ impl BatchModel for Qwen35BatchAdapter {
         };
         let pf_logits = pf_l0.elapsed();
 
+        // Топ-2 логита финального чанка: по ним видно, ничья ли решает выбор
+        // первого токена, когда два варианта ядра дают разный текст.
+        if chunk.is_final && crate::scheduler::trace_on() {
+            let mut top: Vec<(usize, f32)> = logits_f32.iter().copied().enumerate().collect();
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            if top.len() >= 2 {
+                eprintln!(
+                    "[pfa] top1={} ({:.4}) top2={} ({:.4}) отрыв={:.4}",
+                    top[0].0, top[0].1, top[1].0, top[1].1, top[0].1 - top[1].1
+                );
+            }
+        }
+
         // Не-финитные логиты префилла = сэмплер выдаст мусорный первый токен.
         // Дёшево (один проход по vocab на чанк) и ловит целый класс поломок.
         if let Some(idx) = logits_f32.iter().position(|v| !v.is_finite()) {
