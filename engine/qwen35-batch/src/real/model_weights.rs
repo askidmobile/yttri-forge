@@ -3029,12 +3029,13 @@ struct KvMirror {
     valid_tokens: usize,
 }
 
-/// QWEN36_PGRAPH_F16KV=1 — graph-префилл пишет в пул чистый F16 без q8
-/// round-trip (диагностика: вклад q8 в расхождение с eager-префиллом).
+/// Graph-префилл пишет в paged pool чистый F16 (пул и так F16) — с q8
+/// round-trip логиты расходились с eager на MAE 0.42, без него — бит-в-бит.
+/// QWEN36_PGRAPH_Q8KV=1 возвращает round-trip (точность как у батчевого q8-кэша).
 #[cfg(feature = "cuda")]
 fn pgraph_f16_kv() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("QWEN36_PGRAPH_F16KV").as_deref() == Ok("1"))
+    *V.get_or_init(|| std::env::var("QWEN36_PGRAPH_Q8KV").as_deref() != Ok("1"))
 }
 
 impl GatedAttentionLayer {
@@ -3825,8 +3826,8 @@ impl GatedAttentionLayer {
         let k_rope = self.apply_partial_rotary_emb_with(&k_all, &cos_t, &sin_t)?;
 
         // 4. head-last + q8 round-trip: пул F16, но decode держит KV в q8 —
-        //    round-trip уравнивает точность с батчевым кэшем. QWEN36_PGRAPH_F16KV=1
-        //    пишет чистый F16 (диагностика вклада q8 в расхождение с eager).
+        //    По умолчанию пишем F16 (бит-в-бит с eager); QWEN36_PGRAPH_Q8KV=1
+        //    возвращает round-trip — точность как у батчевого q8-кэша.
         let k_hl = k_rope.transpose(1, 2)?.contiguous()?; // [B, T, n_kv, hd]
         let v_hl = v_all.transpose(1, 2)?.contiguous()?;
         let (k_rows, v_rows) = if pgraph_f16_kv() {
