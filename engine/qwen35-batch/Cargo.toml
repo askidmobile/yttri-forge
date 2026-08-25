@@ -118,6 +118,11 @@ path = "src/bin/bench_delta.rs"
 required-features = ["real-model", "cuda"]
 
 [[bin]]
+name = "perplexity"
+path = "src/bin/perplexity.rs"
+required-features = ["real-model", "cuda"]
+
+[[bin]]
 name = "bench_proj"
 path = "src/bin/bench_proj.rs"
 required-features = ["real-model", "cuda"]
