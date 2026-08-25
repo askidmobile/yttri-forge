@@ -53,6 +53,14 @@ fn main() -> Result<()> {
     }
     tokens.truncate(limit);
 
+    // Хеш последовательности токенов: перплексии двух моделей сравнимы только
+    // если корпус разбит одинаково. GGUF собирает токенизатор из
+    // tokenizer.ggml.tokens+merges, а .ytf несёт готовый tokenizer.json —
+    // разное разбиение дало бы разные числа при одинаковых весах.
+    let tok_hash = tokens.iter().fold(1469598103934665603u64, |h, &t| {
+        (h ^ t as u64).wrapping_mul(1099511628211)
+    });
+
     let device = Device::new_cuda(0).or_else(|_| Ok::<_, anyhow::Error>(Device::Cpu))?;
     let t0 = Instant::now();
     let mut adapter = Qwen35BatchAdapter::load(&model, device, 1)?;
@@ -95,7 +103,7 @@ fn main() -> Result<()> {
 
     let mean_nll = nll_sum / counted as f64;
     println!(
-        "model={}\ntokens={counted} ppl={:.4} mean_nll={:.4}\nload={:.1}s eval={:.1}s ({:.1} tok/s)",
+        "model={}\ntokens={counted} tok_hash={tok_hash:016x} ppl={:.4} mean_nll={:.4}\nload={:.1}s eval={:.1}s ({:.1} tok/s)",
         model.display(),
         mean_nll.exp(),
         mean_nll,
