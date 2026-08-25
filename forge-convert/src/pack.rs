@@ -190,12 +190,27 @@ pub fn pack(
             format!("{hf} → {gguf_name}: в эталонном GGUF такого тензора нет")
         })?;
         let (values, shape) = read_tensor_f32(shards, hf)?;
-        if shape != info.shape.dims() {
-            return Err(format!(
-                "{gguf_name}: форма {shape:?} не совпадает с эталоном {:?}",
-                info.shape.dims()
-            ));
-        }
+        // HF держит conv1d как [C, 1, K], GGUF — как [C, K]. Единичные
+        // измерения схлопываем, но только если порядок и число элементов
+        // совпали: иначе это настоящее расхождение раскладки, и молчать нельзя.
+        let ref_dims = info.shape.dims().to_vec();
+        let shape = if shape == ref_dims {
+            shape
+        } else {
+            let squeeze = |d: &[usize]| -> Vec<usize> {
+                d.iter().copied().filter(|x| *x != 1).collect()
+            };
+            let same_elems: usize = shape.iter().product::<usize>();
+            if squeeze(&shape) == squeeze(&ref_dims)
+                && same_elems == ref_dims.iter().product::<usize>()
+            {
+                ref_dims.clone()
+            } else {
+                return Err(format!(
+                    "{gguf_name}: форма {shape:?} не совпадает с эталоном {ref_dims:?}"
+                ));
+            }
+        };
         // Перепаковка раскладки DeltaNet работает по байтам F16 — применяем её
         // до квантования, на F16-представлении.
         let values = if delta_layout.is_some() && shape.len() == 2 {
