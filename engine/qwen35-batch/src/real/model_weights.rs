@@ -3807,9 +3807,14 @@ impl GatedAttentionLayer {
             b_sz, self.n_kv_head, seq_len, self.head_dim,
         ))?;
 
-        // 3. RoPE по device-позициям [T]
-        let q_rope = self.apply_partial_rotary_emb_devpos(&q_all, rope_pos_dev)?;
-        let k_rope = self.apply_partial_rotary_emb_devpos(&k_all, rope_pos_dev)?;
+        // 3. RoPE по device-позициям [T]. index_select — device-gather (capture-safe),
+        //    дальше тот же apply_partial_rotary_emb_with, что и в eager prefill
+        //    (devpos-вариант рассчитан на B строк по 1 токену и здесь broadcast'ит
+        //    [T,1,1,half] против [1,nh,T,half] → мусорная форма [T,nh,T,half]).
+        let cos_t = self.cos.index_select(rope_pos_dev, 0)?; // [T, rope/2]
+        let sin_t = self.sin.index_select(rope_pos_dev, 0)?;
+        let q_rope = self.apply_partial_rotary_emb_with(&q_all, &cos_t, &sin_t)?;
+        let k_rope = self.apply_partial_rotary_emb_with(&k_all, &cos_t, &sin_t)?;
 
         // 4. head-last + q8 round-trip (паритет с eager)
         let k_hl = k_rope.transpose(1, 2)?.contiguous()?; // [B, T, n_kv, hd]
@@ -3829,19 +3834,18 @@ impl GatedAttentionLayer {
         })?;
         pool.launch_append_multi(ctx, &k_rows, &v_rows, b_sz, seq_len, self.n_kv_head, self.head_dim, self.attn_window)?;
 
-        // 6. FA2 varlen: seqlens_q=[T], seqlens_k=[kv0+T]
-        let q_f16 = q_rope.to_dtype(DType::F16)?.squeeze(2)?.contiguous()?; // [B, n_head, T, hd]→varlen ждёт [total_q, n_head, hd]? см. decode: squeeze(2) из [B,nh,1,hd]
-        // Для varlen q формат: [total_q_tokens, n_head, hd] → из [B, nh, T, hd]: transpose→[B,T,nh,hd]→flatten
-        let q_f16 = q_rope.to_dtype(DType::F16)?
-            .transpose(1, 2)?.contiguous()?
+        // 6. FA2 varlen: q [T, nh, hd], seqlens_q=[0,T], seqlens_k=[0, kv0+T].
+        //    seqlens_k заполняется один раз на проход (forward_prefill_graphed),
+        //    seqlens_q — persistent буфер, стейджится вне графа.
+        let q_f16 = q_rope
+            .to_dtype(DType::F16)?
+            .transpose(1, 2)?
+            .contiguous()?
             .reshape((b_sz * seq_len, self.n_head, self.head_dim))?;
         let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
         let window = ctx.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE;
-        // seqlens_k нужно kv0+T (append уже прошёл? НЕТ: FA2 должен видеть len+T строк).
-        // append записал строки, но kv_len ещё не инкрементирован → seqlens_k считаем сами:
-        // используем cumsum от kv_len+T через отдельный staging... MVP: seqlens_k_t патчим host-side вне графа.
-        let seqlens_q = ctx.seqlens_q(b_sz)?;
-        let seqlens_k = ctx.seqlens_k_for_prefill(seq_len, seq_len)?;
+        let seqlens_q = ctx.seqlens_q_prefill();
+        let seqlens_k = ctx.seqlens_k(b_sz)?;
         let block_table = ctx.block_table(b_sz)?;
         let out = candle_flash_attn::flash_attn_varlen_paged_windowed(
             &q_f16,
@@ -3855,7 +3859,10 @@ impl GatedAttentionLayer {
             window,
             scale,
             None,
-            None,
+            // window_size_right=0 → causal. При q_len<k_len FA2 v2 выравнивает
+            // маску по правому-нижнему углу: строка i видит 0..kv0+i. Без этого
+            // токены чанка видят будущее (eager путь идёт с causal=true).
+            Some(0),
             crate::real::paged_kv_cuda::PAGE_SIZE,
             None,
         )?;
@@ -7226,9 +7233,16 @@ impl ModelWeights {
             candle_core::Error::Msg("prefill graph: paged ctx missing".into())
         })?;
 
+        // seqlens_k = kv_len[slot] + T — одинаков для всех слоёв прохода
+        // (kv_len инкрементируется только в конце). Один launch вместо N.
+        ctx.seqlens_k_for_prefill(1, t_len)?;
+
         for block in self.blocks.iter_mut() {
             layer_in = block.forward_prefill_paged(&layer_in, ctx, rope_pos_dev)?;
         }
+
+        // kv_len[slot] += T — после ВСЕХ attention слоёв (все слои видят одну длину).
+        ctx.launch_increment_t(1, t_len)?;
 
         let hidden_all = self.norm.forward(&layer_in)?;
         // head только над последней позицией

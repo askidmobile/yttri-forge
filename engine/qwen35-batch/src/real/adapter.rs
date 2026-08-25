@@ -99,6 +99,71 @@ impl DecodeGraphState {
     }
 }
 
+/// CUDA-graph replay состояние для prefill-чанка. Ключ LRU — (T, slot):
+/// граф жёстко зашит под длину чанка и страницы слота.
+#[cfg(feature = "cuda")]
+struct PrefillGraphState {
+    exec: cudarc::driver::sys::CUgraphExec,
+    cu_graph: cudarc::driver::sys::CUgraph,
+    stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    t: usize,
+    slot: usize,
+    /// Persistent входы (стейджатся ВНЕ графа): ids [1,T] U32, позиции [T] U32.
+    ids_t: Tensor,
+    rope_pos_t: Tensor,
+    /// Внешний буфер выхода (D2D-нода внутри графа) — graph-pool адреса
+    /// невалидны для D2H снаружи launch.
+    logits_t: Tensor,
+}
+
+#[cfg(feature = "cuda")]
+impl PrefillGraphState {
+    fn launch(&self) -> Result<()> {
+        let res = unsafe {
+            cudarc::driver::sys::cuGraphLaunch(self.exec, self.stream.cu_stream())
+        };
+        if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(anyhow!("cuGraphLaunch (prefill) failed: {res:?}"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PrefillGraphState {
+    fn drop(&mut self) {
+        unsafe {
+            cudarc::driver::sys::cuGraphExecDestroy(self.exec);
+            cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
+        }
+    }
+}
+
+/// Сколько графов префилла держим одновременно (PD-A5).
+#[cfg(feature = "cuda")]
+const PGRAPH_LRU: usize = 8;
+
+/// Режим graph-prefill: `QWEN36_PGRAPH` = off (умолчание) | on | check.
+/// `check` — прогнать граф, откатить state и посчитать чанк ещё раз eager'ом,
+/// сравнив логиты (гейт Phase 2). Продакшн-путь — `on`.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PgraphMode {
+    Off,
+    On,
+    Check,
+}
+
+#[cfg(feature = "cuda")]
+fn pgraph_mode() -> PgraphMode {
+    static MODE: std::sync::OnceLock<PgraphMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("QWEN36_PGRAPH").as_deref() {
+        Ok("1") | Ok("on") => PgraphMode::On,
+        Ok("check") => PgraphMode::Check,
+        _ => PgraphMode::Off,
+    })
+}
+
 #[cfg(feature = "cuda")]
 impl Drop for DecodeGraphState {
     fn drop(&mut self) {
@@ -124,6 +189,13 @@ pub struct Qwen35BatchAdapter {
     /// CUDA-graph replay состояние (env QWEN36_CUDA_GRAPHS=1).
     #[cfg(feature = "cuda")]
     decode_graph: Option<DecodeGraphState>,
+    /// LRU графов префилла (QWEN36_PGRAPH), ключ — (T, slot); хвост = свежий.
+    #[cfg(feature = "cuda")]
+    prefill_graphs: Vec<PrefillGraphState>,
+    /// Слот, KV которого лежит ТОЛЬКО в paged pool (graph-prefill режим on):
+    /// eager-decode по batched-кэшу дал бы мусор — путь закрыт явной ошибкой.
+    #[cfg(feature = "cuda")]
+    pg_paged_only: Vec<bool>,
     /// Per-slot: KV данные изменились (prefill/seed) и paged pool устарел.
     #[cfg(feature = "cuda")]
     paged_dirty: Vec<bool>,
@@ -274,6 +346,10 @@ impl Qwen35BatchAdapter {
             decode_graph: None,
             #[cfg(feature = "cuda")]
             paged_dirty: vec![true; num_slots],
+            #[cfg(feature = "cuda")]
+            prefill_graphs: Vec::new(),
+            #[cfg(feature = "cuda")]
+            pg_paged_only: vec![false; num_slots],
             #[cfg(feature = "cuda")]
             graphs_enabled: graphs_on,
             vision: None,
@@ -538,6 +614,7 @@ impl BatchModel for Qwen35BatchAdapter {
             #[cfg(feature = "cuda")]
             {
                 self.paged_dirty[sidx] = true;
+                self.pg_paged_only[sidx] = false;
             }
             if self.multimodal[sidx].is_none() {
                 self.rope_deltas[sidx] = 0;
@@ -559,8 +636,16 @@ impl BatchModel for Qwen35BatchAdapter {
             (1usize, chunk.tokens.len()),
             &self.device,
         )?;
+        // yttri-forge: CUDA-graph prefill (QWEN36_PGRAPH=on|check).
+        #[cfg(feature = "cuda")]
+        let (pg_logits, pg_used) = self.prefill_try_graphed(chunk)?;
+        #[cfg(not(feature = "cuda"))]
+        let (pg_logits, pg_used): (Option<Vec<f32>>, bool) = (None, false);
+
         let pf_fwd0 = std::time::Instant::now();
-        let (logits, mtp_inputs) = if let Some(media) = self.multimodal[sidx].as_mut() {
+        let (logits, mtp_inputs) = if pg_used {
+            (None, None)
+        } else if let Some(media) = self.multimodal[sidx].as_mut() {
             let end = chunk
                 .start_pos
                 .checked_add(chunk.tokens.len())
@@ -613,19 +698,21 @@ impl BatchModel for Qwen35BatchAdapter {
                 .model
                 .forward_embeds_mrope_with_hidden(&embeds, &plan, chunk.start_pos)
                 .map_err(|error| anyhow!("multimodal prefill forward: {error}"))?;
-            (logits, Some((embeds, hidden)))
+            (Some(logits), Some((embeds, hidden)))
         } else if self.mtp.is_some() {
             let embeds = self.model.embed_tokens(&ids, &self.device)?;
             let (logits, hidden) = self
                 .model
                 .forward_embeds_with_hidden(&embeds, chunk.start_pos)
                 .map_err(|error| anyhow!("prefill forward: {error}"))?;
-            (logits, Some((embeds, hidden)))
+            (Some(logits), Some((embeds, hidden)))
         } else {
             (
-                self.model
-                    .forward(&ids, chunk.start_pos)
-                    .map_err(|error| anyhow!("prefill forward: {error}"))?,
+                Some(
+                    self.model
+                        .forward(&ids, chunk.start_pos)
+                        .map_err(|error| anyhow!("prefill forward: {error}"))?,
+                ),
                 None,
             )
         };
@@ -646,12 +733,47 @@ impl BatchModel for Qwen35BatchAdapter {
         }
         let pf_fwd = pf_fwd0.elapsed();
         let pf_l0 = std::time::Instant::now();
-        let logits_f32 = logits
-            .squeeze(0)?
-            .to_dtype(DType::F32)?
-            .to_vec1()
-            .map_err(|e| anyhow!("prefill logits to_vec1: {e}"))?;
+        let logits_f32 = match logits {
+            Some(l) => l
+                .squeeze(0)?
+                .to_dtype(DType::F32)?
+                .to_vec1()
+                .map_err(|e| anyhow!("prefill logits to_vec1: {e}"))?,
+            None => pg_logits
+                .clone()
+                .ok_or_else(|| anyhow!("prefill: логиты не посчитаны"))?,
+        };
         let pf_logits = pf_l0.elapsed();
+
+        // check-режим: граф vs eager на одном и том же чанке (гейт Phase 2).
+        if let (Some(g), false) = (pg_logits.as_ref(), pg_used) {
+            let n = g.len().min(logits_f32.len());
+            let (mut sum, mut max) = (0f64, 0f32);
+            for i in 0..n {
+                let d = (g[i] - logits_f32[i]).abs();
+                sum += d as f64;
+                max = max.max(d);
+            }
+            let argmax = |v: &[f32]| {
+                v.iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
+                        if x > a.1 {
+                            (i, x)
+                        } else {
+                            a
+                        }
+                    })
+                    .0
+            };
+            let (ag, ae) = (argmax(g), argmax(&logits_f32));
+            eprintln!(
+                "[pg] parity T={} len={n} mae={:.3e} max={max:.3e} argmax g={ag} e={ae} {}",
+                chunk.tokens.len(),
+                sum / n.max(1) as f64,
+                if ag == ae { "OK" } else { "MISMATCH" }
+            );
+        }
 
         // Сохранить snapshot state слота на позиции start_pos + tokens.len().
         let new_pos = chunk.start_pos + chunk.tokens.len();
@@ -689,6 +811,17 @@ impl BatchModel for Qwen35BatchAdapter {
             }
         } else {
             self.slot_seeded[sidx] = false;
+        }
+
+        #[cfg(feature = "cuda")]
+        if pg_used {
+            // KV чанка записан прямо в paged pool: миграция из batched-кэша
+            // (он пуст после graph-префилла) затёрла бы его.
+            self.paged_dirty[sidx] = false;
+            self.pg_paged_only[sidx] = true;
+        } else if pg_logits.is_some() {
+            // check-режим: авторитет — batched KV eager-пути, пул пересоберётся.
+            self.paged_dirty[sidx] = true;
         }
 
         if crate::scheduler::trace_on() {
@@ -792,6 +925,18 @@ impl BatchModel for Qwen35BatchAdapter {
         }
         // Hidden decode_batch'а больше не нужен MTP: verify идёт через
         // speculative_verify (multi-token), hidden собирает speculative_accept.
+        #[cfg(feature = "cuda")]
+        if let Some(it) = batch
+            .items
+            .iter()
+            .find(|it| self.pg_paged_only[it.slot_idx])
+        {
+            return Err(anyhow!(
+                "slot {}: KV после graph-префилла живёт только в paged pool — \
+                 eager decode дал бы мусор (нужны CUDA-графы декода)",
+                it.slot_idx
+            ));
+        }
         let logits = self
             .model
             .forward_decode_batch(&ids, &positions, &rope_positions, &slots)
@@ -1033,6 +1178,227 @@ impl BatchModel for Qwen35BatchAdapter {
 }
 
 impl Qwen35BatchAdapter {
+    /// Обёртка над `prefill_chunk_graphed`: снимает snapshot для check-режима,
+    /// глотает ошибку графа (PD-205 — чанк уходит в eager, графы остаются).
+    /// Возвращает (логиты графа, использовать_ли_их_как_результат).
+    #[cfg(feature = "cuda")]
+    fn prefill_try_graphed(&mut self, chunk: &PrefillChunk) -> Result<(Option<Vec<f32>>, bool)> {
+        let mode = pgraph_mode();
+        if mode == PgraphMode::Off {
+            return Ok((None, false));
+        }
+        let pre = if mode == PgraphMode::Check {
+            Some(
+                self.model
+                    .snapshot_state(&self.device, chunk.start_pos)
+                    .map_err(|e| anyhow!("pg pre-snapshot: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let logits = match self.prefill_chunk_graphed(chunk) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[pg] ошибка, чанк уходит в eager: {e}");
+                None
+            }
+        };
+        if logits.is_none() {
+            return Ok((None, false));
+        }
+        match pre {
+            // check: откатываем state на дографовый — эталон считает eager-путь.
+            Some(pre) => {
+                self.model
+                    .restore_state(&self.device, &pre)
+                    .map_err(|e| anyhow!("pg restore: {e}"))?;
+                Ok((logits, false))
+            }
+            None => Ok((logits, true)),
+        }
+    }
+
+    /// CUDA-graph prefill одного чанка: один cuGraphLaunch вместо ~1000 мс
+    /// хостовых launch'ей. `Ok(None)` — чанк не graphable (гейты), вызывающий
+    /// идёт eager. Ошибка внутри → eager этот чанк, графы НЕ выключаются
+    /// (PD-205: отличие от decode).
+    ///
+    /// Вне графа стейджится вся динамика: ids, позиции RoPE, kv_len[slot],
+    /// seqlens_q=[0,T], block_table. Внутри — только device-операции.
+    #[cfg(feature = "cuda")]
+    fn prefill_chunk_graphed(&mut self, chunk: &PrefillChunk) -> Result<Option<Vec<f32>>> {
+        if pgraph_mode() == PgraphMode::Off {
+            return Ok(None);
+        }
+        let Device::Cuda(cuda_dev) = &self.device else {
+            return Ok(None);
+        };
+        let slot = chunk.slot_idx;
+        let t = chunk.tokens.len();
+        // PD-204: MTP читает hidden всех позиций, vision — mrope; оба → eager.
+        if self.mtp.is_some() || self.multimodal[slot].is_some() || !self.graphs_enabled {
+            return Ok(None);
+        }
+        self.model
+            .init_paged_decode(&self.device)
+            .map_err(|e| anyhow!("pgraph init paged: {e}"))?;
+        let window = self.model.paged_window();
+        if window == 0 || chunk.start_pos + t > window {
+            return Ok(None);
+        }
+
+        let t_stage = std::time::Instant::now();
+        // Слот владеет страницами [slot*mb .. (slot+1)*mb).
+        let block_table = {
+            let ctx = self.model.paged_ctx.as_ref().unwrap();
+            let mb = ctx.max_blocks as u32;
+            (0..mb).map(|j| slot as u32 * mb + j).collect::<Vec<u32>>()
+        };
+        {
+            let ctx = self.model.paged_ctx.as_mut().unwrap();
+            // rope_pos_t декода префиллом не используется (позиции идут своим
+            // буфером [T]), но slots/block_table нужны append-ядру.
+            ctx.stage_inputs(&[slot as u32], &[chunk.start_pos], &block_table)?;
+            let mut lens = ctx.kv_len_host.clone();
+            lens[slot] = chunk.start_pos as u32;
+            ctx.reset_kv_len(&lens)?;
+            ctx.set_prefill_seqlens_q(t)?;
+        }
+        let rope_host: Vec<u32> = (chunk.start_pos..chunk.start_pos + t)
+            .map(|p| p as u32)
+            .collect();
+        let stage_ms = t_stage.elapsed().as_secs_f64() * 1e3;
+
+        let t_run = std::time::Instant::now();
+        let hit = self
+            .prefill_graphs
+            .iter()
+            .position(|g| g.t == t && g.slot == slot);
+        let (flat, hit_flag) = match hit {
+            Some(i) => {
+                {
+                    let g = &self.prefill_graphs[i];
+                    let ids_staging =
+                        Tensor::from_vec(chunk.tokens.clone(), (1usize, t), &Device::Cpu)?
+                            .to_device(&self.device)?;
+                    g.ids_t.slice_set(&ids_staging, 0, 0)?;
+                    let rope_staging =
+                        Tensor::from_vec(rope_host, t, &Device::Cpu)?.to_device(&self.device)?;
+                    g.rope_pos_t.slice_set(&rope_staging, 0, 0)?;
+                    g.launch()?;
+                }
+                // LRU: свежий — в хвост.
+                let g = self.prefill_graphs.remove(i);
+                let flat = g
+                    .logits_t
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()
+                    .map_err(|e| anyhow!("pgraph logits read: {e}"))?;
+                self.prefill_graphs.push(g);
+                (flat, true)
+            }
+            None => {
+                // htod-кэш: промах параметров при захвате → явная ошибка вместо
+                // pageable memcpy внутри графа.
+                let _htod_guard = cuda_dev.enable_cuda_graph_htod_cache();
+                let ids_t = Tensor::from_vec(chunk.tokens.clone(), (1usize, t), &self.device)?;
+                let rope_pos_t = Tensor::from_vec(rope_host.clone(), t, &self.device)?;
+                // 1) Eager-прогон: это и есть результат чанка (захват ядра не
+                //    исполняет) + прогрев ядер/htod-кэша.
+                let (logits, _hidden) = self
+                    .model
+                    .forward_prefill_graphed(&ids_t, &rope_pos_t, t)
+                    .map_err(|e| anyhow!("pgraph eager prime: {e}"))?;
+                let flat = logits
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()
+                    .map_err(|e| anyhow!("pgraph prime logits: {e}"))?;
+                let out_shape = logits.shape().clone();
+                let out_dtype = logits.dtype();
+                drop(logits);
+                let stream = cuda_dev.cuda_stream();
+                let captured = (|| -> Result<PrefillGraphState> {
+                    use cudarc::driver::{result as cres, sys as csys};
+                    let logits_out = Tensor::zeros(out_shape, out_dtype, &self.device)?;
+                    unsafe {
+                        cres::stream::begin_capture(
+                            stream.cu_stream(),
+                            csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+                        )
+                    }
+                    .map_err(|e| anyhow!("pgraph begin_capture: {e}"))?;
+                    let forward_result =
+                        self.model.forward_prefill_graphed(&ids_t, &rope_pos_t, t);
+                    let (logits_t, hidden_t) = match forward_result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
+                            return Err(anyhow!("pgraph capture forward: {e}"));
+                        }
+                    };
+                    if let Err(e) = logits_out.slice_set(&logits_t, 0, 0) {
+                        let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
+                        return Err(anyhow!("pgraph logits_out copy: {e}"));
+                    }
+                    drop(logits_t);
+                    drop(hidden_t);
+                    let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
+                        .map_err(|e| anyhow!("pgraph end_capture: {e}"))?;
+                    if cu_graph.is_null() {
+                        return Err(anyhow!("pgraph end_capture returned null graph"));
+                    }
+                    let mut nodes: usize = 0;
+                    unsafe { csys::cuGraphGetNodes(cu_graph, std::ptr::null_mut(), &mut nodes) };
+                    let mut exec: csys::CUgraphExec = std::ptr::null_mut();
+                    let res = unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
+                    if res != csys::CUresult::CUDA_SUCCESS || exec.is_null() {
+                        unsafe { csys::cuGraphDestroy(cu_graph) };
+                        return Err(anyhow!("pgraph instantiate: {res:?}"));
+                    }
+                    eprintln!("[pg] captured T={t} slot={slot} nodes={nodes}");
+                    Ok(PrefillGraphState {
+                        exec,
+                        cu_graph,
+                        stream: stream.clone(),
+                        t,
+                        slot,
+                        ids_t: ids_t.clone(),
+                        rope_pos_t: rope_pos_t.clone(),
+                        logits_t: logits_out,
+                    })
+                })();
+                match captured {
+                    Ok(g) => {
+                        self.prefill_graphs.push(g);
+                        while self.prefill_graphs.len() > PGRAPH_LRU {
+                            self.prefill_graphs.remove(0);
+                        }
+                    }
+                    // Захват не удался — чанк уже посчитан eager-прогоном,
+                    // состояние консистентно; графы остаются включёнными.
+                    Err(e) => eprintln!("[pg] capture failed (чанк отдан eager-прогоном): {e}"),
+                }
+                (flat, false)
+            }
+        };
+
+        // Device kv_len продвинут ядром на +T — синхронизируем хостовое зеркало.
+        {
+            let ctx = self.model.paged_ctx.as_mut().unwrap();
+            ctx.kv_len_host[slot] = (chunk.start_pos + t) as u32;
+        }
+        eprintln!(
+            "[pg] chunk T={t} slot={slot} pos={} hit={} lru={} stage={stage_ms:.1}ms run={:.1}ms",
+            chunk.start_pos,
+            u8::from(hit_flag),
+            self.prefill_graphs.len(),
+            t_run.elapsed().as_secs_f64() * 1e3,
+        );
+        Ok(Some(flat))
+    }
+
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     fn decode_batch_graphed(

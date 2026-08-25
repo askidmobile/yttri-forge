@@ -23,6 +23,8 @@ pub struct PagedModelCtx {
     pub slots_dev: CudaSlice<u32>,
     /// Static seqlens_q: [0, 1, ..., capacity_b] i32 — persistent Tensor.
     pub seqlens_q_t: Tensor,
+    /// Prefill seqlens_q: [0, T] — пишется host-side ВНЕ графа (T фиксирован графом).
+    pub seqlens_q_pf_t: Tensor,
     /// Cumulative seqlens_k (kernel-written per step): [capacity_b + 1] i32.
     pub seqlens_k_t: Tensor,
     /// Block table: [capacity_b, max_blocks] u32 (bidx → slot pages).
@@ -75,6 +77,7 @@ impl PagedModelCtx {
         let seqlens_q_host: Vec<u32> = (0..=capacity_b as u32).collect();
         let seqlens_q_t = Tensor::from_vec(seqlens_q_host, capacity_b + 1, &device)?;
         let seqlens_k_t = Tensor::zeros(capacity_b + 1, DType::U32, &device)?;
+        let seqlens_q_pf_t = Tensor::zeros(2, DType::U32, &device)?;
         let block_table_t = Tensor::zeros((capacity_b, max_blocks), DType::U32, &device)?;
         let rope_pos_t = Tensor::zeros(capacity_b, DType::U32, &device)?;
         Ok(Self {
@@ -82,6 +85,7 @@ impl PagedModelCtx {
             kv_len_dev,
             slots_dev,
             seqlens_q_t,
+            seqlens_q_pf_t,
             seqlens_k_t,
             block_table_t,
             rope_pos_t,
@@ -172,8 +176,8 @@ impl PagedModelCtx {
         Ok(())
     }
 
-    /// Узкие view под текущий batch B для FA2.
-pub fn launch_increment_t(&self, b: usize, t: usize) -> Result<()> {
+    /// Prefill: kv_len[slot] += t для активных слотов (конец prefill-прохода).
+    pub fn launch_increment_t(&self, b: usize, t: usize) -> Result<()> {
         let func = self.dev.get_or_load_func(
             "kv_len_increment_t",
             &candle_core::cuda_backend::kernels::QUANTIZED,
@@ -188,6 +192,8 @@ pub fn launch_increment_t(&self, b: usize, t: usize) -> Result<()> {
         let mut builder = func.builder();
         builder.arg(&self.kv_len_dev);
         builder.arg(&self.slots_dev);
+        builder.arg(&b_i32);
+        builder.arg(&t_i32);
         unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
         Ok(())
     }
@@ -224,6 +230,18 @@ pub fn launch_increment_t(&self, b: usize, t: usize) -> Result<()> {
         builder.arg(&t_i32);
         unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
         Ok(out)
+    }
+
+    /// seqlens_q для prefill varlen = [0, T]. H2D ВНЕ графа.
+    pub fn set_prefill_seqlens_q(&self, t: usize) -> Result<()> {
+        let staging = Tensor::from_vec(vec![0u32, t as u32], 2, &Device::Cpu)?
+            .to_device(&Device::Cuda(self.dev.clone()))?;
+        self.seqlens_q_pf_t.slice_set(&staging, 0, 0)
+    }
+
+    /// Persistent [0, T] — адрес стабилен между replay.
+    pub fn seqlens_q_prefill(&self) -> Tensor {
+        self.seqlens_q_pf_t.clone()
     }
 
     pub fn rope_pos(&self, b: usize) -> Result<Tensor> {
