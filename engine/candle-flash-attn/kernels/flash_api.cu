@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -218,6 +219,12 @@ extern "C" void run_mha(
         const int num_n_blocks = fa_ceildiv(seqlen_k, block_n);
         const int num_m_blocks = fa_ceildiv(seqlen_q, 64);
         const int ns = fa_num_splits_heuristic(b * h * num_m_blocks, num_sms, num_n_blocks, 128);
+        static bool reported = false;
+        if (!reported && std::getenv("QWEN36_FA_DEBUG") != nullptr) {
+            reported = true;
+            fprintf(stderr, "[fa] splits: b=%d h=%d seqlen_q=%d seqlen_k=%d n_blocks=%d sms=%d -> num_splits=%d\n",
+                    b, h, seqlen_q, seqlen_k, num_n_blocks, num_sms, ns);
+        }
         if (ns > 1) {
             const size_t lse_elems = (size_t)ns * b * h * seqlen_q;
             const size_t o_elems = lse_elems * d_rounded;
