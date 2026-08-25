@@ -47,11 +47,11 @@ fn fill(n: usize, seed: u32) -> Vec<f32> {
 fn run(dev: &CudaDevice, kernel: &str, t: usize, iters: usize) -> Result<(f64, Vec<f32>)> {
     let p = params();
     let (n_v, hkd, hvd) = (N_V as usize, HKD as usize, HVD as usize);
-    let q = dev.memcpy_stod(&fill(t * n_v * hkd, 1))?;
-    let k = dev.memcpy_stod(&fill(t * n_v * hkd, 2))?;
-    let v = dev.memcpy_stod(&fill(t * n_v * hvd, 3))?;
-    let beta = dev.memcpy_stod(&fill(t * n_v, 4))?;
-    let gate = dev.memcpy_stod(&fill(t * n_v, 5))?;
+    let q = dev.clone_htod(&fill(t * n_v * hkd, 1))?;
+    let k = dev.clone_htod(&fill(t * n_v * hkd, 2))?;
+    let v = dev.clone_htod(&fill(t * n_v * hvd, 3))?;
+    let beta = dev.clone_htod(&fill(t * n_v, 4))?;
+    let gate = dev.clone_htod(&fill(t * n_v, 5))?;
     let out = dev.alloc_zeros::<f32>(t * n_v * hvd)?;
     let state0 = fill(n_v * hvd * hvd, 6);
 
@@ -87,14 +87,14 @@ fn run(dev: &CudaDevice, kernel: &str, t: usize, iters: usize) -> Result<(f64, V
     };
 
     // Прогрев + эталонный выход (состояние каждый раз одно и то же).
-    let mut state = dev.memcpy_stod(&state0)?;
+    let mut state = dev.clone_htod(&state0)?;
     launch(&mut state)?;
     dev.synchronize()?;
-    let reference = dev.memcpy_dtov(&out)?;
+    let reference = dev.clone_dtoh(&out)?;
 
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        let mut state = dev.memcpy_stod(&state0)?;
+        let mut state = dev.clone_htod(&state0)?;
         launch(&mut state)?;
     }
     dev.synchronize()?;
