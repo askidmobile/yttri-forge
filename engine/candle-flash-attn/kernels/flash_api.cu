@@ -205,10 +205,15 @@ extern "C" void run_mha(
     void* oaccum = nullptr;
     void* lseaccum = nullptr;
     if (!force_single) {
-        int dev = 0;
-        cudaGetDevice(&dev);
-        int num_sms = 0;
-        cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev);
+        // Число SM спрашиваем один раз: на каждый вызов внимания эти два
+        // хостовых запроса стоили заметно (префилл просел на 10%).
+        static const int num_sms = [] {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            int n = 0;
+            cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+            return n > 0 ? n : 1;
+        }();
         const int block_n = d <= 64 ? 256 : (d <= 128 ? 128 : 64);
         const int num_n_blocks = fa_ceildiv(seqlen_k, block_n);
         const int num_m_blocks = fa_ceildiv(seqlen_q, 64);
