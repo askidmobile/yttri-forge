@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 #[command(name = "forge-convert", version)]
 struct Args {
     /// safetensors файлы модели (BASE). Шарды — через пробел.
-    #[arg(required_unless_present_any = ["list", "verify_ytf"])]
+    #[arg(required_unless_present_any = ["list", "verify_ytf", "list_gguf"])]
     inputs: Vec<PathBuf>,
 
     /// Режим heavy: 9 групп проекций DeltaNet+Attention
@@ -79,10 +79,24 @@ struct Args {
     /// q6-head, q8-delta. Имя рецепта попадает в имя выходного файла.
     #[arg(long, default_value = "mirror")]
     recipe: String,
+
+    /// Напечатать тензоры GGUF (имя, тип, форма) — карта имён строится по
+    /// факту, а не по памяти.
+    #[arg(long)]
+    list_gguf: Option<PathBuf>,
 }
 
 fn main() {
     let args = Args::parse();
+    if let Some(g) = args.list_gguf.clone() {
+        match pack::list_gguf(&g) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let Some(ytf) = args.verify_ytf.clone() {
         let Some(gguf) = args.gguf.clone() else {
             eprintln!("error: --verify-ytf требует --gguf <эталон>");

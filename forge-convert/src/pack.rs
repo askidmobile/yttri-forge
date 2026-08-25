@@ -629,3 +629,20 @@ pub fn verify(ytf: &Path, ref_gguf: &Path, top: usize) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Напечатать тензоры GGUF: имя, тип, форма. Карта имён строится по факту.
+pub fn list_gguf(path: &Path) -> Result<(), String> {
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let ct = gguf_file::Content::read(&mut f).map_err(|e| format!("read gguf: {e}"))?;
+    let mut names: Vec<&String> = ct.tensor_infos.keys().collect();
+    names.sort();
+    println!("тензоров: {}", names.len());
+    for n in names {
+        let i = &ct.tensor_infos[n];
+        println!("  {:<40} {:<6} {:?}", n, dtype_name(i.ggml_dtype), i.shape.dims());
+    }
+    let mut keys: Vec<&String> = ct.metadata.keys().collect();
+    keys.sort();
+    println!("метаданных: {}", keys.len());
+    Ok(())
+}

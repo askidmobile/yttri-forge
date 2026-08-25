@@ -359,8 +359,8 @@ impl Qwen35Vision {
     fn load_with_policy(path: &Path, device: Device, production_q8: bool) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
-        let mut cursor = std::io::Cursor::new(mmap.as_ref());
-        let content = gguf_file::Content::read(&mut cursor)?;
+        // Формат-независимо: GGUF или самостоятельный контейнер .ytf.
+        let content = crate::real::ytf16::content_any(mmap.as_ref())?;
         let profile = if production_q8 {
             VisionProfile::read_and_validate(&content)?
         } else {

@@ -78,8 +78,8 @@ impl Qwen35Mtp {
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
             .map_err(candle_core::Error::wrap)?;
         let mmap = Arc::new(mmap);
-        let mut cursor = std::io::Cursor::new(mmap.as_ref());
-        let content = gguf_file::Content::read(&mut cursor)?;
+        // Формат-независимо: GGUF или самостоятельный контейнер .ytf.
+        let content = crate::real::ytf16::content_any(mmap.as_ref())?;
         let profile = MtpProfile::read_and_validate(&content, text_profile)?;
         let rms_norm_eps = profile.rms_norm_eps;
         let data: &[u8] = &mmap;
