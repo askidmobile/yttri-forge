@@ -430,6 +430,48 @@ pub fn dispatch_delta_rule_prefill(
         .unwrap_or(2); // FR-002 sweep: warps=2 optimal (1.8ms vs 2.8ms for warps=1)
     let t_p3_start = sync_t(dev);
     {
+        // Chunked-ядро (умолчание): рекуррентность блоками по 8 токенов,
+        // внутри блока — скалярные произведения и прямая подстановка вместо
+        // двух warp-редукций на каждый токен. Замер на стенде bench_delta:
+        // 1.977 против 2.287 мс у v1 при T=512, расхождение с последовательным
+        // эталоном 5.5e-7 (у v1 — 4.5e-7). Требует hkd=128 и hvd, кратного 64;
+        // иначе и по QWEN36_DELTA_KERNEL=v1 — старое ядро.
+        const CHUNK_C: usize = 8;
+        const CHUNK_COLS: usize = 64;
+        const CHUNK_ROWGRP: usize = 4;
+        let want_v1 = std::env::var("QWEN36_DELTA_KERNEL").as_deref() == Ok("v1");
+        let chunked_ok = hkd == 128 && hvd % CHUNK_COLS == 0 && !want_v1;
+        if chunked_ok {
+            let smem = (2 * CHUNK_C * hkd
+                + 3 * CHUNK_C * CHUNK_COLS
+                + 2 * CHUNK_C * CHUNK_C
+                + 2 * CHUNK_C
+                + CHUNK_COLS * CHUNK_ROWGRP)
+                * 4;
+            let func = dev
+                .get_or_load_func("delta_rule_prefill_chunked_c8", &candle_kernels::DELTA_RULE)?;
+            func.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                smem as i32,
+            )
+            .map_err(candle_core::Error::wrap)?;
+            let cfg = LaunchConfig {
+                grid_dim: (n_v as u32, (hvd / CHUNK_COLS) as u32, 1),
+                block_dim: (CHUNK_COLS as u32, CHUNK_ROWGRP as u32, 1),
+                shared_mem_bytes: smem as u32,
+            };
+            let mut b = func.builder();
+            b.arg(&q_a);
+            b.arg(&k_a);
+            b.arg(&v_a);
+            b.arg(&beta_a);
+            b.arg(&gate_a);
+            b.arg(&state.ssm_state);
+            b.arg(&raw_out);
+            b.arg(&p);
+            b.arg(&t_u32);
+            unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        } else {
         // v2 (QWEN36_DELTA_V2=1) — блок 1024 потока на 32 колонки, k/q через
         // shared. Замер 2026-08-25: МЕДЛЕННЕЕ v1 (1.23 против 1.14 с на
         // 1910 токенах). Гипотеза про «2 ГБ лишних чтений» неверна: 128 варпов
@@ -468,6 +510,7 @@ pub fn dispatch_delta_rule_prefill(
         b.arg(&p);
         b.arg(&t_u32);
         unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        }
     }
     if gprof2 { t_p3 = sync_t(dev).duration_since(t_p3_start).as_secs_f64() * 1000.0; }
 
