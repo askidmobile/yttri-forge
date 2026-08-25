@@ -69,6 +69,11 @@ struct Args {
     /// имена и формы) и напечатать худшие расхождения.
     #[arg(long)]
     verify_ytf: Option<PathBuf>,
+
+    /// Дополнительно записать слитую проекцию qkv+z+b+a одним тензором
+    /// (дополненным до кратности 128). Движок использует её, если найдёт.
+    #[arg(long)]
+    fuse_in_proj: bool,
 }
 
 fn main() {
@@ -413,6 +418,7 @@ fn run_pack(args: &Args) -> Result<(), String> {
         &tokenizer,
         &out_path,
         delta_layout,
+        args.fuse_in_proj,
         &read_tensor_f32,
         &repack_delta,
     )?;

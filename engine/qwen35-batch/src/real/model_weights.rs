@@ -1645,6 +1645,12 @@ struct DeltaNetLayer {
     w_beta: QMatMul,
     /// Alpha проекция: [n_embd] → [n_v_heads]
     w_alpha: QMatMul,
+    /// Слитая проекция qkv+z+b+a одной матрицей (контейнер .ytf, тензор
+    /// `attn_in_proj`). Число строк дополнено до кратности 128, хвост нулевой:
+    /// без этого матмуль уходит с MMA-пути (гейт n % 128 == 0) и становится
+    /// медленнее четырёх раздельных. None — контейнер её не несёт, работаем
+    /// по-старому.
+    in_proj_fused: Option<QMatMul>,
     /// Alpha bias: [n_v_heads] — per-head bias для alpha
     dt_bias: Vec<f32>,
     /// Negative A_log: [n_v_heads] — для decay gate (отрицательные значения)
@@ -1703,6 +1709,45 @@ struct DeltaNetLayer {
 }
 
 impl DeltaNetLayer {
+    /// Проекции qkv/z/beta/alpha одним матмулем, если контейнер несёт слитую
+    /// матрицу; иначе четырьмя, как раньше.
+    ///
+    /// Разрез выхода по последнему измерению бесплатен, когда остальные
+    /// измерения единичны (декод одного слота): candle считает такой вид
+    /// смежным. При батче и на префилле вид нессмежный, и его приходится
+    /// копировать — поэтому выигрыш здесь не универсален и его надо мерить.
+    #[cfg(not(target_os = "macos"))]
+    fn project_in(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let Some(fused) = self.in_proj_fused.as_ref() else {
+            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x)
+                .ok()
+                .flatten();
+            return Ok((
+                self.wqkv.forward_with_prequant(x, prequant.as_ref())?,
+                self.wgate.forward_with_prequant(x, prequant.as_ref())?,
+                self.w_beta.forward_with_prequant(x, prequant.as_ref())?,
+                self.w_alpha.forward_with_prequant(x, prequant.as_ref())?,
+            ));
+        };
+        let out = fused.forward(x)?;
+        let d = out.rank() - 1;
+        let ch = self.key_dim * 2 + self.value_dim;
+        let take = |off: usize, len: usize| -> Result<Tensor> {
+            let t = out.narrow(d, off, len)?;
+            if t.is_contiguous() {
+                Ok(t)
+            } else {
+                t.contiguous()
+            }
+        };
+        Ok((
+            take(0, ch)?,
+            take(ch, self.value_dim)?,
+            take(ch + self.value_dim, self.n_v_heads)?,
+            take(ch + self.value_dim + self.n_v_heads, self.n_v_heads)?,
+        ))
+    }
+
     /// Forward pass для одного токена (авторегрессивный режим).
     ///
     /// Вход: x shape [1, 1, n_embd] на device.
@@ -1730,13 +1775,7 @@ impl DeltaNetLayer {
         #[cfg(target_os = "macos")]
         let alpha_t = dispatch_q4k_matmul(&self.w_alpha, self.w_alpha_opt.as_ref(), x)?;
         #[cfg(not(target_os = "macos"))]
-        let qkv_t = self.wqkv.forward(x)?; // [1, 1, key_dim*2 + value_dim]
-        #[cfg(not(target_os = "macos"))]
-        let z_t = self.wgate.forward(x)?; // [1, 1, value_dim]
-        #[cfg(not(target_os = "macos"))]
-        let beta_t = self.w_beta.forward(x)?; // [1, 1, n_v_heads]
-        #[cfg(not(target_os = "macos"))]
-        let alpha_t = self.w_alpha.forward(x)?; // [1, 1, n_v_heads]
+        let (qkv_t, z_t, beta_t, alpha_t) = self.project_in(x)?;
         let t_proj = t0.elapsed();
 
         // ══════════════════════════════════════════════════════════════
@@ -1973,14 +2012,7 @@ impl DeltaNetLayer {
         #[cfg(target_os = "macos")]
         let alpha_t = dispatch_q4k_matmul(&self.w_alpha, self.w_alpha_opt.as_ref(), x)?;
         #[cfg(not(target_os = "macos"))]
-        let (qkv_t, z_t, beta_t, alpha_t) = {
-            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x).ok().flatten();
-            let qkv_t = self.wqkv.forward_with_prequant(x, prequant.as_ref())?;
-            let z_t = self.wgate.forward_with_prequant(x, prequant.as_ref())?;
-            let beta_t = self.w_beta.forward_with_prequant(x, prequant.as_ref())?;
-            let alpha_t = self.w_alpha.forward_with_prequant(x, prequant.as_ref())?;
-            (qkv_t, z_t, beta_t, alpha_t)
-        };
+        let (qkv_t, z_t, beta_t, alpha_t) = self.project_in(x)?;
 
         // Повторяющиеся слоты в батче (MTP verify: K позиций ОДНОГО слота) —
         // рекуррентный state требует последовательной обработки строк; параллельное
@@ -2305,12 +2337,7 @@ impl DeltaNetLayer {
                 let a = fa.forward(x)?;
                 (qkv, z, b, a)
             }
-            _ => (
-                self.wqkv.forward(x)?,
-                self.wgate.forward(x)?,
-                self.w_beta.forward(x)?,
-                self.w_alpha.forward(x)?,
-            ),
+            _ => self.project_in(x)?,
         };
         #[cfg(not(target_os = "macos"))]
         let dn_proj_ms = {
@@ -5790,6 +5817,18 @@ impl ModelWeights {
 
             let layer = if is_deltanet {
                 // ── DeltaNet Layer ──
+                // Слитая проекция qkv+z+b+a — опциональна: контейнер .ytf её
+                // несёт, GGUF нет. Отключается QWEN36_NO_FUSED_IN_PROJ=1.
+                let in_proj_fused = if std::env::var("QWEN36_NO_FUSED_IN_PROJ").as_deref()
+                    == Ok("1")
+                {
+                    None
+                } else {
+                    match load_heavy(&format!("{prefix}.attn_in_proj.weight")) {
+                        Ok(qt) => Some(QMatMul::from_qtensor(qt)?),
+                        Err(_) => None,
+                    }
+                };
                 let wqkv = load_heavy(&format!("{prefix}.attn_qkv.weight"))?;
                 let wgate = load_heavy(&format!("{prefix}.attn_gate.weight"))?;
                 let w_beta = load_heavy(&format!("{prefix}.ssm_beta.weight"))?;
@@ -6006,6 +6045,7 @@ impl ModelWeights {
                     wgate: qm_wgate,
                     w_beta: qm_w_beta,
                     w_alpha: qm_w_alpha,
+                    in_proj_fused,
                     f16_wqkv: None,
                     f16_wgate: None,
                     f16_w_beta: None,

@@ -191,6 +191,23 @@ fn apply_hf_transforms(
     values
 }
 
+/// Сверка формы с эталоном. HF держит conv1d как [C, 1, K], GGUF — как [C, K].
+/// Единичные измерения схлопываем, но только если порядок и число элементов
+/// совпали: иначе это настоящее расхождение раскладки, и молчать нельзя.
+fn reconcile_shape(name: &str, shape: &[usize], ref_dims: &[usize]) -> Result<Vec<usize>, String> {
+    if shape == ref_dims {
+        return Ok(shape.to_vec());
+    }
+    let squeeze = |d: &[usize]| -> Vec<usize> { d.iter().copied().filter(|x| *x != 1).collect() };
+    if squeeze(shape) == squeeze(ref_dims)
+        && shape.iter().product::<usize>() == ref_dims.iter().product::<usize>()
+    {
+        Ok(ref_dims.to_vec())
+    } else {
+        Err(format!("{name}: форма {shape:?} не совпадает с эталоном {ref_dims:?}"))
+    }
+}
+
 pub struct PackStats {
     pub tensors: usize,
     pub bytes: u64,
@@ -219,6 +236,7 @@ pub fn pack(
     tokenizer_json: &Path,
     out_path: &Path,
     delta_layout: Option<crate::DeltaLayout>,
+    fuse_in_proj: bool,
     read_tensor_f32: &dyn Fn(&[(String, memmap2::Mmap)], &str) -> Result<(Vec<f32>, Vec<usize>), String>,
     repack: &dyn Fn(&str, Vec<u8>, &[usize], Option<crate::DeltaLayout>) -> Vec<u8>,
 ) -> Result<PackStats, String> {
@@ -255,6 +273,32 @@ pub fn pack(
         skipped: Vec::new(),
     };
 
+    // Значения тензора, готовые к квантованию: чтение + преобразования
+    // llama.cpp + перепаковка раскладки + сверка формы с эталоном.
+    let prepare = |hf: &str, ref_dims: &[usize]| -> Result<(Vec<f32>, Vec<usize>), String> {
+        let (values, shape) = read_tensor_f32(shards, hf)?;
+        let shape = reconcile_shape(hf, &shape, ref_dims)?;
+        let values = apply_hf_transforms(hf, values, &shape, delta_layout);
+        let values = if delta_layout.is_some() && shape.len() == 2 {
+            let gguf_name = hf_to_gguf(hf).unwrap_or_default();
+            let f16le: Vec<u8> = values
+                .iter()
+                .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+                .collect();
+            let packed = repack(&gguf_name, f16le, &shape, delta_layout);
+            packed
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        } else {
+            values
+        };
+        Ok((values, shape))
+    };
+
+    // hf-имя каждого записанного тензора — нужно слитой проекции.
+    let mut written: BTreeMap<String, String> = BTreeMap::new();
+
     for hf in hf_names {
         let Some(gguf_name) = hf_to_gguf(hf) else {
             stats.skipped.push(hf.clone());
@@ -264,27 +308,7 @@ pub fn pack(
             format!("{hf} → {gguf_name}: в эталонном GGUF такого тензора нет")
         })?;
         let (values, shape) = read_tensor_f32(shards, hf)?;
-        // HF держит conv1d как [C, 1, K], GGUF — как [C, K]. Единичные
-        // измерения схлопываем, но только если порядок и число элементов
-        // совпали: иначе это настоящее расхождение раскладки, и молчать нельзя.
-        let ref_dims = info.shape.dims().to_vec();
-        let shape = if shape == ref_dims {
-            shape
-        } else {
-            let squeeze = |d: &[usize]| -> Vec<usize> {
-                d.iter().copied().filter(|x| *x != 1).collect()
-            };
-            let same_elems: usize = shape.iter().product::<usize>();
-            if squeeze(&shape) == squeeze(&ref_dims)
-                && same_elems == ref_dims.iter().product::<usize>()
-            {
-                ref_dims.clone()
-            } else {
-                return Err(format!(
-                    "{gguf_name}: форма {shape:?} не совпадает с эталоном {ref_dims:?}"
-                ));
-            }
-        };
+        let shape = reconcile_shape(&gguf_name, &shape, info.shape.dims())?;
         // Преобразования llama.cpp (нормы, A_log, dt_bias, conv1d) — по f32.
         let values = apply_hf_transforms(hf, values, &shape, delta_layout);
         // Перепаковка проекций DeltaNet работает по байтам F16 — применяем её
@@ -305,9 +329,60 @@ pub fn pack(
         let bytes = quantize_bytes(values, &shape, info.ggml_dtype)?;
         let dn = dtype_name(info.ggml_dtype);
         w.add_typed(&gguf_name, &shape, dn, &bytes);
+        written.insert(gguf_name.clone(), hf.clone());
         stats.tensors += 1;
         stats.bytes += bytes.len() as u64;
         *stats.by_dtype.entry(dn.to_string()).or_insert(0) += 1;
+    }
+
+    if fuse_in_proj {
+        // Слитая проекция qkv+z+b+a: одна матрица вместо четырёх.
+        // Дополняем число строк до кратности 128 — иначе матмуль уходит с
+        // MMA-пути (гейт n % 128 == 0) и становится медленнее раздельных:
+        // замер на M=512 Q8_0 дал -67.5% без дополнения и +27.8% с ним.
+        let parts = ["attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight"];
+        let mut layers = 0usize;
+        for blk in 0..1024usize {
+            let names: Vec<String> = parts.iter().map(|p| format!("blk.{blk}.{p}")).collect();
+            if !names.iter().all(|n| written.contains_key(n)) {
+                continue;
+            }
+            let mut fused: Vec<f32> = Vec::new();
+            let mut cols = 0usize;
+            let mut offsets: Vec<usize> = Vec::new();
+            let mut dt = GgmlDType::Q4K;
+            for (i, n) in names.iter().enumerate() {
+                let hf = &written[n];
+                let info = ct.tensor_infos.get(n).unwrap();
+                if i == 0 {
+                    dt = info.ggml_dtype;
+                    cols = info.shape.dims()[1];
+                }
+                let (v, sh) = prepare(hf, info.shape.dims())?;
+                if sh[1] != cols {
+                    return Err(format!("{n}: ширина {} != {cols}", sh[1]));
+                }
+                offsets.push(fused.len() / cols);
+                fused.extend_from_slice(&v);
+            }
+            let rows = fused.len() / cols;
+            let padded = rows.div_ceil(128) * 128;
+            fused.resize(padded * cols, 0.0);
+            let bytes = quantize_bytes(fused, &[padded, cols], dt)?;
+            let name = format!("blk.{blk}.attn_in_proj.weight");
+            w.add_typed(&name, &[padded, cols], dtype_name(dt), &bytes);
+            stats.bytes += bytes.len() as u64;
+            stats.tensors += 1;
+            if layers == 0 {
+                println!(
+                    "слитая проекция: [{padded}, {cols}] (строк {rows}, дополнено {}), смещения {offsets:?}, тип {}",
+                    padded - rows,
+                    dtype_name(dt)
+                );
+            }
+            layers += 1;
+        }
+        println!("слитых проекций записано: {layers}");
     }
 
     let tok = std::fs::read(tokenizer_json)
