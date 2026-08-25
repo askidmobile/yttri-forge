@@ -46,8 +46,13 @@ fn main() -> Result<()> {
         .nth(1)
         .and_then(|v| v.parse().ok())
         .unwrap_or(512);
+    // Вторым аргументом — какую форму мерить. Замеры в одном процессе
+    // отравляют друг друга (что меряется первым — быстрее в разы), поэтому
+    // каждую форму гоняем отдельным запуском.
+    let only = std::env::args().nth(2).unwrap_or_else(|| "all".to_string());
+    let want = |name: &str| only == "all" || only == name;
     let dev = Device::new_cuda(0)?;
-    println!("bench_proj: M={m} K={K} (чанк префилла), {ITERS} итераций\n");
+    println!("bench_proj: M={m} K={K} shape={only}, {ITERS} итераций\n");
 
     // Веса собираем на CPU: quantize_onto кладёт квант сразу в VRAM.
     let mk_w = |n: usize| -> Result<Tensor> {
@@ -57,7 +62,10 @@ fn main() -> Result<()> {
 
     // FFN (по профилю — самая крупная статья): gate/up [9216, 2560] и
     // down [2560, 9216]. K у down другой, поэтому у него свой вход.
-    for (name, n, k) in [("ffn_gate/up", 9216usize, K), ("ffn_down", 2560, 9216)] {
+    for (name, n, k) in [("ffn_gate", 9216usize, K), ("ffn_down", 2560, 9216)] {
+        if !want(name) {
+            continue;
+        }
         println!("{name} [{n}, {k}]:");
         let w_cpu = Tensor::randn(0f32, 0.02f32, (n, k), &Device::Cpu)?;
         let xk = Tensor::randn(0f32, 1f32, (1usize, m, k), &dev)?;
@@ -78,6 +86,9 @@ fn main() -> Result<()> {
 
     // Проекции DeltaNet одного слоя: qkv, z, b, a + ssm_out.
     for (name, n) in [("qkv", 8192usize), ("z", 4096), ("b", 32), ("a", 32)] {
+        if !want(name) {
+            continue;
+        }
         println!("{name} [{n}, {K}]:");
         let w_cpu = mk_w(n)?;
         for (label, dtype) in [("Q4_K MMQ (GGUF)", GgmlDType::Q4K), ("Q8_0 MMQ", GgmlDType::Q8_0)] {
@@ -105,6 +116,9 @@ fn main() -> Result<()> {
     // Слитая проекция: qkv+z+b+a одним тензором — экономия запусков и один
     // проход по активациям вместо четырёх.
     let fused_n = 8192 + 4096 + 32 + 32;
+    if !want("fused") {
+        return Ok(());
+    }
     println!("слитая qkv+z+b+a [{fused_n}, {K}] против четырёх раздельных:");
     let w_cpu = mk_w(fused_n)?;
     for (label, dtype) in [("Q4_K MMQ", GgmlDType::Q4K), ("Q8_0 MMQ", GgmlDType::Q8_0)] {
