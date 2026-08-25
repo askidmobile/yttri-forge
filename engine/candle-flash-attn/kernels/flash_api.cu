@@ -1,3 +1,7 @@
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include "kernels.h"
 #include "kernel_helpers.h"
 #include "flash_fwd_launch_template.h"
@@ -23,6 +27,36 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
           }
       });
   });
+}
+
+
+// ── Split-KV: выбор числа сплитов и буферы-аккумуляторы ──
+// На декоде (seqlen_q=1) сетка без сплитов вырождается в batch*heads блоков —
+// для 16 голов это 16-32 блока на 28 SM, половина карты простаивает, и ядро
+// идёт в 10 раз выше предела памяти. Эвристика — из апстрима flash-attn.
+static inline int fa_ceildiv(int a, int b) { return (a + b - 1) / b; }
+
+static int fa_num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
+    if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
+    max_splits = std::min(std::min(max_splits, num_SMs), num_n_blocks);
+    float max_efficiency = 0.f;
+    std::vector<float> efficiency;
+    efficiency.reserve(max_splits);
+    auto is_split_eligible = [&](int ns) {
+        return ns == 1 || fa_ceildiv(num_n_blocks, ns) != fa_ceildiv(num_n_blocks, ns - 1);
+    };
+    for (int ns = 1; ns <= max_splits; ns++) {
+        if (!is_split_eligible(ns)) { efficiency.push_back(0.f); continue; }
+        float n_waves = float(batch_nheads_mblocks * ns) / num_SMs;
+        float eff = n_waves / std::ceil(n_waves);
+        if (eff > max_efficiency) { max_efficiency = eff; }
+        efficiency.push_back(eff);
+    }
+    for (int ns = 1; ns <= max_splits; ns++) {
+        if (!is_split_eligible(ns)) { continue; }
+        if (efficiency[ns - 1] >= 0.85f * max_efficiency) { return ns; }
+    }
+    return 1;
 }
 
 extern "C" void run_mha(
@@ -158,9 +192,44 @@ extern "C" void run_mha(
     params.window_size_right = window_size_right;
 
     params.is_seqlens_k_cumulative = true;
-    params.num_splits = 1;
     params.unpadded_lse = unpadded_lse;
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+
+    // Число сплитов по K. QWEN36_FA_SPLITS=1 возвращает прежнее поведение.
+    params.num_splits = 1;
+    static const bool force_single = [] {
+        const char* e = std::getenv("QWEN36_FA_SPLITS");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    void* oaccum = nullptr;
+    void* lseaccum = nullptr;
+    if (!force_single) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        int num_sms = 0;
+        cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev);
+        const int block_n = d <= 64 ? 256 : (d <= 128 ? 128 : 64);
+        const int num_n_blocks = fa_ceildiv(seqlen_k, block_n);
+        const int num_m_blocks = fa_ceildiv(seqlen_q, 64);
+        const int ns = fa_num_splits_heuristic(b * h * num_m_blocks, num_sms, num_n_blocks, 128);
+        if (ns > 1) {
+            const size_t lse_elems = (size_t)ns * b * h * seqlen_q;
+            const size_t o_elems = lse_elems * d_rounded;
+            if (cudaMallocAsync(&lseaccum, lse_elems * sizeof(float), stream) == cudaSuccess &&
+                cudaMallocAsync(&oaccum, o_elems * sizeof(float), stream) == cudaSuccess) {
+                params.num_splits = ns;
+                params.softmax_lseaccum_ptr = lseaccum;
+                params.oaccum_ptr = oaccum;
+            } else {
+                if (lseaccum) { cudaFreeAsync(lseaccum, stream); lseaccum = nullptr; }
+                if (oaccum) { cudaFreeAsync(oaccum, stream); oaccum = nullptr; }
+            }
+        }
+    }
+
     run_mha_fwd(params, stream);
+
+    if (lseaccum) { cudaFreeAsync(lseaccum, stream); }
+    if (oaccum) { cudaFreeAsync(oaccum, stream); }
 }
