@@ -54,7 +54,12 @@ flowchart TD
 - [ ] Env: QWEN36_PGRAPH_STATIC_KV=1 включает оба
 - **Check:** eager prefill @8K с флагом — wall не хуже baseline ±5%, логи чистые
 
-### Phase 2: Capture/Replay + LRU (estimate: 12h)
+### Phase 2: Capture/Replay + LRU (estimate: 12h) — 🔶 ядро готово (623b82a6..42603918)
+Готово: forward_prefill_graphed (embeds→блоки paged→norm→head-last),
+HybridBlock::forward_prefill_paged (DeltaNet fused in-graph + attention
+forward_attn_prefill_paged: F16 dual-read proj, RoPE devpos, q8 round-trip,
+append_multi T строк, FA2 varlen seqlens_k=kv0+T). Сборка BUILD=0 на yttri-win.
+Остаток фазы: adapter capture/replay + LRU + rope/kv_len staging.
 - [ ] `PrefillGraphState { exec, cu_graph, stream, t, slot, ids_t, cos_t, sin_t,
       logits_out }` в adapter.rs (аналог DecodeGraphState)
 - [ ] `forward_prefill_graphed(ids, index_pos)` в ModelWeights: полный проход
