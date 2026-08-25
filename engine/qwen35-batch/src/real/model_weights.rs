@@ -3874,6 +3874,69 @@ impl GatedAttentionLayer {
         }
     }
 
+    /// yttri-forge: paged prefill pass для одного блока (graph-friendly).
+    /// x: [1, T, n_embd]; rope_pos_dev: [T] u32 (позиции start..start+T).
+    fn forward_prefill_paged(
+        &mut self,
+        x: &Tensor,
+        ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
+        rope_pos_dev: &Tensor,
+    ) -> Result<Tensor> {
+        let residual = x;
+        let normed = self.attn_norm.forward(x)?;
+
+        let layer_out = match &mut self.layer {
+            HybridLayerType::DeltaNet(delta) => {
+                // Fused GDN: проекции (F16 dual-read) → dispatch → ssm_out
+                let (b_sz, seq_len, _n_embd) = normed.dims3()?;
+                let _ = b_sz;
+                let qkv_t = match &delta.f16_wqkv {
+                    Some(f) => f.forward(&normed)?,
+                    None => delta.wqkv.forward(&normed)?,
+                };
+                let z_t = match &delta.f16_wgate {
+                    Some(f) => f.forward(&normed)?,
+                    None => delta.wgate.forward(&normed)?,
+                };
+                let beta_t = match &delta.f16_w_beta {
+                    Some(f) => f.forward(&normed)?,
+                    None => delta.w_beta.forward(&normed)?,
+                };
+                let alpha_t = match &delta.f16_w_alpha {
+                    Some(f) => f.forward(&normed)?,
+                    None => delta.w_alpha.forward(&normed)?,
+                };
+
+                let ctx_cuda = delta.cuda_ctx.as_mut().ok_or_else(|| {
+                    candle_core::Error::Msg("paged prefill: cuda_ctx missing".into())
+                })?;
+                let gated_all = crate::real::delta_rule_cuda::dispatch_delta_rule_prefill(
+                    &ctx_cuda.dev,
+                    &mut ctx_cuda.layer_state,
+                    &ctx_cuda.params,
+                    &qkv_t,
+                    &z_t,
+                    &beta_t,
+                    &alpha_t,
+                ).map_err(|e| candle_core::Error::Msg(format!("delta fused: {e}")))?;
+                let head_in = gated_all;
+                match &delta.f16_ssm_out {
+                    Some(fo) => fo.forward(&head_in),
+                    None => delta.ssm_out.forward(&head_in),
+                }
+            }
+            HybridLayerType::Attention(attn) => {
+                attn.forward_attn_prefill_paged(&normed, ctx, rope_pos_dev)?
+            }
+        };
+        let x = (layer_out + residual)?;
+
+        let residual = &x;
+        let normed = self.ffn_norm.forward(&x)?;
+        let ffn_out = self.ff.forward(&normed)?;
+        Ok(ffn_out + residual)
+    }
+
     fn forward_attn_decode_batch(
         &mut self,
         x: &Tensor,
@@ -7141,6 +7204,39 @@ impl ModelWeights {
     /// CUDA-graph-совместимый decode forward: вся динамика в device-буферах ctx.
     /// tokens — persistent Tensor [B,1] U32; остальные входы стейджатся через ctx.
     #[cfg(feature = "cuda")]
+    /// yttri-forge: полный prefill-проход, capture-safe (CUDA graphs).
+    /// ids_t: [1,T] u32 (device staging); rope_pos_dev: [T] u32 (start..start+T).
+    /// kv_len_dev[slot] должен быть выставлен в start_pos ДО вызова (host H2D).
+    /// Возвращает (logits_last [1,vocab] F32, hidden_last [1,n_embd]).
+    /// Требует: MTP off, vision off, cuda_ctx на DeltaNet слоях, paged pool.
+    pub fn forward_prefill_graphed(
+        &mut self,
+        ids_t: &Tensor,
+        rope_pos_dev: &Tensor,
+        t_len: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let emb = self.tok_embeddings_cuda.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("prefill graph: no CUDA embedding".into())
+        })?;
+        let mut layer_in = emb
+            .embedding(ids_t)?
+            .reshape((1usize, t_len, self.hidden_size()))?;
+
+        let ctx = self.paged_ctx.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("prefill graph: paged ctx missing".into())
+        })?;
+
+        for block in self.blocks.iter_mut() {
+            layer_in = block.forward_prefill_paged(&layer_in, ctx, rope_pos_dev)?;
+        }
+
+        let hidden_all = self.norm.forward(&layer_in)?;
+        // head только над последней позицией
+        let hidden_last = hidden_all.i((.., t_len - 1..t_len, ..))?;
+        let logits = self.output.forward(&hidden_last)?;
+        Ok((logits, hidden_last))
+    }
+
     pub fn forward_decode_batch_graphed(
         &mut self,
         tokens: &Tensor,
