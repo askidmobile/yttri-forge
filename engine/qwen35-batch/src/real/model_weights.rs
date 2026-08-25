@@ -1051,6 +1051,25 @@ struct DenseMlp {
     feed_forward_w2_opt: Option<Arc<Q4KOptMetadataGpu>>,
     #[cfg(target_os = "macos")]
     feed_forward_w3_opt: Option<Arc<Q4KOptMetadataGpu>>,
+    /// yttri-forge dual-read: сайдкар FFN, используется ТОЛЬКО в префилле.
+    f16_w1: Option<QMatMul>,
+    f16_w2: Option<QMatMul>,
+    f16_w3: Option<QMatMul>,
+}
+
+impl DenseMlp {
+    /// Префилл-путь: если подключён сайдкар, считаем по нему (dual-read).
+    fn forward_prefill(&self, xs: &Tensor) -> Result<Tensor> {
+        let (Some(w1t), Some(w3t), Some(w2t)) =
+            (&self.f16_w1, &self.f16_w3, &self.f16_w2)
+        else {
+            return self.forward(xs);
+        };
+        let w1 = w1t.forward(xs)?;
+        let w3 = w3t.forward(xs)?;
+        let silu_mul = w1.silu_mul_direct(&w3)?;
+        w2t.forward(&silu_mul)
+    }
 }
 
 impl Module for DenseMlp {
@@ -1138,7 +1157,7 @@ impl FeedForward {
     /// Prefill forward (chunked, KV-accumulating) — DeltaNet block path.
     fn forward_prefill(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense(mlp) => mlp.forward(xs),
+            Self::Dense(mlp) => mlp.forward_prefill(xs),
             Self::Moe(moe) => moe.forward(xs, ForwardMode::Prefill),
         }
     }
@@ -4585,7 +4604,7 @@ impl HybridBlock {
 
         let residual = &x;
         let normed = self.ffn_norm.forward(&x)?;
-        let ffn_out = self.ff.forward(&normed)?;
+        let ffn_out = self.ff.forward_prefill(&normed)?;
         Ok((ffn_out + residual)?)
     }
 
@@ -5725,6 +5744,9 @@ impl ModelWeights {
                     feed_forward_w1: qm_w1,
                     feed_forward_w2: qm_w2,
                     feed_forward_w3: qm_w3,
+                    f16_w1: None,
+                    f16_w2: None,
+                    f16_w3: None,
                     #[cfg(target_os = "macos")]
                     feed_forward_w1_opt: w1_opt,
                     #[cfg(target_os = "macos")]
@@ -7672,6 +7694,25 @@ impl ModelWeights {
                     }
                 }
                 _ => {}
+            }
+            // FFN есть в каждом слое (маска heavy+ffn) — 31.7% времени префилла
+            // по профилю 2026-08-25. Отсутствие тензоров в сайдкаре = None.
+            if let FeedForward::Dense(mlp) = &mut block.ff {
+                for (field, suffix) in [
+                    (&mut mlp.f16_w1, "ffn_gate"),
+                    (&mut mlp.f16_w2, "ffn_down"),
+                    (&mut mlp.f16_w3, "ffn_up"),
+                ] {
+                    let name = format!("blk.{i}.{suffix}.weight");
+                    *field = build_f16(&reader, &name, device);
+                    if field.is_some() {
+                        mapped += 1;
+                        total_bytes += reader
+                            .tensor_bytes(&name)
+                            .map(|(b, _)| b.len())
+                            .unwrap_or(0) as u64;
+                    }
+                }
             }
         }
         // Постоянный сторож: сайдкар обязан совпадать с GGUF с точностью

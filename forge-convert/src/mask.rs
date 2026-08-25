@@ -9,6 +9,8 @@
 //!     GGUF blk.{i}.attn_out.weight  ← …linear_attn.out_proj.weight
 //!   Attention слои (self_attn, каждый 4-й):
 //!     GGUF blk.{i}.attn_q/k/v/o     ← self_attn.{q,k,v,o}_proj.weight
+//!   FFN (каждый слой, флаг --f16-ffn):
+//!     GGUF blk.{i}.ffn_gate/up/down ← mlp.{gate,up,down}_proj.weight
 
 /// Суффикс → GGUF-имя внутри слоя. None = тензор не входит в heavy-маску.
 pub fn resolve(layer_kind: LayerKind, st_suffix: &str) -> Option<&'static str> {
@@ -28,6 +30,12 @@ pub fn resolve(layer_kind: LayerKind, st_suffix: &str) -> Option<&'static str> {
             "self_attn.o_proj.weight" => Some("blk.{i}.attn_o.weight"),
             _ => None,
         },
+        LayerKind::Ffn => match st_suffix {
+            "mlp.gate_proj.weight" => Some("blk.{i}.ffn_gate.weight"),
+            "mlp.up_proj.weight" => Some("blk.{i}.ffn_up.weight"),
+            "mlp.down_proj.weight" => Some("blk.{i}.ffn_down.weight"),
+            _ => None,
+        },
     }
 }
 
@@ -35,6 +43,9 @@ pub fn resolve(layer_kind: LayerKind, st_suffix: &str) -> Option<&'static str> {
 pub enum LayerKind {
     DeltaNet,
     Attention,
+    /// SwiGLU-MLP слоя: по профилю 2026-08-25 это 31.7% времени префилла —
+    /// больше, чем все проекции внимания и DeltaNet вместе.
+    Ffn,
 }
 
 /// Классифицировать тензор safetensors по имени.
@@ -52,6 +63,9 @@ pub fn classify(name: &str) -> Option<(u32, LayerKind, String)> {
     }
     if suffix.starts_with("linear_attn.") {
         return Some((idx, LayerKind::DeltaNet, suffix.to_string()));
+    }
+    if suffix.starts_with("mlp.") {
+        return Some((idx, LayerKind::Ffn, suffix.to_string()));
     }
     None
 }

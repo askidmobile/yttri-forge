@@ -48,6 +48,11 @@ struct Args {
     /// Эмулировать Q8_0 (int8, блок 32, масштаб F16) — сравнение с FP8
     #[arg(long)]
     q8_emulate: bool,
+
+    /// Включить в сайдкар FFN (ffn_gate/up/down каждого слоя). По профилю это
+    /// 31.7% времени префилла; цена — размер сайдкара примерно ×2.
+    #[arg(long)]
+    f16_ffn: bool,
 }
 
 fn main() {
@@ -298,6 +303,7 @@ fn run(args: &Args) -> Result<(), String> {
     // Классифицируем слои
     let mut layers_delta: Vec<u32> = Vec::new();
     let mut layers_attn: Vec<u32> = Vec::new();
+    let mut layers_ffn: Vec<u32> = Vec::new();
     for name in index.keys() {
         if let Some((idx, kind, _)) = mask::classify(name) {
             match kind {
@@ -311,11 +317,20 @@ fn run(args: &Args) -> Result<(), String> {
                         layers_attn.push(idx);
                     }
                 }
+                mask::LayerKind::Ffn => {
+                    if !layers_ffn.contains(&idx) {
+                        layers_ffn.push(idx);
+                    }
+                }
             }
         }
     }
     layers_delta.sort();
     layers_attn.sort();
+    layers_ffn.sort();
+    if !args.f16_ffn {
+        layers_ffn.clear();
+    }
 
     // Планируем список (st_name, layer_idx, gguf_name)
     struct Plan {
@@ -369,10 +384,32 @@ fn run(args: &Args) -> Result<(), String> {
         }
     }
 
+    for &i in &layers_ffn {
+        for suffix in [
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ] {
+            let st_name = format!("model.language_model.layers.{i}.{suffix}");
+            if let Some(gguf_t) = mask::resolve(mask::LayerKind::Ffn, suffix) {
+                if index.contains_key(&st_name) {
+                    plan.push(Plan {
+                        st_name,
+                        layer: i,
+                        gguf: mask::gguf_name(i, gguf_t),
+                    });
+                } else {
+                    missing.push(st_name);
+                }
+            }
+        }
+    }
+
     println!(
-        "heavy plan: {} delta layers ×5 + {} attn layers ×4 = {} tensors (missing {})",
+        "heavy plan: {} delta layers ×5 + {} attn layers ×4 + {} ffn layers ×3 = {} tensors (missing {})",
         layers_delta.len(),
         layers_attn.len(),
+        layers_ffn.len(),
         plan.len(),
         missing.len()
     );
@@ -419,7 +456,7 @@ fn run(args: &Args) -> Result<(), String> {
 
     let pre = container::ManifestPre {
         gguf_sha256: gguf_sha.clone(),
-        mask: "heavy".into(),
+        mask: if args.f16_ffn { "heavy+ffn".into() } else { "heavy".into() },
     };
     let mut w = container::ContainerWriter::create(out_file, pre).map_err(|e| format!("container create: {e}"))?;
 
