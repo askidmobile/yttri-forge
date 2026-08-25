@@ -68,7 +68,7 @@ fn run(
         const C: usize = 32;
         const COLS: usize = 64;
         const ROWGRP: usize = 4;
-        let smem = (2 * C * hkd + C * COLS + 2 * C * C + 2 * C + COLS * ROWGRP) * 4;
+        let smem = (2 * C * hkd + 3 * C * COLS + 2 * C * C + 2 * C + COLS * ROWGRP) * 4;
         let func = dev.get_or_load_func(kernel, &candle_kernels::DELTA_RULE)?;
         func.set_attribute(
             candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -406,7 +406,7 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
         const C: usize = 32;
         const COLS: usize = 64;
         const ROWGRP: usize = 4;
-        let smem = (2 * C * hkd + C * COLS + 2 * C * C + 2 * C + COLS * ROWGRP) * 4;
+        let smem = (2 * C * hkd + 3 * C * COLS + 2 * C * C + 2 * C + COLS * ROWGRP) * 4;
         let f = dev.get_or_load_func("delta_rule_prefill_chunked", &candle_kernels::DELTA_RULE)?;
         f.set_attribute(
             candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,

@@ -679,58 +679,64 @@ extern "C" __global__ void delta_rule_prefill_chunked(
         }
         __syncthreads();
 
-        // 3. W = β (v − exp(c_t) S₀ᵀ k_t) и прямая подстановка по строкам.
+        // 3. Проекции состояния сразу для ВСЕХ токенов блока: pk[t][col] =
+        //    Σ_row S[row][col] k_t[row], аналогично pq. Раньше это считалось
+        //    внутри последовательного цикла по t с двумя блочными
+        //    синхронизациями на токен — теперь один проход с atomicAdd по
+        //    группам строк (4-сторонняя редукция без syncthreads на каждый t).
+        for (unsigned int idx = tid; idx < C * DR_COLS; idx += nthreads) {
+            spk[idx] = 0.0f;
+            spq[idx] = 0.0f;
+        }
+        __syncthreads();
         for (unsigned int t = 0; t < C; t++) {
-            float part = 0.0f;
+            float pk = 0.0f, pq = 0.0f;
             #pragma unroll
             for (unsigned int r = 0; r < 32; r++) {
-                part += st[r] * sk[t * hkd + row0 + r];
+                const float sv = st[r];
+                pk += sv * sk[t * hkd + row0 + r];
+                pq += sv * sq[t * hkd + row0 + r];
             }
-            sred[col_l * DR_ROWGRP + rowgrp] = part;
+            atomicAdd(&spk[t * DR_COLS + col_l], pk);
+            atomicAdd(&spq[t * DR_COLS + col_l], pq);
+        }
+        __syncthreads();
+
+        // 4. Прямая подстановка: единственная по-настоящему последовательная
+        //    часть. Сумму по i делим между группами строк, чтобы работали все
+        //    потоки, и оставляем одну синхронизацию на токен.
+        for (unsigned int t = 0; t < C; t++) {
+            float acc = 0.0f;
+            for (unsigned int i = rowgrp; i < t; i += DR_ROWGRP) {
+                acc += sa[t * DR_CHUNK + i] * sd[i * DR_COLS + col_l];
+            }
+            sred[col_l * DR_ROWGRP + rowgrp] = acc;
             __syncthreads();
             if (rowgrp == 0) {
-                float s0k = 0.0f;
+                float sum = 0.0f;
                 #pragma unroll
                 for (unsigned int g = 0; g < DR_ROWGRP; g++) {
-                    s0k += sred[col_l * DR_ROWGRP + g];
+                    sum += sred[col_l * DR_ROWGRP + g];
                 }
                 const unsigned int vb = ((t0 + t) * n_v + head) * hvd;
-                float w = v[vb + col] - __expf(sc[t]) * s0k;
-                // − Σ_{i<t} A[t][i] δ_i, затем умножение на β.
-                float acc = 0.0f;
-                for (unsigned int i = 0; i < t; i++) {
-                    acc += sa[t * DR_CHUNK + i] * sd[i * DR_COLS + col_l];
-                }
-                sd[t * DR_COLS + col_l] = sbeta[t] * (w - acc);
+                const float w = v[vb + col] - __expf(sc[t]) * spk[t * DR_COLS + col_l];
+                sd[t * DR_COLS + col_l] = sbeta[t] * (w - sum);
             }
             __syncthreads();
         }
 
-        // 4. Выход блока: exp(c_t) S₀ᵀ q_t + Σ_{i≤t} B[t][i] δ_i.
-        for (unsigned int t = 0; t < C; t++) {
-            float part = 0.0f;
-            #pragma unroll
-            for (unsigned int r = 0; r < 32; r++) {
-                part += st[r] * sq[t * hkd + row0 + r];
+        // 5. Выход блока — теперь полностью параллельно по (t, col).
+        for (unsigned int idx = tid; idx < C * DR_COLS; idx += nthreads) {
+            const unsigned int t = idx / DR_COLS, cl = idx % DR_COLS;
+            float o = __expf(sc[t]) * spq[idx];
+            for (unsigned int i = 0; i <= t; i++) {
+                o += sbq[t * DR_CHUNK + i] * sd[i * DR_COLS + cl];
             }
-            sred[col_l * DR_ROWGRP + rowgrp] = part;
-            __syncthreads();
-            if (rowgrp == 0) {
-                float s0q = 0.0f;
-                #pragma unroll
-                for (unsigned int g = 0; g < DR_ROWGRP; g++) {
-                    s0q += sred[col_l * DR_ROWGRP + g];
-                }
-                float o = __expf(sc[t]) * s0q;
-                for (unsigned int i = 0; i <= t; i++) {
-                    o += sbq[t * DR_CHUNK + i] * sd[i * DR_COLS + col_l];
-                }
-                output[((t0 + t) * n_v + head) * hvd + col] = o;
-            }
-            __syncthreads();
+            output[((t0 + t) * n_v + head) * hvd + col0 + cl] = o;
         }
+        __syncthreads();
 
-        // 5. Состояние: S ← exp(c_C) S + Σ_i exp(c_C − c_i) k_i δ_iᵀ.
+        // 6. Состояние: S ← exp(c_C) S + Σ_i exp(c_C − c_i) k_i δ_iᵀ.
         const float gc = sc[C - 1];
         #pragma unroll
         for (unsigned int r = 0; r < 32; r++) {
