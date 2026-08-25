@@ -631,6 +631,8 @@ extern "C" __global__ void delta_rule_prefill_chunked(
     float* sc = sbq + DR_CHUNK * DR_CHUNK;               // [C] лог-кумулята
     float* sbeta = sc + DR_CHUNK;                        // [C]
     float* sred = sbeta + DR_CHUNK;                      // [COLS][ROWGRP]
+    float* spk = sred + DR_COLS * DR_ROWGRP;             // [C][COLS] Sᵀk
+    float* spq = spk + DR_CHUNK * DR_COLS;               // [C][COLS] Sᵀq
 
     // Состояние: строки [row0, row0+rows_per) своего столбца — в регистрах.
     float st[32];
