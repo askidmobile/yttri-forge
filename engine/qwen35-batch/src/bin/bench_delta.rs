@@ -110,13 +110,270 @@ fn run(
     Ok((ms, reference))
 }
 
+
+// ────────────────────────────────────────────────────────────────────────────
+// Эталоны на CPU: последовательный (как в v1-ядре) и chunked.
+//
+// Обозначения на голову: состояние S [hkd × hvd] (строки — key-размерность,
+// столбцы — value). На токене t:
+//     kv  = Sᵀ k_t                       S ← g_t S + k_t δᵀ
+//     δ   = β_t (v_t − g_t kv)           o_t = S_tᵀ q_t   (S уже обновлён)
+// где g_t = exp(gate_t).
+//
+// Chunked-форма. Пусть c_t = Σ_{i≤t} gate_i (лог-кумулята внутри блока),
+// тогда G_t = exp(c_t) и S_t = G_t [S_0 + Σ_{i≤t} (k_i/G_i) δ_iᵀ]. Отсюда
+//     δ_t = β_t ( v_t − S_0ᵀ k̂_t − Σ_{i<t} (k̃_iᵀ k̂_t) δ_i ),
+// то есть треугольная система (I + diag(β) A) Δ = B (V − K̂ S_0), где
+//     A[t][i] = exp(c_t − c_i) (k_i·k_t),  i < t.
+// Выход и новое состояние:
+//     o_t = G_t S_0ᵀ q_t + Σ_{i≤t} exp(c_t − c_i)(k_i·q_t) δ_i
+//     S_C = exp(c_C) S_0 + Σ_i exp(c_C − c_i) k_i δ_iᵀ
+//
+// ВАЖНО про численность: k̃_i = k_i/G_i отдельно не считаем — при затухающем
+// гейте 1/G_i растёт экспоненциально и переполняет f32. Все множители входят
+// только как exp(c_t − c_i) при t ≥ i, то есть ≤ 1.
+// ────────────────────────────────────────────────────────────────────────────
+
+struct Dims {
+    t: usize,
+    n_v: usize,
+    hkd: usize,
+    hvd: usize,
+}
+
+fn ref_sequential(
+    q: &[f32], k: &[f32], v: &[f32], beta: &[f32], gate: &[f32],
+    s0: &[f32], d: &Dims, head: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let (hkd, hvd, n_v) = (d.hkd, d.hvd, d.n_v);
+    let mut s: Vec<f32> = s0[head * hkd * hvd..(head + 1) * hkd * hvd].to_vec();
+    let mut out = vec![0f32; d.t * hvd];
+    for t in 0..d.t {
+        let g = (gate[t * n_v + head]).exp();
+        let b = beta[t * n_v + head];
+        let kb = (t * n_v + head) * hkd;
+        let vb = (t * n_v + head) * hvd;
+        let mut delta = vec![0f32; hvd];
+        for col in 0..hvd {
+            let mut kv = 0f32;
+            for row in 0..hkd {
+                kv += s[row * hvd + col] * k[kb + row];
+            }
+            delta[col] = (v[vb + col] - g * kv) * b;
+        }
+        for row in 0..hkd {
+            let kr = k[kb + row];
+            let qr = q[kb + row];
+            for col in 0..hvd {
+                let sv = g * s[row * hvd + col] + kr * delta[col];
+                s[row * hvd + col] = sv;
+                out[t * hvd + col] += sv * qr;
+            }
+        }
+    }
+    (out, s)
+}
+
+fn ref_chunked(
+    q: &[f32], k: &[f32], v: &[f32], beta: &[f32], gate: &[f32],
+    s0: &[f32], d: &Dims, head: usize, chunk: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let (hkd, hvd, n_v) = (d.hkd, d.hvd, d.n_v);
+    let mut s: Vec<f32> = s0[head * hkd * hvd..(head + 1) * hkd * hvd].to_vec();
+    let mut out = vec![0f32; d.t * hvd];
+
+    let mut t0 = 0usize;
+    while t0 < d.t {
+        let c = chunk.min(d.t - t0);
+        // Лог-кумулята гейта внутри блока (inclusive).
+        let mut clog = vec![0f32; c];
+        let mut acc = 0f32;
+        for i in 0..c {
+            acc += gate[(t0 + i) * n_v + head];
+            clog[i] = acc;
+        }
+        let krow = |i: usize| -> &[f32] {
+            let b = ((t0 + i) * n_v + head) * hkd;
+            &k[b..b + hkd]
+        };
+        let qrow = |i: usize| -> &[f32] {
+            let b = ((t0 + i) * n_v + head) * hkd;
+            &q[b..b + hkd]
+        };
+
+        // Δ: прямая подстановка по строкам блока.
+        let mut delta = vec![0f32; c * hvd];
+        for t in 0..c {
+            let b_t = beta[(t0 + t) * n_v + head];
+            let vb = ((t0 + t) * n_v + head) * hvd;
+            let kt = krow(t);
+            // W = β (V − G_t S_0ᵀ k_t)
+            let gt = clog[t].exp();
+            let mut w = vec![0f32; hvd];
+            for col in 0..hvd {
+                let mut s0k = 0f32;
+                for row in 0..hkd {
+                    s0k += s[row * hvd + col] * kt[row];
+                }
+                w[col] = b_t * (v[vb + col] - gt * s0k);
+            }
+            // − β Σ_{i<t} exp(c_t − c_i)(k_i·k_t) δ_i
+            for i in 0..t {
+                let ki = krow(i);
+                let mut dot = 0f32;
+                for r in 0..hkd {
+                    dot += ki[r] * kt[r];
+                }
+                let coef = b_t * (clog[t] - clog[i]).exp() * dot;
+                for col in 0..hvd {
+                    w[col] -= coef * delta[i * hvd + col];
+                }
+            }
+            delta[t * hvd..(t + 1) * hvd].copy_from_slice(&w);
+        }
+
+        // Выход блока.
+        for t in 0..c {
+            let qt = qrow(t);
+            let gt = clog[t].exp();
+            let ob = (t0 + t) * hvd;
+            for col in 0..hvd {
+                let mut acc = 0f32;
+                for row in 0..hkd {
+                    acc += s[row * hvd + col] * qt[row];
+                }
+                out[ob + col] = gt * acc;
+            }
+            for i in 0..=t {
+                let ki = krow(i);
+                let mut dot = 0f32;
+                for r in 0..hkd {
+                    dot += ki[r] * qt[r];
+                }
+                let coef = (clog[t] - clog[i]).exp() * dot;
+                for col in 0..hvd {
+                    out[ob + col] += coef * delta[i * hvd + col];
+                }
+            }
+        }
+
+        // Новое состояние блока.
+        let gc = clog[c - 1];
+        for row in 0..hkd {
+            for col in 0..hvd {
+                s[row * hvd + col] *= gc.exp();
+            }
+        }
+        for i in 0..c {
+            let ki = krow(i);
+            let w = (gc - clog[i]).exp();
+            for row in 0..hkd {
+                let kw = w * ki[row];
+                if kw == 0.0 {
+                    continue;
+                }
+                for col in 0..hvd {
+                    s[row * hvd + col] += kw * delta[i * hvd + col];
+                }
+            }
+        }
+        t0 += c;
+    }
+    (out, s)
+}
+
+fn max_rel(a: &[f32], b: &[f32]) -> f32 {
+    let scale = a.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-6);
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
+        / scale
+}
+
+/// Сверка математики: ядро против последовательного CPU-эталона и chunked.
+fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
+    let (n_v, hkd, hvd) = (N_V as usize, HKD as usize, HVD as usize);
+    let d = Dims { t, n_v, hkd, hvd };
+    let (q, k, v) = (
+        fill(t * n_v * hkd, 1),
+        fill(t * n_v * hkd, 2),
+        fill(t * n_v * hvd, 3),
+    );
+    // Гейт отрицательный (затухание), как в модели: gate = -softplus(...).
+    let beta = fill(t * n_v, 4).iter().map(|x| x.abs() + 0.1).collect::<Vec<_>>();
+    let gate = fill(t * n_v, 5).iter().map(|x| -(x.abs()) - 0.01).collect::<Vec<_>>();
+    let s0 = fill(n_v * hvd * hvd, 6);
+
+    // GPU: текущее ядро.
+    let p = params();
+    let (dq, dk, dv) = (dev.clone_htod(&q)?, dev.clone_htod(&k)?, dev.clone_htod(&v)?);
+    let (db, dg) = (dev.clone_htod(&beta)?, dev.clone_htod(&gate)?);
+    let out = dev.alloc_zeros::<f32>(t * n_v * hvd)?;
+    let mut state = dev.clone_htod(&s0)?;
+    let func = dev.get_or_load_func("delta_rule_prefill", &candle_kernels::DELTA_RULE)?;
+    let cfg = LaunchConfig {
+        grid_dim: (N_V, (hvd / 2) as u32, 1),
+        block_dim: (32, 2, 1),
+        shared_mem_bytes: 0,
+    };
+    let t_u32 = t as u32;
+    {
+        let mut b = func.builder();
+        b.arg(&dq);
+        b.arg(&dk);
+        b.arg(&dv);
+        b.arg(&db);
+        b.arg(&dg);
+        b.arg(&state);
+        b.arg(&out);
+        b.arg(&p);
+        b.arg(&t_u32);
+        unsafe { b.launch(cfg) }.map_err(|e| anyhow!("launch: {e:?}"))?;
+    }
+    dev.cuda_stream().synchronize()?;
+    let gpu_out = dev.clone_dtoh(&out)?;
+    let gpu_state = dev.clone_dtoh(&state)?;
+
+    let head = 0usize;
+    let (seq_out, seq_state) = ref_sequential(&q, &k, &v, &beta, &gate, &s0, &d, head);
+    let (chk_out, chk_state) = ref_chunked(&q, &k, &v, &beta, &gate, &s0, &d, head, chunk);
+
+    // Срез головы 0 из GPU-выхода: [T, n_v, hvd] → [T, hvd].
+    let mut gpu_head = vec![0f32; t * hvd];
+    for tt in 0..t {
+        let b = (tt * n_v + head) * hvd;
+        gpu_head[tt * hvd..(tt + 1) * hvd].copy_from_slice(&gpu_out[b..b + hvd]);
+    }
+    let gpu_head_state = &gpu_state[head * hkd * hvd..(head + 1) * hkd * hvd];
+
+    println!("T={t} chunk={chunk} (голова {head})");
+    println!("  ядро vs последовательный CPU: out {:.2e}, state {:.2e}",
+        max_rel(&gpu_head, &seq_out), max_rel(gpu_head_state, &seq_state));
+    println!("  chunked vs последовательный:  out {:.2e}, state {:.2e}",
+        max_rel(&seq_out, &chk_out), max_rel(&seq_state, &chk_state));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let t: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(512);
+    let first = args.next().unwrap_or_default();
+    let check_mode = first == "check";
+    let t: usize = if check_mode {
+        args.next().and_then(|v| v.parse().ok()).unwrap_or(128)
+    } else {
+        first.parse().unwrap_or(512)
+    };
     let iters: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(20);
     let Device::Cuda(dev) = Device::new_cuda(0)? else {
         return Err(anyhow!("нужен CUDA-девайс"));
     };
+    if check_mode {
+        for chunk in [16usize, 32, 64] {
+            check(&dev, t, chunk)?;
+        }
+        return Ok(());
+    }
     // FLOPs на запуск: на токен и голову — Sᵀk, обновление S и Sᵀq по hkd*hvd FMA.
     let flops = 3.0 * 2.0 * t as f64 * N_V as f64 * (HKD as f64) * (HVD as f64);
     println!("bench_delta: T={t} n_v={N_V} hkd={HKD} hvd={HVD}, {iters} итераций\n");
