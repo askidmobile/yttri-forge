@@ -3075,6 +3075,31 @@ fn audit_ytf16(name: &str, gguf: &QMatMul, sidecar: &QMatMul) {
     }
 }
 
+/// Кросс-проверка v-хвоста fused qkv против z: если сайдкарный z совпал с
+/// GGUF-хвостом qkv (и наоборот) — конвертер перепутал местами v и z.
+fn audit_cross_vz(i: usize, g_qkv: &QMatMul, g_z: &QMatMul, f_qkv: &QMatMul, f_z: &QMatMul) {
+    let run = || -> Result<String> {
+        let gq = g_qkv.dequantize_f16()?.to_dtype(DType::F32)?;
+        let gz = g_z.dequantize_f16()?.to_dtype(DType::F32)?;
+        let fq = f_qkv.dequantize_f16()?.to_dtype(DType::F32)?;
+        let fz = f_z.dequantize_f16()?.to_dtype(DType::F32)?;
+        let rows = gz.dim(0)?; // 4096 = размер v-хвоста
+        let tail = gq.dim(0)? - rows;
+        let g_tail = gq.narrow(0, tail, rows)?;
+        let f_tail = fq.narrow(0, tail, rows)?;
+        let d_zz = (&gz - &fz)?.abs()?.mean_all()?.to_scalar::<f32>()?;
+        let d_tail_z = (&g_tail - &fz)?.abs()?.mean_all()?.to_scalar::<f32>()?;
+        let d_z_tail = (&gz - &f_tail)?.abs()?.mean_all()?.to_scalar::<f32>()?;
+        Ok(format!(
+            "z↔z={d_zz:.5} qkv_tail↔f_z={d_tail_z:.5} g_z↔qkv_tail={d_z_tail:.5}"
+        ))
+    };
+    match run() {
+        Ok(r) => eprintln!("[ytf-audit] blk.{i} cross v/z: {r}"),
+        Err(e) => eprintln!("[ytf-audit] blk.{i} cross v/z: FAILED {e}"),
+    }
+}
+
 /// Graph-префилл пишет в paged pool чистый F16 (пул и так F16) — с q8
 /// round-trip логиты расходились с eager на MAE 0.42, без него — бит-в-бит.
 /// QWEN36_PGRAPH_Q8KV=1 возвращает round-trip (точность как у батчевого q8-кэша).
@@ -7629,7 +7654,7 @@ impl ModelWeights {
             }
         }
         if audit {
-            for (i, block) in self.blocks.iter().enumerate().take(5) {
+            for (i, block) in self.blocks.iter().enumerate().take(2) {
                 match &block.layer {
                     HybridLayerType::Attention(a) => {
                         if let Some(f16) = a.f16_q.as_ref() {
@@ -7639,6 +7664,13 @@ impl ModelWeights {
                     HybridLayerType::DeltaNet(d) => {
                         if let Some(f16) = d.f16_wqkv.as_ref() {
                             audit_ytf16(&format!("blk.{i}.attn_qkv"), &d.wqkv, f16);
+                        }
+                        if let Some(f16) = d.f16_wgate.as_ref() {
+                            audit_ytf16(&format!("blk.{i}.attn_z"), &d.wgate, f16);
+                            // Кросс-проверка: не перепутаны ли v-хвост qkv и z?
+                            if let Some(fq) = d.f16_wqkv.as_ref() {
+                                audit_cross_vz(i, &d.wqkv, &d.wgate, fq, f16);
+                            }
                         }
                     }
                 }
