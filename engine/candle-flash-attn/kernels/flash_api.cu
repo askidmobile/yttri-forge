@@ -219,7 +219,10 @@ extern "C" void run_mha(
         const int num_n_blocks = fa_ceildiv(seqlen_k, block_n);
         const int num_m_blocks = fa_ceildiv(seqlen_q, 64);
         const int ns = fa_num_splits_heuristic(b * h * num_m_blocks, num_sms, num_n_blocks, 128);
-        static bool reported = false;
+        // Печатаем по одному разу для декода (seqlen_q==1) и для префилла.
+        static bool reported_decode = false;
+        static bool reported_prefill = false;
+        bool& reported = (seqlen_q == 1) ? reported_decode : reported_prefill;
         if (!reported && std::getenv("QWEN36_FA_DEBUG") != nullptr) {
             reported = true;
             fprintf(stderr, "[fa] splits: b=%d h=%d seqlen_q=%d seqlen_k=%d n_blocks=%d sms=%d -> num_splits=%d\n",
