@@ -44,7 +44,13 @@ fn fill(n: usize, seed: u32) -> Vec<f32> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(dev: &CudaDevice, kernel: &str, t: usize, iters: usize) -> Result<(f64, Vec<f32>)> {
+fn run(
+    dev: &CudaDevice,
+    kernel: &str,
+    warps: u32,
+    t: usize,
+    iters: usize,
+) -> Result<(f64, Vec<f32>)> {
     let p = params();
     let (n_v, hkd, hvd) = (N_V as usize, HKD as usize, HVD as usize);
     let q = dev.clone_htod(&fill(t * n_v * hkd, 1))?;
@@ -55,18 +61,18 @@ fn run(dev: &CudaDevice, kernel: &str, t: usize, iters: usize) -> Result<(f64, V
     let out = dev.alloc_zeros::<f32>(t * n_v * hvd)?;
     let state0 = fill(n_v * hvd * hvd, 6);
 
-    let cfg = if kernel.ends_with("_v2") {
-        LaunchConfig {
-            grid_dim: (n_v as u32, (hvd / 32) as u32, 1),
-            block_dim: (32, 32, 1),
-            shared_mem_bytes: (2 * hkd * 4) as u32,
-        }
-    } else {
-        LaunchConfig {
-            grid_dim: (n_v as u32, (hvd / 2) as u32, 1),
-            block_dim: (32, 2, 1),
-            shared_mem_bytes: 0,
-        }
+    // Ядро параметризовано по blockDim.y: warp ведёт одну колонку состояния,
+    // блок — `warps` колонок. У v2 k/q грузятся в shared один раз на блок,
+    // поэтому чем больше warps, тем меньше повторных чтений — но тем хуже
+    // занятость SM. Развёртка ищет баланс.
+    let cfg = LaunchConfig {
+        grid_dim: (n_v as u32, (hvd / warps as usize) as u32, 1),
+        block_dim: (32, warps, 1),
+        shared_mem_bytes: if kernel.ends_with("_v2") {
+            (2 * hkd * 4) as u32
+        } else {
+            0
+        },
     };
     let func = dev.get_or_load_func(kernel, &candle_kernels::DELTA_RULE)?;
     let t_u32 = t as u32;
@@ -114,8 +120,19 @@ fn main() -> Result<()> {
     println!("bench_delta: T={t} n_v={N_V} hkd={HKD} hvd={HVD}, {iters} итераций\n");
 
     let mut base: Option<Vec<f32>> = None;
-    for kernel in ["delta_rule_prefill", "delta_rule_prefill_v2"] {
-        match run(&dev, kernel, t, iters) {
+    let variants: Vec<(&str, u32)> = vec![
+        ("delta_rule_prefill", 2),
+        ("delta_rule_prefill", 4),
+        ("delta_rule_prefill", 8),
+        ("delta_rule_prefill_v2", 4),
+        ("delta_rule_prefill_v2", 8),
+        ("delta_rule_prefill_v2", 16),
+        ("delta_rule_prefill_v2", 32),
+    ];
+    for (kernel, warps) in variants {
+        let kernel_label = format!("{kernel} warps={warps}");
+        let kernel = kernel_label.split(' ').next().unwrap().to_string();
+        match run(&dev, &kernel, warps, t, iters) {
             Ok((ms, outv)) => {
                 let diff = base.as_ref().map(|b: &Vec<f32>| {
                     b.iter()
@@ -124,7 +141,7 @@ fn main() -> Result<()> {
                         .fold(0f32, f32::max)
                 });
                 println!(
-                    "  {kernel:<26} {ms:8.3} мс  {:6.2} TFLOPS{}",
+                    "  {kernel_label:<34} {ms:8.3} мс  {:6.2} TFLOPS{}",
                     flops / (ms * 1e-3) / 1e12,
                     match diff {
                         Some(d) => format!("   max|diff| к v1 = {d:.3e}"),
@@ -135,7 +152,7 @@ fn main() -> Result<()> {
                     base = Some(outv);
                 }
             }
-            Err(e) => println!("  {kernel:<26} ОШИБКА: {e}"),
+            Err(e) => println!("  {kernel_label:<34} ОШИБКА: {e}"),
         }
     }
     println!("\nПик RTX 3060: FP32 ~12.7 TFLOPS.");
