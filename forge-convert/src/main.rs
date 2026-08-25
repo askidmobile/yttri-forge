@@ -84,6 +84,10 @@ struct Args {
     /// факту, а не по памяти.
     #[arg(long)]
     list_gguf: Option<PathBuf>,
+
+    /// Собрать контейнер видео-башни (эталон — mmproj GGUF в --gguf).
+    #[arg(long)]
+    pack_vision: bool,
 }
 
 fn main() {
@@ -108,8 +112,8 @@ fn main() {
         }
         return;
     }
-    if !args.f16_heavy && !args.pack {
-        eprintln!("error: нужен --f16-heavy (сайдкар) или --pack (самостоятельный контейнер)");
+    if !args.f16_heavy && !args.pack && !args.pack_vision {
+        eprintln!("error: нужен --f16-heavy (сайдкар), --pack или --pack-vision");
         std::process::exit(2);
     }
     if let Err(e) = run(&args) {
@@ -479,7 +483,60 @@ fn run_pack(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+fn run_pack_vision(args: &Args) -> Result<(), String> {
+    let shards = open_safetensors(&args.inputs)?;
+    let mut hf_names: Vec<String> = Vec::new();
+    for (_, mmap) in &shards {
+        let (_off, meta) = safetensors::SafeTensors::read_metadata(mmap)
+            .map_err(|e| format!("safetensors meta: {e}"))?;
+        for (name, _) in meta.tensors() {
+            hf_names.push(name.to_string());
+        }
+    }
+    hf_names.sort();
+    hf_names.dedup();
+
+    let ref_gguf = args
+        .gguf
+        .clone()
+        .ok_or_else(|| "--pack-vision требует --gguf <mmproj> (типы и метаданные)".to_string())?;
+    let dir = args.inputs[0].parent().unwrap_or(Path::new("."));
+    let out_path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| dir.to_path_buf())
+        .join(
+            ref_gguf
+                .file_stem()
+                .map(|s| format!("{}.ytf", s.to_string_lossy()))
+                .unwrap_or_else(|| "mmproj.ytf".into()),
+        );
+    let t0 = std::time::Instant::now();
+    let stats = pack::pack_vision(
+        &shards,
+        &hf_names,
+        &ref_gguf,
+        &out_path,
+        &args.recipe,
+        &read_tensor_f32,
+    )?;
+    println!(
+        "видео-башня: {} тензоров, {:.2} ГиБ, за {:.1} с → {}",
+        stats.tensors,
+        stats.bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        t0.elapsed().as_secs_f64(),
+        out_path.display()
+    );
+    for (dt, n) in &stats.by_dtype {
+        println!("  {dt}: {n}");
+    }
+    Ok(())
+}
+
 fn run(args: &Args) -> Result<(), String> {
+    if args.pack_vision {
+        return run_pack_vision(args);
+    }
     if args.pack {
         return run_pack(args);
     }

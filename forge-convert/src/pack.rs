@@ -59,6 +59,74 @@ pub fn hf_to_gguf(hf: &str) -> Option<String> {
     Some(format!("blk.{idx}.{g}"))
 }
 
+/// HF-имя тензора видео-башни → имена в mmproj.
+///
+/// Возвращает список, потому что `patch_embed.proj.weight` — это Conv3d
+/// [1024, 3, 2, 16, 16], а загрузчик ждёт его расщеплённым по временной оси
+/// на два тензора [1024, 3, 16, 16] (`v.patch_embd.weight` и `.weight.1`).
+pub fn hf_to_gguf_vision(hf: &str) -> Option<Vec<String>> {
+    match hf {
+        "model.visual.patch_embed.proj.weight" => {
+            return Some(vec![
+                "v.patch_embd.weight".into(),
+                "v.patch_embd.weight.1".into(),
+            ])
+        }
+        "model.visual.patch_embed.proj.bias" => return Some(vec!["v.patch_embd.bias".into()]),
+        "model.visual.pos_embed.weight" => return Some(vec!["v.position_embd.weight".into()]),
+        "model.visual.merger.norm.weight" => return Some(vec!["v.post_ln.weight".into()]),
+        "model.visual.merger.norm.bias" => return Some(vec!["v.post_ln.bias".into()]),
+        "model.visual.merger.linear_fc1.weight" => return Some(vec!["mm.0.weight".into()]),
+        "model.visual.merger.linear_fc1.bias" => return Some(vec!["mm.0.bias".into()]),
+        "model.visual.merger.linear_fc2.weight" => return Some(vec!["mm.2.weight".into()]),
+        "model.visual.merger.linear_fc2.bias" => return Some(vec!["mm.2.bias".into()]),
+        _ => {}
+    }
+    let rest = hf.strip_prefix("model.visual.blocks.")?;
+    let (idx, suffix) = rest.split_once('.')?;
+    idx.parse::<u32>().ok()?;
+    let g = match suffix {
+        "norm1.weight" => "ln1.weight",
+        "norm1.bias" => "ln1.bias",
+        "norm2.weight" => "ln2.weight",
+        "norm2.bias" => "ln2.bias",
+        "attn.qkv.weight" => "attn_qkv.weight",
+        "attn.qkv.bias" => "attn_qkv.bias",
+        "attn.proj.weight" => "attn_out.weight",
+        "attn.proj.bias" => "attn_out.bias",
+        "mlp.linear_fc1.weight" => "ffn_up.weight",
+        "mlp.linear_fc1.bias" => "ffn_up.bias",
+        "mlp.linear_fc2.weight" => "ffn_down.weight",
+        "mlp.linear_fc2.bias" => "ffn_down.bias",
+        _ => return None,
+    };
+    Some(vec![format!("v.blk.{idx}.{g}")])
+}
+
+/// Срез Conv3d по временной оси: [O, C, T, H, W] → T тензоров [O, C, H, W].
+/// Данные в HF идут row-major, поэтому элемент (o,c,t,h,w) лежит по индексу
+/// (((o*C + c)*T + t)*H + h)*W + w — простой копией срез не возьмёшь.
+fn split_conv3d_temporal(values: &[f32], shape: &[usize]) -> Result<Vec<Vec<f32>>, String> {
+    if shape.len() != 5 {
+        return Err(format!("patch_embed: ожидалась форма [O,C,T,H,W], пришла {shape:?}"));
+    }
+    let (o, c, t, h, w) = (shape[0], shape[1], shape[2], shape[3], shape[4]);
+    if values.len() != o * c * t * h * w {
+        return Err("patch_embed: длина не бьётся с формой".into());
+    }
+    let hw = h * w;
+    let mut out = vec![Vec::with_capacity(o * c * hw); t];
+    for oi in 0..o {
+        for ci in 0..c {
+            for ti in 0..t {
+                let base = (((oi * c + ci) * t + ti) * hw) as usize;
+                out[ti].extend_from_slice(&values[base..base + hw]);
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn dtype_name(dt: GgmlDType) -> &'static str {
     match dt {
         GgmlDType::F32 => "F32",
@@ -645,4 +713,116 @@ pub fn list_gguf(path: &Path) -> Result<(), String> {
     keys.sort();
     println!("метаданных: {}", keys.len());
     Ok(())
+}
+
+/// Собрать контейнер видео-башни из safetensors.
+///
+/// Эталон — mmproj GGUF: из него берутся типы тензоров и метаданные.
+/// Токенизатор башне не нужен. Формы сверяются с эталоном, как и у языковой
+/// модели: расхождение раскладки — ошибка, а не тихий сдвиг.
+pub fn pack_vision(
+    shards: &[(String, memmap2::Mmap)],
+    hf_names: &[String],
+    ref_gguf: &Path,
+    out_path: &Path,
+    recipe: &str,
+    read_tensor_f32: &dyn Fn(
+        &[(String, memmap2::Mmap)],
+        &str,
+    ) -> Result<(Vec<f32>, Vec<usize>), String>,
+) -> Result<PackStats, String> {
+    let mut gf = std::fs::File::open(ref_gguf)
+        .map_err(|e| format!("open mmproj {}: {e}", ref_gguf.display()))?;
+    let ct = gguf_file::Content::read(&mut gf).map_err(|e| format!("read mmproj: {e}"))?;
+
+    let mut config: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for (k, v) in ct.metadata.iter() {
+        match value_to_json(v) {
+            Some(j) => {
+                config.insert(k.clone(), j);
+            }
+            // Массивы (image_mean/std и подобное) в манифест не переносятся —
+            // печатаем их, чтобы потеря была видна.
+            None => dropped.push(k.clone()),
+        }
+    }
+    if !dropped.is_empty() {
+        dropped.sort();
+        println!("метаданные не перенесены (не скаляры): {dropped:?}");
+    }
+
+    let out_file = std::fs::File::create(out_path)
+        .map_err(|e| format!("create {}: {e}", out_path.display()))?;
+    let pre = container::ManifestPre {
+        gguf_sha256: String::new(),
+        mask: "vision".into(),
+    };
+    let mut w = container::ContainerWriter::create_standalone(out_file, pre, config)
+        .map_err(|e| format!("container create: {e}"))?;
+
+    let mut stats = PackStats {
+        tensors: 0,
+        bytes: 0,
+        by_dtype: BTreeMap::new(),
+        skipped: Vec::new(),
+    };
+
+    for hf in hf_names {
+        let Some(targets) = hf_to_gguf_vision(hf) else {
+            stats.skipped.push(hf.clone());
+            continue;
+        };
+        let (values, shape) = read_tensor_f32(shards, hf)?;
+        // Одна HF-матрица может давать несколько тензоров эталона: Conv3d
+        // patch_embed режется по временной оси.
+        let parts: Vec<Vec<f32>> = if targets.len() > 1 {
+            split_conv3d_temporal(&values, &shape)?
+        } else {
+            vec![values]
+        };
+        if parts.len() != targets.len() {
+            return Err(format!(
+                "{hf}: срезов {} против {} имён",
+                parts.len(),
+                targets.len()
+            ));
+        }
+        for (name, part) in targets.iter().zip(parts) {
+            let info = ct
+                .tensor_infos
+                .get(name)
+                .ok_or_else(|| format!("{hf} → {name}: в mmproj такого тензора нет"))?;
+            let dims = info.shape.dims().to_vec();
+            if part.len() != dims.iter().product::<usize>() {
+                return Err(format!(
+                    "{name}: элементов {} против эталонных {dims:?}",
+                    part.len()
+                ));
+            }
+            let dt = recipe_dtype(recipe, name, info.ggml_dtype);
+            let bytes = quantize_bytes(part, &dims, dt)?;
+            let dn = dtype_name(dt);
+            w.add_typed(name, &dims, dn, &bytes)
+                .map_err(|e| format!("{name}: запись: {e}"))?;
+            stats.tensors += 1;
+            stats.bytes += bytes.len() as u64;
+            *stats.by_dtype.entry(dn.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    // Всё, что есть в эталоне, должно быть в контейнере: иначе башня не
+    // соберётся, а узнаем мы об этом только при загрузке.
+    let mut missing: Vec<&String> = ct
+        .tensor_infos
+        .keys()
+        .filter(|n| !w.has_tensor(n))
+        .collect();
+    if !missing.is_empty() {
+        missing.sort();
+        return Err(format!("в контейнер не попали тензоры эталона: {missing:?}"));
+    }
+
+    w.finalize().map_err(|e| format!("finalize: {e}"))?;
+    Ok(stats)
 }

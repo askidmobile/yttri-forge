@@ -154,6 +154,7 @@ fn ggml_dtype(name: &str) -> Result<GgmlDType> {
     Ok(match name {
         "F32" => GgmlDType::F32,
         "F16" => GgmlDType::F16,
+        "BF16" => GgmlDType::BF16,
         "Q4_0" => GgmlDType::Q4_0,
         "Q4_1" => GgmlDType::Q4_1,
         "Q5_0" => GgmlDType::Q5_0,

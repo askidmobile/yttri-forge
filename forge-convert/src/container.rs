@@ -168,6 +168,11 @@ impl<W: Write + Seek> ContainerWriter<W> {
         Ok(off)
     }
 
+    /// Записан ли уже тензор с таким именем.
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.entries.iter().any(|e| e.name == name)
+    }
+
     pub fn note_dtype(&mut self, dt: &str) {
         *self.dtype_counts.entry(dt.to_string()).or_insert(0) += 1;
     }
