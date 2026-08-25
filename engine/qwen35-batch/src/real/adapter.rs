@@ -745,6 +745,19 @@ impl BatchModel for Qwen35BatchAdapter {
         };
         let pf_logits = pf_l0.elapsed();
 
+        // Не-финитные логиты префилла = сэмплер выдаст мусорный первый токен.
+        // Дёшево (один проход по vocab на чанк) и ловит целый класс поломок.
+        if let Some(idx) = logits_f32.iter().position(|v| !v.is_finite()) {
+            let bad = logits_f32.iter().filter(|v| !v.is_finite()).count();
+            eprintln!(
+                "[pfa] WARN non-finite logits: {bad}/{} (первый idx={idx}) T={} pos={} graph={}",
+                logits_f32.len(),
+                chunk.tokens.len(),
+                chunk.start_pos,
+                pg_used
+            );
+        }
+
         // check-режим: граф vs eager на одном и том же чанке (гейт Phase 2).
         if let (Some(g), false) = (pg_logits.as_ref(), pg_used) {
             let n = g.len().min(logits_f32.len());
