@@ -310,15 +310,33 @@ pub fn dispatch_delta_rule_batched(
         candle_core::bail!("delta decode: head_v_dim={hvd} > 128 не поддерживается ядром");
     }
     {
-        let func = dev.get_or_load_func(
-            "delta_rule_kernel_batched",
-            &candle_kernels::DELTA_RULE_BATCHED,
-        )?;
-        let cfg = LaunchConfig {
-            grid_dim: (n_v, b_u32, 1),
-            block_dim: (hvd, 1, 1),
-            shared_mem_bytes: 0,
+        // Split-вариант (умолчание): столбец состояния делится между четырьмя
+        // потоками — 512 потоков на блок вместо 128. Прежняя сетка давала
+        // 32 блока × 128 = 4096 потоков на карту, чего мало для насыщения
+        // памяти. QWEN36_DELTA_DECODE=single возвращает однопоточный столбец.
+        const ROWGRP: u32 = 4;
+        let single = std::env::var("QWEN36_DELTA_DECODE").as_deref() == Ok("single");
+        let split_ok = !single && hvd % ROWGRP == 0 && (hvd / ROWGRP) <= 32;
+        let (name, cfg) = if split_ok {
+            (
+                "delta_rule_kernel_batched_split",
+                LaunchConfig {
+                    grid_dim: (n_v, b_u32, 1),
+                    block_dim: (hvd, ROWGRP, 1),
+                    shared_mem_bytes: hvd * ROWGRP * 4,
+                },
+            )
+        } else {
+            (
+                "delta_rule_kernel_batched",
+                LaunchConfig {
+                    grid_dim: (n_v, b_u32, 1),
+                    block_dim: (hvd, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+            )
         };
+        let func = dev.get_or_load_func(name, &candle_kernels::DELTA_RULE_BATCHED)?;
         let mut bb = func.builder();
         bb.arg(&temp.q);
         bb.arg(&temp.k);

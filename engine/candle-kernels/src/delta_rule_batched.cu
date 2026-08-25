@@ -373,6 +373,81 @@ __device__ __forceinline__ void delta_rule_row(
                          shared_sk, shared_d, head, col, bidx);
 }
 
+// Вариант с разделением столбца между DR_ROWGRP потоками: блок 128×4 = 512
+// потоков вместо 128, каждый держит 32 строки вместо 128. Трафик тот же
+// (состояние читается и пишется по разу), но параллелизм вчетверо выше —
+// прежняя сетка давала 32 блока × 128 потоков = 4096 потоков на всю карту,
+// чего мало, чтобы насытить память.
+// Сумма по строкам складывается из четырёх частичных в фиксированном порядке
+// (не бит-в-бит с однопоточным вариантом, расхождение уровня 1e-7).
+// grid=(n_v, B, 1), block=(head_v_dim, DR_ROWGRP, 1)
+#define DR_ROWGRP 4
+
+extern "C" __global__ void delta_rule_kernel_batched_split(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ beta,
+    const float* __restrict__ gate,
+    float* __restrict__ ssm_state,
+    float* __restrict__ output,
+    const DeltaParams params,
+    const unsigned int* __restrict__ slots
+) {
+    extern __shared__ float sred[];              // [hd][DR_ROWGRP]
+    const unsigned int hd = params.head_v_dim;
+    const unsigned int n_v = params.n_v_heads;
+    const unsigned int head = blockIdx.x;
+    const unsigned int bidx = blockIdx.y;
+    const unsigned int col = threadIdx.x;
+    const unsigned int rg = threadIdx.y;
+    const unsigned int rows_per = hd / DR_ROWGRP;
+    const unsigned int row0 = rg * rows_per;
+
+    const unsigned int real_slot = slots[bidx];
+    const unsigned int slot_head = bidx * n_v + head;
+    const unsigned int vec_base = bidx * n_v * hd + head * hd;
+    float* state = ssm_state + real_slot * n_v * hd * hd + head * hd * hd;
+
+    const float gate_exp = __expf(gate[slot_head]);
+    const float beta_h = beta[slot_head];
+
+    float st[32];
+    float sk_part = 0.0f;
+    for (unsigned int r = 0; r < rows_per; r++) {
+        const float sv = state[(row0 + r) * hd + col] * gate_exp;
+        st[r] = sv;
+        sk_part += sv * k[vec_base + row0 + r];
+    }
+    sred[col * DR_ROWGRP + rg] = sk_part;
+    __syncthreads();
+
+    float sk_val = 0.0f;
+    #pragma unroll
+    for (unsigned int g = 0; g < DR_ROWGRP; g++) {
+        sk_val += sred[col * DR_ROWGRP + g];
+    }
+    const float d_col = (v[vec_base + col] - sk_val) * beta_h;
+
+    float out_part = 0.0f;
+    for (unsigned int r = 0; r < rows_per; r++) {
+        const float sv = st[r] + k[vec_base + row0 + r] * d_col;
+        state[(row0 + r) * hd + col] = sv;
+        out_part += sv * q[vec_base + row0 + r];
+    }
+    __syncthreads();
+    sred[col * DR_ROWGRP + rg] = out_part;
+    __syncthreads();
+    if (rg == 0) {
+        float o = 0.0f;
+        #pragma unroll
+        for (unsigned int g = 0; g < DR_ROWGRP; g++) {
+            o += sred[col * DR_ROWGRP + g];
+        }
+        output[vec_base + col] = o;
+    }
+}
+
 extern "C" __global__ void delta_rule_kernel_batched(
     const float* __restrict__ q,    // [B * n_v_heads * head_k_dim] (batch_idx, temp)
     const float* __restrict__ k,    // [B * n_v_heads * head_k_dim] (batch_idx, temp)
