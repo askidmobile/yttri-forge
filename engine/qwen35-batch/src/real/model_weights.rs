@@ -3107,6 +3107,16 @@ fn audit_ytf16(name: &str, gguf: &QMatMul, sidecar: &QMatMul) {
     }
 }
 
+/// KV декода: круговой прогон через q8 (квантование и сразу обратно) стоит
+/// точности и ничего не экономит — кэш всё равно хранится в f16. Он остался
+/// ради численного паритета между батчевым кэшем и paged-пулом.
+/// QWEN36_KV_Q8_ROUNDTRIP=1 возвращает старое поведение.
+#[cfg(feature = "cuda")]
+fn kv_exact_f16() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("QWEN36_KV_Q8_ROUNDTRIP").as_deref() != Ok("1"))
+}
+
 /// Graph-префилл пишет в paged pool чистый F16 (пул и так F16) — с q8
 /// round-trip логиты расходились с eager на MAE 0.42, без него — бит-в-бит.
 /// QWEN36_PGRAPH_Q8KV=1 возвращает round-trip (точность как у батчевого q8-кэша).
@@ -3791,18 +3801,32 @@ impl GatedAttentionLayer {
         let q_rope = self.apply_partial_rotary_emb_devpos(&q_all, &rope_pos)?;
         let k_rope = self.apply_partial_rotary_emb_devpos(&k_all, &rope_pos)?;
 
-        // 4. head-last строки + q8 round-trip (численный паритет с eager path).
-        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 4. q8"); let _ = std::io::stderr().flush(); }
+        // 4. head-last строки. Пул хранит f16, поэтому круговой q8 здесь только
+        //    терял точность (оставлен под QWEN36_KV_Q8_ROUNDTRIP=1).
+        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 4. rows"); let _ = std::io::stderr().flush(); }
         let k_hl = k_rope.transpose(1, 2)?.contiguous()?;
         let v_hl = v_all.transpose(1, 2)?.contiguous()?;
-        let (kq, ks) = q8_quantize_rows(&k_hl)?;
-        let (vq, vs) = q8_quantize_rows(&v_hl)?;
-        let k_rows = q8_dequantize_rows(&kq, &ks)?
-            .reshape((b_sz, self.n_kv_head, self.head_dim))?
-            .contiguous()?;
-        let v_rows = q8_dequantize_rows(&vq, &vs)?
-            .reshape((b_sz, self.n_kv_head, self.head_dim))?
-            .contiguous()?;
+        let (k_rows, v_rows) = if kv_exact_f16() {
+            (
+                k_hl.to_dtype(DType::F16)?
+                    .reshape((b_sz, self.n_kv_head, self.head_dim))?
+                    .contiguous()?,
+                v_hl.to_dtype(DType::F16)?
+                    .reshape((b_sz, self.n_kv_head, self.head_dim))?
+                    .contiguous()?,
+            )
+        } else {
+            let (kq, ks) = q8_quantize_rows(&k_hl)?;
+            let (vq, vs) = q8_quantize_rows(&v_hl)?;
+            (
+                q8_dequantize_rows(&kq, &ks)?
+                    .reshape((b_sz, self.n_kv_head, self.head_dim))?
+                    .contiguous()?,
+                q8_dequantize_rows(&vq, &vs)?
+                    .reshape((b_sz, self.n_kv_head, self.head_dim))?
+                    .contiguous()?,
+            )
+        };
 
         // 5. Append в paged pool (device kv_len).
         if crate::scheduler::trace_on() { eprintln!("[attn-paged] 5. append"); let _ = std::io::stderr().flush(); }
@@ -4066,10 +4090,18 @@ impl GatedAttentionLayer {
         };
         let v_hl = v_all.transpose(1, 2)?.contiguous()?;
         let cache_rows: Vec<BatchedKvCache> = if self.use_q8_f16_kv_cache {
-            let (kq, ks) = q8_quantize_rows(&k_hl)?;
-            let (vq, vs) = q8_quantize_rows(&v_hl)?;
-            let k = q8_dequantize_rows(&kq, &ks)?;
-            let v = q8_dequantize_rows(&vq, &vs)?;
+            // Кэш всё равно f16 — круговой q8 здесь только теряет точность.
+            #[cfg(feature = "cuda")]
+            let exact = kv_exact_f16();
+            #[cfg(not(feature = "cuda"))]
+            let exact = false;
+            let (k, v) = if exact {
+                (k_hl.to_dtype(DType::F16)?, v_hl.to_dtype(DType::F16)?)
+            } else {
+                let (kq, ks) = q8_quantize_rows(&k_hl)?;
+                let (vq, vs) = q8_quantize_rows(&v_hl)?;
+                (q8_dequantize_rows(&kq, &ks)?, q8_dequantize_rows(&vq, &vs)?)
+            };
             (0..b_sz)
                 .map(|bidx| {
                     Ok(BatchedKvCache::F16(F16KvCache {
