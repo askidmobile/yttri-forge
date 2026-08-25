@@ -777,6 +777,8 @@ DR_CHUNKED_KERNEL(delta_rule_prefill_chunked, 16, 64)
 DR_CHUNKED_KERNEL(delta_rule_prefill_chunked_c8, 8, 64)
 DR_CHUNKED_KERNEL(delta_rule_prefill_chunked_c16w32, 16, 32)
 DR_CHUNKED_KERNEL(delta_rule_prefill_chunked_c32w32, 32, 32)
+DR_CHUNKED_KERNEL(delta_rule_prefill_chunked_c4, 4, 64)
+DR_CHUNKED_KERNEL(delta_rule_prefill_chunked_c8w128, 8, 128)
 
 // ДИАГНОСТИКА (не для продакшена): те же обращения к памяти и та же
 // арифметика, но с одной warp-редукцией на токен (probe1) и без редукций

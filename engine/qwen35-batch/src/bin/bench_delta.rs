@@ -23,6 +23,8 @@ fn chunked_shape(name: &str) -> Option<(usize, usize)> {
         "delta_rule_prefill_chunked_c8" => Some((8, 64)),
         "delta_rule_prefill_chunked_c16w32" => Some((16, 32)),
         "delta_rule_prefill_chunked_c32w32" => Some((32, 32)),
+        "delta_rule_prefill_chunked_c4" => Some((4, 64)),
+        "delta_rule_prefill_chunked_c8w128" => Some((8, 128)),
         _ => None,
     }
 }
@@ -413,10 +415,11 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
     let out_c = dev.alloc_zeros::<f32>(t * n_v * hvd)?;
     let mut state_c = dev.clone_htod(&s0)?;
     {
-        let (c, cols) = chunked_shape("delta_rule_prefill_chunked").unwrap();
+        let winner = std::env::var("QWEN36_CHUNK_KERNEL").unwrap_or_else(|_| "delta_rule_prefill_chunked_c8".into());
+        let (c, cols) = chunked_shape(&winner).unwrap();
         const ROWGRP: usize = 4;
         let smem = (2 * c * hkd + 3 * c * cols + 2 * c * c + 2 * c + cols * ROWGRP) * 4;
-        let f = dev.get_or_load_func("delta_rule_prefill_chunked", &candle_kernels::DELTA_RULE)?;
+        let f = dev.get_or_load_func(&winner, &candle_kernels::DELTA_RULE)?;
         f.set_attribute(
             candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             smem as i32,
@@ -502,6 +505,8 @@ fn main() -> Result<()> {
         ("delta_rule_prefill_chunked_c8", 0),
         ("delta_rule_prefill_chunked_c16w32", 0),
         ("delta_rule_prefill_chunked_c32w32", 0),
+        ("delta_rule_prefill_chunked_c4", 0),
+        ("delta_rule_prefill_chunked_c8w128", 0),
     ];
     for (kernel, warps) in variants {
         let kernel_label = format!("{kernel} warps={warps}");
