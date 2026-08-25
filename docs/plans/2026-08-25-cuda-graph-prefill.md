@@ -115,3 +115,14 @@ flowchart TD
 |---|---|
 | Buckets реализация | gate по данным Phase 4 |
 | MTP-совместимый граф | после паритета префилла |
+
+
+## Миграция репозитория (2026-08-25)
+
+candle-fork ЗАМОРОЖЕН (05aa926a — последняя точка). Вся разработка в yttri-forge:
+- engine/ = subtree форка (история сохранена, a29344e9)
+- qwen36-server Cargo.toml → path ../../yttri-forge/engine/*
+- Транспорт на yttri-win: git bundle (GitHub credentials недоступны из SSH-сессии)
+- Сборка BUILD=0 из нового пути подтверждена
+
+Правила процесса (урок 2026-08-25): НЕ коммитить в candle-fork; сборки/тесты только yttri-win.
