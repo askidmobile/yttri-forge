@@ -486,8 +486,10 @@ fn main() -> Result<()> {
         return Err(anyhow!("нужен CUDA-девайс"));
     };
     if check_mode {
-        for chunk in [16usize, 32, 64] {
-            check(&dev, t, chunk)?;
+        // Длины с хвостом обязательны: при C=8 ошибка шага в матрицах A/B
+        // проявляется только когда T не кратно 8 (баг 2026-08-25).
+        for len in [t, 19, 374, 45] {
+            check(&dev, len, 32)?;
         }
         return Ok(());
     }

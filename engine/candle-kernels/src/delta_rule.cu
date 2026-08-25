@@ -662,11 +662,14 @@ __device__ __forceinline__ void delta_rule_chunked_impl(
         __syncthreads();
 
         // 2. Матрицы попарных скалярных произведений с затуханием.
+        // ВНИМАНИЕ: пишем с шагом DR_CHUNK (compile-time), а не C: на хвостовом
+        // блоке C < DR_CHUNK, и шаги чтения в шагах 4-5 иначе разъезжаются.
         for (unsigned int idx = tid; idx < C * C; idx += nthreads) {
             const unsigned int t = idx / C, i = idx % C;
+            const unsigned int dst = t * DR_CHUNK + i;
             if (i > t) {
-                sa[idx] = 0.0f;
-                sbq[idx] = 0.0f;
+                sa[dst] = 0.0f;
+                sbq[dst] = 0.0f;
                 continue;
             }
             float dk = 0.0f, dq = 0.0f;
@@ -676,8 +679,8 @@ __device__ __forceinline__ void delta_rule_chunked_impl(
                 dq += ki * sq[t * hkd + d];
             }
             const float decay = __expf(sc[t] - sc[i]);
-            sa[idx] = (i < t) ? decay * dk : 0.0f;   // строго нижняя
-            sbq[idx] = decay * dq;                   // включая диагональ
+            sa[dst] = (i < t) ? decay * dk : 0.0f;   // строго нижняя
+            sbq[dst] = decay * dq;                   // включая диагональ
         }
         __syncthreads();
 
