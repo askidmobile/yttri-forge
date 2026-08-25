@@ -117,6 +117,80 @@ fn wanted_metadata(key: &str) -> bool {
         || key.starts_with("qwen35moe.")
 }
 
+
+/// Перестановка v-голов по f32: HF чередует головы внутри k-группы, GGUF
+/// хранит их подряд. Та же перестановка, что в `deinterleave_blocks`, но без
+/// промежуточного F16 — у скаляров DeltaNet цель F32, и round-trip через
+/// половинную точность их бы огрубил.
+fn reorder_v_heads_f32(src: &[f32], n_k: usize, n_per_k: usize, block: usize) -> Vec<f32> {
+    let heads = n_k * n_per_k;
+    if src.len() != heads * block {
+        return src.to_vec();
+    }
+    let mut out = Vec::with_capacity(src.len());
+    for j in 0..n_per_k {
+        for g in 0..n_k {
+            let hf = g * n_per_k + j;
+            out.extend_from_slice(&src[hf * block..(hf + 1) * block]);
+        }
+    }
+    out
+}
+
+/// Преобразования весов, которые конвертер llama.cpp применяет при записи GGUF
+/// (`convert_hf_to_gguf.py`, `Qwen3NextModel.modify_tensors`). Без них
+/// контейнер грузится и даже проходит проверки имён и форм, но модель выдаёт
+/// мусор: расхождение сидит в скалярах DeltaNet и в нормах.
+///
+///   .A_log            → -exp(x), затем перестановка v-голов
+///   .dt_bias          → перестановка v-голов
+///   *norm.weight      → x + 1, КРОМЕ linear_attn.norm.weight
+///   conv1d            → squeeze + перестановка только v-канальной части
+fn apply_hf_transforms(
+    hf: &str,
+    mut values: Vec<f32>,
+    shape: &[usize],
+    lay: Option<crate::DeltaLayout>,
+) -> Vec<f32> {
+    if hf.ends_with("norm.weight") && !hf.ends_with("linear_attn.norm.weight") {
+        for v in values.iter_mut() {
+            *v += 1.0;
+        }
+        return values;
+    }
+    if hf.ends_with(".A_log") {
+        for v in values.iter_mut() {
+            *v = -v.exp();
+        }
+    }
+    let Some(l) = lay else { return values };
+    let n_per_k = l.n_per_k();
+    if n_per_k <= 1 {
+        return values;
+    }
+    if hf.ends_with(".A_log") || hf.ends_with(".dt_bias") {
+        // 1-D по числу v-голов: блок в один элемент.
+        return reorder_v_heads_f32(&values, l.n_k, n_per_k, 1);
+    }
+    if hf.ends_with("conv1d.weight") {
+        // [C, K] после схлопывания: q/k-часть остаётся, переставляется хвост v.
+        let cols = *shape.last().unwrap_or(&1);
+        let qk = l.hk * l.n_k * 2 * cols;
+        if qk >= values.len() {
+            return values;
+        }
+        let mut out = values[..qk].to_vec();
+        out.extend(reorder_v_heads_f32(
+            &values[qk..],
+            l.n_k,
+            n_per_k,
+            l.hv * cols,
+        ));
+        return out;
+    }
+    values
+}
+
 pub struct PackStats {
     pub tensors: usize,
     pub bytes: u64,
@@ -211,7 +285,9 @@ pub fn pack(
                 ));
             }
         };
-        // Перепаковка раскладки DeltaNet работает по байтам F16 — применяем её
+        // Преобразования llama.cpp (нормы, A_log, dt_bias, conv1d) — по f32.
+        let values = apply_hf_transforms(hf, values, &shape, delta_layout);
+        // Перепаковка проекций DeltaNet работает по байтам F16 — применяем её
         // до квантования, на F16-представлении.
         let values = if delta_layout.is_some() && shape.len() == 2 {
             let f16le: Vec<u8> = values
