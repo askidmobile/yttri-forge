@@ -44,6 +44,10 @@ struct Args {
     /// Размер блока масштабирования для --fp8-emulate
     #[arg(long, default_value_t = 128)]
     fp8_block: usize,
+
+    /// Эмулировать Q8_0 (int8, блок 32, масштаб F16) — сравнение с FP8
+    #[arg(long)]
+    q8_emulate: bool,
 }
 
 fn main() {
@@ -137,6 +141,30 @@ pub fn fp8_emulate_f16(bytes: &[u8], block: usize) -> (Vec<u8>, f64, f64) {
         let scale = if amax > 0.0 { amax / 448.0 } else { 1.0 };
         for &v in chunk {
             let q = e4m3_round(v / scale) * scale;
+            sum_err += (v - q).abs() as f64;
+            sum_abs += v.abs() as f64;
+            out.extend_from_slice(&half::f16::from_f32(q).to_le_bytes());
+        }
+    }
+    (out, sum_err, sum_abs)
+}
+
+/// Q8_0-эмуляция: блок 32 значения, масштаб amax/127, целые уровни.
+/// Считает ту же метрику, что и fp8_emulate_f16 — для сравнения форматов.
+pub fn q8_0_emulate_f16(bytes: &[u8], block: usize) -> (Vec<u8>, f64, f64) {
+    let n = bytes.len() / 2;
+    let mut vals: Vec<f32> = Vec::with_capacity(n);
+    for c in bytes.chunks_exact(2) {
+        vals.push(half::f16::from_le_bytes([c[0], c[1]]).to_f32());
+    }
+    let (mut sum_err, mut sum_abs) = (0f64, 0f64);
+    let mut out = Vec::with_capacity(bytes.len());
+    for chunk in vals.chunks(block) {
+        let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+        // Масштаб хранится в F16 — учитываем и это округление.
+        let scale = half::f16::from_f32(if amax > 0.0 { amax / 127.0 } else { 1.0 }).to_f32();
+        for &v in chunk {
+            let q = (v / scale).round().clamp(-127.0, 127.0) * scale;
             sum_err += (v - q).abs() as f64;
             sum_abs += v.abs() as f64;
             out.extend_from_slice(&half::f16::from_f32(q).to_le_bytes());
@@ -463,6 +491,11 @@ fn run(args: &Args) -> Result<(), String> {
             fp8_err += err;
             fp8_abs += abs;
             q
+        } else if args.q8_emulate {
+            let (q, err, abs) = q8_0_emulate_f16(&f16_bytes, 32);
+            fp8_err += err;
+            fp8_abs += abs;
+            q
         } else {
             f16_bytes
         };
@@ -470,6 +503,12 @@ fn run(args: &Args) -> Result<(), String> {
         w.add_tensor(&p.gguf, &shape, f16_bytes);
     }
 
+    if args.q8_emulate {
+        println!(
+            "q8_0 emulate (int8, блок 32): относительная ошибка весов {:.3}%",
+            100.0 * fp8_err / fp8_abs.max(1e-9)
+        );
+    }
     if args.fp8_emulate {
         println!(
             "fp8 emulate (E4M3, блок {}): относительная ошибка весов {:.3}%",
@@ -552,6 +591,27 @@ mod tests {
         // Ниже минимальной субнормали (2^-9) E4M3 обнуляет — ровно поэтому
         // веса масштабируются поблочно, а не квантуются «как есть».
         assert_eq!(e4m3_round(0.001234), 0.0);
+    }
+
+    /// Q8_0 с блоком 32 точнее E4M3 с блоком 128 на типичном распределении
+    /// весов: линейная сетка на узком блоке бьёт экспоненциальную на широком.
+    #[test]
+    fn q8_beats_fp8_on_weight_like_data() {
+        let mut vals = Vec::new();
+        let mut x = 0.123f32;
+        for _ in 0..4096 {
+            x = (x * 7.13 + 0.37).fract() - 0.5; // детерминированный «шум» ±0.5
+            vals.push(half::f16::from_f32(x * 0.08));
+        }
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let (_, q8_err, abs) = q8_0_emulate_f16(&bytes, 32);
+        let (_, fp8_err, _) = fp8_emulate_f16(&bytes, 128);
+        assert!(
+            q8_err < fp8_err,
+            "q8={} fp8={} (abs={abs})",
+            q8_err / abs,
+            fp8_err / abs
+        );
     }
 
     /// Поблочный масштаб спасает мелкие значения рядом с крупным выбросом.
