@@ -446,7 +446,8 @@ pub fn dispatch_delta_rule_prefill(
                 + 3 * CHUNK_C * CHUNK_COLS
                 + 2 * CHUNK_C * CHUNK_C
                 + 2 * CHUNK_C
-                + CHUNK_COLS * CHUNK_ROWGRP)
+                + CHUNK_COLS * CHUNK_ROWGRP
+                + 2 * CHUNK_C * CHUNK_COLS * CHUNK_ROWGRP)
                 * 4;
             let func = dev
                 .get_or_load_func("delta_rule_prefill_chunked_c8", &candle_kernels::DELTA_RULE)?;

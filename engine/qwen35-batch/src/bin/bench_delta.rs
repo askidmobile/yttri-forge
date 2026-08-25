@@ -80,7 +80,7 @@ fn run(
         // две матрицы [32×32] и мелочь — около 49 КБ, нужен opt-in.
         let (c, cols) = (c, cols);
         const ROWGRP: usize = 4;
-        let smem = (2 * c * hkd + 3 * c * cols + 2 * c * c + 2 * c + cols * ROWGRP) * 4;
+        let smem = (2 * c * hkd + 3 * c * cols + 2 * c * c + 2 * c + cols * ROWGRP + 2 * c * cols * ROWGRP) * 4;
         let func = dev.get_or_load_func(kernel, &candle_kernels::DELTA_RULE)?;
         func.set_attribute(
             candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -418,7 +418,7 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
         let winner = std::env::var("QWEN36_CHUNK_KERNEL").unwrap_or_else(|_| "delta_rule_prefill_chunked_c8".into());
         let (c, cols) = chunked_shape(&winner).unwrap();
         const ROWGRP: usize = 4;
-        let smem = (2 * c * hkd + 3 * c * cols + 2 * c * c + 2 * c + cols * ROWGRP) * 4;
+        let smem = (2 * c * hkd + 3 * c * cols + 2 * c * c + 2 * c + cols * ROWGRP + 2 * c * cols * ROWGRP) * 4;
         let f = dev.get_or_load_func(&winner, &candle_kernels::DELTA_RULE)?;
         f.set_attribute(
             candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -463,6 +463,9 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
     println!("  ЯДРО chunked vs последовательный: out {}, state {}",
         max_rel(&gpu_c_head, &seq_out),
         max_rel(&gpu_c_state[head * hkd * hvd..(head + 1) * hkd * hvd], &seq_state));
+    // Сверка по ВСЕМ головам сразу: ошибка в индексации головы иначе пройдёт мимо.
+    println!("  ЯДРО chunked vs ЯДРО v1 (все головы): out {}, state {}",
+        max_rel(&gpu_out, &gpu_c_out), max_rel(&gpu_state, &gpu_c_state));
     println!("  масштаб: |out|max={:.3} |state|max={:.3}",
         seq_out.iter().fold(0f32, |m, x| m.max(x.abs())),
         seq_state.iter().fold(0f32, |m, x| m.max(x.abs())));

@@ -632,6 +632,7 @@ __device__ __forceinline__ void delta_rule_chunked_impl(
     float* sred = sbeta + DR_CHUNK;                      // [COLS][ROWGRP]
     float* spk = sred + DR_COLS * DR_ROWGRP;             // [C][COLS] Sᵀk
     float* spq = spk + DR_CHUNK * DR_COLS;               // [C][COLS] Sᵀq
+    float* spart = spq + DR_CHUNK * DR_COLS;             // [2][C][COLS][ROWGRP]
 
     // Состояние: строки [row0, row0+rows_per) своего столбца — в регистрах.
     float st[32];
@@ -685,11 +686,9 @@ __device__ __forceinline__ void delta_rule_chunked_impl(
         //    внутри последовательного цикла по t с двумя блочными
         //    синхронизациями на токен — теперь один проход с atomicAdd по
         //    группам строк (4-сторонняя редукция без syncthreads на каждый t).
-        for (unsigned int idx = tid; idx < C * DR_COLS; idx += nthreads) {
-            spk[idx] = 0.0f;
-            spq[idx] = 0.0f;
-        }
-        __syncthreads();
+        // Частичные суммы по группам строк складываем в фиксированном порядке:
+        // atomicAdd давал недетерминированный порядок и, как следствие, разные
+        // логиты между одинаковыми запросами.
         for (unsigned int t = 0; t < C; t++) {
             float pk = 0.0f, pq = 0.0f;
             #pragma unroll
@@ -698,8 +697,19 @@ __device__ __forceinline__ void delta_rule_chunked_impl(
                 pk += sv * sk[t * hkd + row0 + r];
                 pq += sv * sq[t * hkd + row0 + r];
             }
-            atomicAdd(&spk[t * DR_COLS + col_l], pk);
-            atomicAdd(&spq[t * DR_COLS + col_l], pq);
+            spart[(t * DR_COLS + col_l) * DR_ROWGRP + rowgrp] = pk;
+            spart[(DR_CHUNK * DR_COLS + t * DR_COLS + col_l) * DR_ROWGRP + rowgrp] = pq;
+        }
+        __syncthreads();
+        for (unsigned int idx = tid; idx < C * DR_COLS; idx += nthreads) {
+            float ak = 0.0f, aq = 0.0f;
+            #pragma unroll
+            for (unsigned int g = 0; g < DR_ROWGRP; g++) {
+                ak += spart[idx * DR_ROWGRP + g];
+                aq += spart[(DR_CHUNK * DR_COLS + idx) * DR_ROWGRP + g];
+            }
+            spk[idx] = ak;
+            spq[idx] = aq;
         }
         __syncthreads();
 
