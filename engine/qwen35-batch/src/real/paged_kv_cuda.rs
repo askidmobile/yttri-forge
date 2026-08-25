@@ -218,8 +218,10 @@ pub fn launch_increment_t(&self, b: usize, t: usize) -> Result<()> {
         builder.arg(&kv_len_ptr);
         builder.arg(&slots_ptr);
         builder.arg(&out_ptr);
-        builder.arg(&(b as i32));
-        builder.arg(&(t as i32));
+        let b_i32 = b as i32;
+        let t_i32 = t as i32;
+        builder.arg(&b_i32);
+        builder.arg(&t_i32);
         unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
         Ok(out)
     }
@@ -357,8 +359,10 @@ impl PagedKvPool {
         builder.arg(&block_table_ptr);
         builder.arg(&slots_ptr);
         builder.arg(&kv_len_ptr);
-        builder.arg(&(b as i32));
-        builder.arg(&(t as i32));
+        let b_i32 = b as i32;
+        let t_i32 = t as i32;
+        builder.arg(&b_i32);
+        builder.arg(&t_i32);
         builder.arg(&(n_kv as i32));
         builder.arg(&(hd as i32));
         builder.arg(&(PAGE_SIZE as i32));
