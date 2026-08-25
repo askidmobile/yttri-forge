@@ -88,6 +88,10 @@ struct Args {
     /// Собрать контейнер видео-башни (эталон — mmproj GGUF в --gguf).
     #[arg(long)]
     pack_vision: bool,
+
+    /// Собрать контейнер MTP (эталон — MTP-GGUF в --gguf).
+    #[arg(long)]
+    pack_mtp: bool,
 }
 
 fn main() {
@@ -112,8 +116,8 @@ fn main() {
         }
         return;
     }
-    if !args.f16_heavy && !args.pack && !args.pack_vision {
-        eprintln!("error: нужен --f16-heavy (сайдкар), --pack или --pack-vision");
+    if !args.f16_heavy && !args.pack && !args.pack_vision && !args.pack_mtp {
+        eprintln!("error: нужен --f16-heavy (сайдкар), --pack, --pack-vision или --pack-mtp");
         std::process::exit(2);
     }
     if let Err(e) = run(&args) {
@@ -512,12 +516,15 @@ fn run_pack_vision(args: &Args) -> Result<(), String> {
                 .unwrap_or_else(|| "mmproj.ytf".into()),
         );
     let t0 = std::time::Instant::now();
-    let stats = pack::pack_vision(
+    let stats = pack::pack_component(
         &shards,
         &hf_names,
         &ref_gguf,
         &out_path,
         &args.recipe,
+        "vision",
+        &|hf, _ct| pack::hf_to_gguf_vision(hf),
+        true,
         &read_tensor_f32,
     )?;
     println!(
@@ -533,7 +540,70 @@ fn run_pack_vision(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+fn run_pack_mtp(args: &Args) -> Result<(), String> {
+    let shards = open_safetensors(&args.inputs)?;
+    let mut hf_names: Vec<String> = Vec::new();
+    for (_, mmap) in &shards {
+        let (_off, meta) = safetensors::SafeTensors::read_metadata(mmap)
+            .map_err(|e| format!("safetensors meta: {e}"))?;
+        for (name, _) in meta.tensors() {
+            hf_names.push(name.to_string());
+        }
+    }
+    hf_names.sort();
+    hf_names.dedup();
+
+    let ref_gguf = args
+        .gguf
+        .clone()
+        .ok_or_else(|| "--pack-mtp требует --gguf <MTP-эталон>".to_string())?;
+    let dir = args.inputs[0].parent().unwrap_or(Path::new("."));
+    let out_path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| dir.to_path_buf())
+        .join("mtp.ytf");
+    let t0 = std::time::Instant::now();
+    let stats = pack::pack_component(
+        &shards,
+        &hf_names,
+        &ref_gguf,
+        &out_path,
+        &args.recipe,
+        "mtp",
+        &|hf, ct| {
+            let block = pack::mtp_block_of(ct)?;
+            pack::hf_to_gguf_mtp(hf, block)
+        },
+        // Эталон MTP содержит всю модель, а нам нужен только nextn-слой,
+        // поэтому полноты по эталону не требуем — вместо неё проверяем, что
+        // взяты все 15 тензоров слоя.
+        false,
+        &read_tensor_f32,
+    )?;
+    if stats.tensors != 15 {
+        return Err(format!(
+            "MTP-слой это 15 тензоров, упаковано {}: карта имён не полна",
+            stats.tensors
+        ));
+    }
+    println!(
+        "MTP: {} тензоров, {:.2} МиБ, за {:.1} с → {}",
+        stats.tensors,
+        stats.bytes as f64 / (1024.0 * 1024.0),
+        t0.elapsed().as_secs_f64(),
+        out_path.display()
+    );
+    for (dt, n) in &stats.by_dtype {
+        println!("  {dt}: {n}");
+    }
+    Ok(())
+}
+
 fn run(args: &Args) -> Result<(), String> {
+    if args.pack_mtp {
+        return run_pack_mtp(args);
+    }
     if args.pack_vision {
         return run_pack_vision(args);
     }

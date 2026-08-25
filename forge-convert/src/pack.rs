@@ -103,6 +103,54 @@ pub fn hf_to_gguf_vision(hf: &str) -> Option<Vec<String>> {
     Some(vec![format!("v.blk.{idx}.{g}")])
 }
 
+/// HF-имя тензора MTP → имя в эталонном MTP-GGUF.
+///
+/// `block` — индекс слоя MTP (в эталоне это blk.32: block_count включает
+/// nextn-слой). Формы подтверждают карту: `nextn.eh_proj` имеет вход 5120 =
+/// 2×2560, то есть это и есть `mtp.fc`, склеивающий эмбеддинг с hidden.
+pub fn hf_to_gguf_mtp(hf: &str, block: u32) -> Option<Vec<String>> {
+    let one = |s: String| Some(vec![s]);
+    match hf {
+        "mtp.fc.weight" => return one(format!("blk.{block}.nextn.eh_proj.weight")),
+        "mtp.pre_fc_norm_embedding.weight" => {
+            return one(format!("blk.{block}.nextn.enorm.weight"))
+        }
+        "mtp.pre_fc_norm_hidden.weight" => return one(format!("blk.{block}.nextn.hnorm.weight")),
+        "mtp.norm.weight" => return one(format!("blk.{block}.nextn.shared_head_norm.weight")),
+        _ => {}
+    }
+    let rest = hf.strip_prefix("mtp.layers.")?;
+    let (idx, suffix) = rest.split_once('.')?;
+    idx.parse::<u32>().ok()?;
+    let g = match suffix {
+        "input_layernorm.weight" => "attn_norm.weight",
+        "post_attention_layernorm.weight" => "post_attention_norm.weight",
+        "mlp.gate_proj.weight" => "ffn_gate.weight",
+        "mlp.up_proj.weight" => "ffn_up.weight",
+        "mlp.down_proj.weight" => "ffn_down.weight",
+        "self_attn.q_proj.weight" => "attn_q.weight",
+        "self_attn.k_proj.weight" => "attn_k.weight",
+        "self_attn.v_proj.weight" => "attn_v.weight",
+        "self_attn.o_proj.weight" => "attn_output.weight",
+        "self_attn.q_norm.weight" => "attn_q_norm.weight",
+        "self_attn.k_norm.weight" => "attn_k_norm.weight",
+        _ => return None,
+    };
+    one(format!("blk.{block}.{g}"))
+}
+
+/// Индекс слоя MTP в эталонном GGUF: единственный блок с тензорами `nextn.*`.
+pub fn mtp_block_of(ct: &gguf_file::Content) -> Option<u32> {
+    ct.tensor_infos
+        .keys()
+        .filter_map(|n| {
+            let rest = n.strip_prefix("blk.")?;
+            let (idx, tail) = rest.split_once('.')?;
+            tail.starts_with("nextn.").then(|| idx.parse::<u32>().ok())?
+        })
+        .max()
+}
+
 /// Срез Conv3d по временной оси: [O, C, T, H, W] → T тензоров [O, C, H, W].
 /// Данные в HF идут row-major, поэтому элемент (o,c,t,h,w) лежит по индексу
 /// (((o*C + c)*T + t)*H + h)*W + w — простой копией срез не возьмёшь.
@@ -724,25 +772,34 @@ pub fn list_gguf(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Собрать контейнер видео-башни из safetensors.
+/// Собрать контейнер компонента (видео-башня, MTP) из safetensors.
 ///
-/// Эталон — mmproj GGUF: из него берутся типы тензоров и метаданные.
-/// Токенизатор башне не нужен. Формы сверяются с эталоном, как и у языковой
-/// модели: расхождение раскладки — ошибка, а не тихий сдвиг.
-pub fn pack_vision(
+/// Эталон — GGUF компонента: из него берутся типы тензоров и метаданные.
+/// Токенизатор компонентам не нужен. Формы сверяются с эталоном, как и у
+/// языковой модели: расхождение раскладки — ошибка, а не тихий сдвиг.
+///
+/// `map` возвращает список имён, потому что одна HF-матрица может давать
+/// несколько тензоров эталона (Conv3d видео-башни режется по временной оси).
+/// `require_all` — падать, если в контейнер не попал тензор эталона; для MTP
+/// это неверно: его эталон содержит всю модель, а нам нужен только nextn-слой.
+#[allow(clippy::too_many_arguments)]
+pub fn pack_component(
     shards: &[(String, memmap2::Mmap)],
     hf_names: &[String],
     ref_gguf: &Path,
     out_path: &Path,
     recipe: &str,
+    mask: &str,
+    map: &dyn Fn(&str, &gguf_file::Content) -> Option<Vec<String>>,
+    require_all: bool,
     read_tensor_f32: &dyn Fn(
         &[(String, memmap2::Mmap)],
         &str,
     ) -> Result<(Vec<f32>, Vec<usize>), String>,
 ) -> Result<PackStats, String> {
     let mut gf = std::fs::File::open(ref_gguf)
-        .map_err(|e| format!("open mmproj {}: {e}", ref_gguf.display()))?;
-    let ct = gguf_file::Content::read(&mut gf).map_err(|e| format!("read mmproj: {e}"))?;
+        .map_err(|e| format!("open {}: {e}", ref_gguf.display()))?;
+    let ct = gguf_file::Content::read(&mut gf).map_err(|e| format!("read эталон: {e}"))?;
 
     let mut config: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let mut dropped: Vec<String> = Vec::new();
@@ -765,7 +822,7 @@ pub fn pack_vision(
         .map_err(|e| format!("create {}: {e}", out_path.display()))?;
     let pre = container::ManifestPre {
         gguf_sha256: String::new(),
-        mask: "vision".into(),
+        mask: mask.to_string(),
     };
     let mut w = container::ContainerWriter::create_standalone(out_file, pre, config)
         .map_err(|e| format!("container create: {e}"))?;
@@ -778,7 +835,7 @@ pub fn pack_vision(
     };
 
     for hf in hf_names {
-        let Some(targets) = hf_to_gguf_vision(hf) else {
+        let Some(targets) = map(hf, &ct) else {
             stats.skipped.push(hf.clone());
             continue;
         };
@@ -801,7 +858,7 @@ pub fn pack_vision(
             let info = ct
                 .tensor_infos
                 .get(name)
-                .ok_or_else(|| format!("{hf} → {name}: в mmproj такого тензора нет"))?;
+                .ok_or_else(|| format!("{hf} → {name}: в эталоне такого тензора нет"))?;
             let dims = info.shape.dims().to_vec();
             if part.len() != dims.iter().product::<usize>() {
                 return Err(format!(
@@ -820,16 +877,18 @@ pub fn pack_vision(
         }
     }
 
-    // Всё, что есть в эталоне, должно быть в контейнере: иначе башня не
+    // Всё, что есть в эталоне, должно быть в контейнере: иначе компонент не
     // соберётся, а узнаем мы об этом только при загрузке.
-    let mut missing: Vec<&String> = ct
-        .tensor_infos
-        .keys()
-        .filter(|n| !w.has_tensor(n))
-        .collect();
-    if !missing.is_empty() {
-        missing.sort();
-        return Err(format!("в контейнер не попали тензоры эталона: {missing:?}"));
+    if require_all {
+        let mut missing: Vec<&String> = ct
+            .tensor_infos
+            .keys()
+            .filter(|n| !w.has_tensor(n))
+            .collect();
+        if !missing.is_empty() {
+            missing.sort();
+            return Err(format!("в контейнер не попали тензоры эталона: {missing:?}"));
+        }
     }
 
     w.finalize().map_err(|e| format!("finalize: {e}"))?;
