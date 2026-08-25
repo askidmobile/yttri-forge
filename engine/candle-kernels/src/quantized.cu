@@ -7028,26 +7028,27 @@ extern "C" __global__ void kv_append_paged_f16_multi(
     const int max_blocks,
     const int window)
 {
+    // Токен — по оси z сетки: раньше цикл по t крутился внутри блока, и на
+    // всю копию приходилось n_kv*b блоков (для 4B — четыре блока на 28 SM,
+    // 362 мкс на запуск при мегабайте данных).
     const int bidx = blockIdx.y;
     const int head = blockIdx.x;
-    if (bidx >= b || head >= n_kv) return;
+    const int row = blockIdx.z;
+    if (bidx >= b || head >= n_kv || row >= t) return;
     const unsigned int slot = slots[bidx];
-    unsigned int base_len = kv_len[slot];
-    for (int row = 0; row < t; ++row) {
-        unsigned int len = base_len + (unsigned int)row;
-        if (len >= (unsigned int)window) continue; // eviction guard: host falls back
-        const unsigned int page = block_table[bidx * max_blocks + len / page_size];
-        const unsigned int off = len % page_size;
-        const size_t dst_base = ((size_t)page * page_size + off) * n_kv * hd;
-        half* k_dst = k_pool + dst_base + (size_t)head * hd;
-        half* v_dst = v_pool + dst_base + (size_t)head * hd;
-        const size_t src_base = (((size_t)bidx * t) + row) * n_kv * hd + (size_t)head * hd;
-        const half* k_src = k_rows + src_base;
-        const half* v_src = v_rows + src_base;
-        for (int i = threadIdx.x; i < hd; i += blockDim.x) {
-            k_dst[i] = k_src[i];
-            v_dst[i] = v_src[i];
-        }
+    const unsigned int len = kv_len[slot] + (unsigned int)row;
+    if (len >= (unsigned int)window) return; // eviction guard: host falls back
+    const unsigned int page = block_table[bidx * max_blocks + len / page_size];
+    const unsigned int off = len % page_size;
+    const size_t dst_base = ((size_t)page * page_size + off) * n_kv * hd;
+    half* k_dst = k_pool + dst_base + (size_t)head * hd;
+    half* v_dst = v_pool + dst_base + (size_t)head * hd;
+    const size_t src_base = (((size_t)bidx * t) + row) * n_kv * hd + (size_t)head * hd;
+    const half* k_src = k_rows + src_base;
+    const half* v_src = v_rows + src_base;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        k_dst[i] = k_src[i];
+        v_dst[i] = v_src[i];
     }
 }
 

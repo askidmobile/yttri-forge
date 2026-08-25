@@ -364,8 +364,9 @@ impl PagedKvPool {
             "kv_append_paged_f16_multi",
             &candle_core::cuda_backend::kernels::QUANTIZED,
         )?;
+        // Ось z — токены чанка: без неё копию вели n_kv*b блоков (4 на 28 SM).
         let cfg = LaunchConfig {
-            grid_dim: (n_kv as u32, b as u32, 1),
+            grid_dim: (n_kv as u32, b as u32, t as u32),
             block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         };
