@@ -3090,8 +3090,26 @@ fn audit_cross_vz(i: usize, g_qkv: &QMatMul, g_z: &QMatMul, f_qkv: &QMatMul, f_z
         let d_zz = (&gz - &fz)?.abs()?.mean_all()?.to_scalar::<f32>()?;
         let d_tail_z = (&g_tail - &fz)?.abs()?.mean_all()?.to_scalar::<f32>()?;
         let d_z_tail = (&gz - &f_tail)?.abs()?.mean_all()?.to_scalar::<f32>()?;
+        // Сопоставление голов v (по 128 строк) между GGUF и сайдкаром:
+        // сравниваем первую строку каждой головы — этого хватает, чтобы найти
+        // закон перестановки.
+        let hd = 128usize;
+        let heads = rows / hd;
+        let mut perm = String::new();
+        for hg in 0..heads.min(6) {
+            let gr = g_tail.i((hg * hd, ..))?;
+            let mut best = (0usize, f32::MAX);
+            for hf in 0..heads {
+                let fr = f_tail.i((hf * hd, ..))?;
+                let d = (&gr - &fr)?.abs()?.mean_all()?.to_scalar::<f32>()?;
+                if d < best.1 {
+                    best = (hf, d);
+                }
+            }
+            perm.push_str(&format!(" g_v{hg}<-f_v{}({:.5})", best.0, best.1));
+        }
         Ok(format!(
-            "z↔z={d_zz:.5} qkv_tail↔f_z={d_tail_z:.5} g_z↔qkv_tail={d_z_tail:.5}"
+            "z↔z={d_zz:.5} qkv_tail↔f_z={d_tail_z:.5} g_z↔qkv_tail={d_z_tail:.5}\n[ytf-audit]   головы v:{perm}"
         ))
     };
     match run() {
