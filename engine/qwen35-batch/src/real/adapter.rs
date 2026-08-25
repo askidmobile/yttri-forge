@@ -108,6 +108,9 @@ struct PrefillGraphState {
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
     t: usize,
     slot: usize,
+    /// Верхняя оценка длины KV, зашитая в граф как max_seqlen_k: чанки с
+    /// разным start_pos переиспользуют граф только внутри одной корзины.
+    kv_cap: usize,
     /// Persistent входы (стейджатся ВНЕ графа): ids [1,T] U32, позиции [T] U32.
     ids_t: Tensor,
     rope_pos_t: Tensor,
@@ -1328,10 +1331,15 @@ impl Qwen35BatchAdapter {
         let stage_ms = t_stage.elapsed().as_secs_f64() * 1e3;
 
         let t_run = std::time::Instant::now();
+        // Корзина по длине KV: реальная длина kv0+T округляется вверх до 512,
+        // чтобы граф переиспользовался соседними чанками, а max_seqlen_k внутри
+        // него оставался честной верхней оценкой.
+        const KV_BUCKET: usize = 512;
+        let kv_cap = ((chunk.start_pos + t).div_ceil(KV_BUCKET) * KV_BUCKET).min(window);
         let hit = self
             .prefill_graphs
             .iter()
-            .position(|g| g.t == t && g.slot == slot);
+            .position(|g| g.t == t && g.slot == slot && g.kv_cap == kv_cap);
         let (flat, hit_flag) = match hit {
             Some(i) => {
                 {
@@ -1366,7 +1374,7 @@ impl Qwen35BatchAdapter {
                 //    исполняет) + прогрев ядер/htod-кэша.
                 let (logits, _hidden) = self
                     .model
-                    .forward_prefill_graphed(&ids_t, &rope_pos_t, t)
+                    .forward_prefill_graphed(&ids_t, &rope_pos_t, t, kv_cap)
                     .map_err(|e| anyhow!("pgraph eager prime: {e}"))?;
                 let flat = logits
                     .to_dtype(DType::F32)?
@@ -1388,7 +1396,7 @@ impl Qwen35BatchAdapter {
                     }
                     .map_err(|e| anyhow!("pgraph begin_capture: {e}"))?;
                     let forward_result =
-                        self.model.forward_prefill_graphed(&ids_t, &rope_pos_t, t);
+                        self.model.forward_prefill_graphed(&ids_t, &rope_pos_t, t, kv_cap);
                     let (logits_t, hidden_t) = match forward_result {
                         Ok(v) => v,
                         Err(e) => {
@@ -1415,13 +1423,14 @@ impl Qwen35BatchAdapter {
                         unsafe { csys::cuGraphDestroy(cu_graph) };
                         return Err(anyhow!("pgraph instantiate: {res:?}"));
                     }
-                    eprintln!("[pg] captured T={t} slot={slot} nodes={nodes}");
+                    eprintln!("[pg] captured T={t} slot={slot} kv_cap={kv_cap} nodes={nodes}");
                     Ok(PrefillGraphState {
                         exec,
                         cu_graph,
                         stream: stream.clone(),
                         t,
                         slot,
+                        kv_cap,
                         ids_t: ids_t.clone(),
                         rope_pos_t: rope_pos_t.clone(),
                         logits_t: logits_out,

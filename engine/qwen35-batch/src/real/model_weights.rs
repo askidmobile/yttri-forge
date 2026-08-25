@@ -3866,6 +3866,7 @@ impl GatedAttentionLayer {
         x: &Tensor,
         ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
         rope_pos_dev: &Tensor,
+        kv_cap: usize,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         if b_sz != 1 {
@@ -3946,6 +3947,12 @@ impl GatedAttentionLayer {
             .reshape((b_sz * seq_len, self.n_head, self.head_dim))?;
         let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
         let window = ctx.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE;
+        // max_seqlen_k: раньше подавали всё окно (16384 при реальных ~2000).
+        // FA2 берёт из него seqlen_k_rounded и решение о split-KV, поэтому
+        // завышение стоит и памяти, и лишних проходов. kv_cap — верхняя оценка
+        // фактической длины (адаптер округляет вверх и кладёт в ключ графа),
+        // так что корректность сохраняется при любом replay.
+        let max_k = kv_cap.clamp(seq_len, window);
         let seqlens_q = ctx.seqlens_q_prefill();
         let seqlens_k = ctx.seqlens_k(b_sz)?;
         let block_table = ctx.block_table(b_sz)?;
@@ -3958,7 +3965,7 @@ impl GatedAttentionLayer {
             &block_table,
             None,
             seq_len,
-            window,
+            max_k,
             scale,
             None,
             // window_size_right=0 → causal. При q_len<k_len FA2 v2 выравнивает
@@ -4552,6 +4559,7 @@ impl HybridBlock {
         x: &Tensor,
         ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
         rope_pos_dev: &Tensor,
+        kv_cap: usize,
     ) -> Result<Tensor> {
         let residual = x;
         let normed = self.attn_norm.forward(x)?;
@@ -4597,7 +4605,7 @@ impl HybridBlock {
                 }
             }
             HybridLayerType::Attention(attn) => {
-                attn.forward_attn_prefill_paged(&normed, ctx, rope_pos_dev)?
+                attn.forward_attn_prefill_paged(&normed, ctx, rope_pos_dev, kv_cap)?
             }
         };
         let x = (layer_out + residual)?;
@@ -7326,6 +7334,7 @@ impl ModelWeights {
         ids_t: &Tensor,
         rope_pos_dev: &Tensor,
         t_len: usize,
+        kv_cap: usize,
     ) -> Result<(Tensor, Tensor)> {
         let emb = self.tok_embeddings_cuda.as_ref().ok_or_else(|| {
             candle_core::Error::Msg("prefill graph: no CUDA embedding".into())
@@ -7343,7 +7352,7 @@ impl ModelWeights {
         ctx.seqlens_k_for_prefill(1, t_len)?;
 
         for block in self.blocks.iter_mut() {
-            layer_in = block.forward_prefill_paged(&layer_in, ctx, rope_pos_dev)?;
+            layer_in = block.forward_prefill_paged(&layer_in, ctx, rope_pos_dev, kv_cap)?;
         }
 
         // kv_len[slot] += T — после ВСЕХ attention слоёв (все слои видят одну длину).
