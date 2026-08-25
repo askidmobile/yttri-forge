@@ -266,15 +266,12 @@ impl Qwen35BatchAdapter {
         // а метаданные и токенизатор развёрнуты в тот же `Content`.
         let standalone = crate::real::ytf16::container_version(mmap.as_ref())
             == Some(crate::real::ytf16::VERSION_STANDALONE);
-        let ct = if standalone {
+        if standalone {
             log::info!("[qwen35-batch] самостоятельный контейнер .ytf — GGUF не нужен");
-            crate::real::ytf16::content_from_standalone(mmap.as_ref())
-                .map_err(|e| anyhow!("read ytf: {e}"))?
-        } else {
-            // Один проход чтения GGUF: EOS + vocab (из token_embd.weight shape[0]) + веса.
-            let mut c = std::io::Cursor::new(mmap.as_ref());
-            gguf_file::Content::read(&mut c).map_err(|e| anyhow!("read GGUF: {e}"))?
-        };
+        }
+        // Один проход чтения: EOS + vocab (из token_embd.weight shape[0]) + веса.
+        let ct = crate::real::ytf16::content_any(mmap.as_ref())
+            .map_err(|e| anyhow!("read model: {e}"))?;
 
         // Phase 1 preflight: validate architecture, metadata, and tensor contracts
         // BEFORE heavy tensor loading. Fail-fast with aggregated errors.

@@ -298,3 +298,29 @@ pub fn content_from_standalone(data: &[u8]) -> Result<gguf_file::Content> {
         tensor_data_offset: data_start,
     })
 }
+
+/// Прочитать метаданные модели из файла любого поддерживаемого формата:
+/// GGUF или самостоятельный контейнер .ytf (v2).
+///
+/// Точка входа для всех, кому нужен `Content` по пути к модели: без неё
+/// каждый такой читатель падает на .ytf с «unknown magic».
+pub fn content_any(data: &[u8]) -> Result<gguf_file::Content> {
+    if container_version(data) == Some(VERSION_STANDALONE) {
+        return content_from_standalone(data);
+    }
+    let mut c = std::io::Cursor::new(data);
+    gguf_file::Content::read(&mut c)
+}
+
+/// То же по пути к файлу: mmap + разбор. Возвращает mmap, потому что для .ytf
+/// (как и для GGUF) смещения тензоров ссылаются в него.
+pub fn content_any_path(
+    path: &std::path::Path,
+) -> Result<(gguf_file::Content, memmap2::Mmap)> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| candle_core::Error::Msg(format!("open {}: {e}", path.display())))?;
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
+        .map_err(|e| candle_core::Error::Msg(format!("mmap {}: {e}", path.display())))?;
+    let ct = content_any(&mmap)?;
+    Ok((ct, mmap))
+}
