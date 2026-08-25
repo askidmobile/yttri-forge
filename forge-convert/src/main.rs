@@ -75,13 +75,18 @@ fn find_tensor_info(
     name: &str,
 ) -> Option<Found> {
     for (si, (_, mmap)) in shards.iter().enumerate() {
-        if let Ok((_off, meta)) = safetensors::SafeTensors::read_metadata(mmap) {
+        if let Ok((header_len, meta)) = safetensors::SafeTensors::read_metadata(mmap) {
             if let Some(info) = meta.tensors().get(name).copied() {
+                // data_offsets отсчитываются от НАЧАЛА СЕКЦИИ ДАННЫХ, а она идёт
+                // после 8 байт длины заголовка и самого JSON. Без этой базы все
+                // тензоры читаются со сдвигом на размер заголовка (веса-мусор:
+                // распределение похоже, значения чужие).
+                let base = header_len + 8;
                 return Some(Found {
                     dtype: info.dtype,
                     shape: info.shape.clone(),
-                    start: info.data_offsets.0,
-                    end: info.data_offsets.1,
+                    start: base + info.data_offsets.0,
+                    end: base + info.data_offsets.1,
                     shard: si,
                 });
             }
@@ -297,4 +302,33 @@ fn run(args: &Args) -> Result<(), String> {
         &gguf_sha[..12.min(gguf_sha.len())]
     );
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Смещения тензора должны отсчитываться от секции данных, а не от начала
+    /// файла: иначе конвертер пишет в сайдкар чужие байты (баг 2026-08-25).
+    #[test]
+    fn tensor_offsets_are_relative_to_data_section() {
+        let values = [1.0f32, -2.0, 3.5, 4.25];
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let view = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::F32,
+            vec![2, 2],
+            &data,
+        )
+        .expect("view");
+        let bytes = safetensors::serialize([("w", view)], &None).expect("serialize");
+        let path = std::env::temp_dir().join("forge-convert-offsets-test.safetensors");
+        std::fs::write(&path, &bytes).expect("write");
+
+        let shards = open_safetensors(&[path.clone()]).expect("open");
+        let found = find_tensor_info(&shards, "w").expect("tensor found");
+        assert_eq!(&shards[found.shard].1[found.start..found.end], data.as_slice());
+
+        std::fs::remove_file(&path).ok();
+    }
 }
