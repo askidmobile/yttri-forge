@@ -159,15 +159,21 @@ fn value_to_json(v: &gguf_file::Value) -> Option<serde_json::Value> {
         V::U16(x) => (*x as u64).into(),
         V::U32(x) => (*x as u64).into(),
         V::U64(x) => (*x).into(),
-        V::I8(x) if *x >= 0 => (*x as u64).into(),
-        V::I16(x) if *x >= 0 => (*x as u64).into(),
-        V::I32(x) if *x >= 0 => (*x as u64).into(),
-        V::I64(x) if *x >= 0 => (*x as u64).into(),
+        // Знаковые: неотрицательные уходят как u64 (читатель развернёт их в
+        // U32, как ждёт конструктор), отрицательные — как i64.
+        V::I8(x) => i64::from(*x).into(),
+        V::I16(x) => i64::from(*x).into(),
+        V::I32(x) => i64::from(*x).into(),
+        V::I64(x) => (*x).into(),
         V::F32(x) => serde_json::Number::from_f64(*x as f64).map(Into::into)?,
         V::F64(x) => serde_json::Number::from_f64(*x).map(Into::into)?,
         V::Bool(x) => (*x).into(),
         V::String(s) => s.clone().into(),
-        _ => return None,
+        // Массивы нужны как есть: у видео-башни это image_mean/image_std —
+        // константы нормализации, без них препроцессинг неверен.
+        V::Array(items) => serde_json::Value::Array(
+            items.iter().filter_map(value_to_json).collect(),
+        ),
     })
 }
 
@@ -650,6 +656,9 @@ pub fn verify(ytf: &Path, ref_gguf: &Path, top: usize) -> Result<(), String> {
         let dt = match entry.dtype.as_str() {
             "F32" => GgmlDType::F32,
             "F16" => GgmlDType::F16,
+            "BF16" => GgmlDType::BF16,
+            "Q4_0" => GgmlDType::Q4_0,
+            "Q8_1" => GgmlDType::Q8_1,
             "Q4_K" => GgmlDType::Q4K,
             "Q5_K" => GgmlDType::Q5K,
             "Q6_K" => GgmlDType::Q6K,
@@ -749,7 +758,7 @@ pub fn pack_vision(
     }
     if !dropped.is_empty() {
         dropped.sort();
-        println!("метаданные не перенесены (не скаляры): {dropped:?}");
+        return Err(format!("метаданные не перенесены: {dropped:?}"));
     }
 
     let out_file = std::fs::File::create(out_path)

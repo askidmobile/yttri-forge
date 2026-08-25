@@ -184,10 +184,17 @@ fn config_value(v: &serde_json::Value) -> Option<gguf_file::Value> {
         serde_json::Value::Number(n) => {
             if let Some(u) = n.as_u64() {
                 Some(gguf_file::Value::U32(u as u32))
+            } else if let Some(i) = n.as_i64() {
+                // Отрицательные целые: конструктор ждёт их как I32.
+                Some(gguf_file::Value::I32(i as i32))
             } else {
                 n.as_f64().map(|f| gguf_file::Value::F32(f as f32))
             }
         }
+        // Массивы (image_mean/image_std у видео-башни) переносятся как есть.
+        serde_json::Value::Array(items) => Some(gguf_file::Value::Array(
+            items.iter().filter_map(config_value).collect(),
+        )),
         _ => None,
     }
 }
