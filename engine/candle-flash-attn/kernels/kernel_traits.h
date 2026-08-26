@@ -107,6 +107,13 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
     static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
+    // Промежуточный буфер для int8-KV: cp.async кладёт байты сюда, распаковка
+    // разворачивает их в sK/sV. Без него загрузка становится синхронной и рвёт
+    // конвейер FA2 — замер показал потерю 15% декода при вдвое меньшем трафике.
+    // Занятость от добавки не страдает: при 100 КБ на мультипроцессор здесь и
+    // так помещается один блок.
+    static constexpr int kSmemKV8Size = size(SmemLayoutKV{}) * 2 * sizeof(int8_t);
+    static constexpr int kSmemSizeSplitKV = kSmemSize + kSmemKV8Size;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");

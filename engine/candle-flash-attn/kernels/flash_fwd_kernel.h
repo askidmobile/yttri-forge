@@ -697,6 +697,37 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
+    // Промежуточные буферы int8: cp.async кладёт байты сюда, распаковка
+    // разворачивает их в sK/sV. Асинхронность обязательна — синхронное чтение
+    // встаёт в критический путь и рвёт конвейер FA2.
+    int8_t *smem_kv8 = reinterpret_cast<int8_t *>(sV.data().get() + size(sV));
+    Tensor sK8 = make_tensor(
+        make_smem_ptr(smem_kv8),
+        Layout<Shape<Int<kBlockN>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
+    Tensor sV8 = make_tensor(
+        make_smem_ptr(smem_kv8 + kBlockN * kHeadDim),
+        Layout<Shape<Int<kBlockN>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
+
+    // 128 бит на поток = 16 байт int8.
+    constexpr int kElemsPerLoadQ8 = 16;
+    constexpr int kThreadsPerRowQ8 = kHeadDim / kElemsPerLoadQ8;
+    using GmemTiledCopyQ8 = decltype(make_tiled_copy(
+        Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, int8_t>{},
+        Layout<Shape<Int<Kernel_traits::kNThreads / kThreadsPerRowQ8>, Int<kThreadsPerRowQ8>>,
+               Stride<Int<kThreadsPerRowQ8>, _1>>{},
+        Layout<Shape<_1, Int<kElemsPerLoadQ8>>>{}));
+    GmemTiledCopyQ8 gmem_tiled_copy_q8;
+    auto gmem_thr_copy_q8 = gmem_tiled_copy_q8.get_thread_slice(tidx);
+    Tensor tKsK8 = gmem_thr_copy_q8.partition_D(sK8);
+    Tensor tVsV8 = gmem_thr_copy_q8.partition_D(sV8);
+    Tensor cKV8 = make_identity_tensor(make_shape(size<0>(sK8), size<1>(sK8)));
+    Tensor tKVcKV8 = gmem_thr_copy_q8.partition_S(cKV8);
+    Tensor tKVpKV8 = make_tensor<bool>(make_shape(size<2>(tKsK8)));
+    #pragma unroll
+    for (int k = 0; k < size(tKVpKV8); ++k) {
+        tKVpKV8(k) = get<1>(tKVcKV8(0, 0, k)) < params.d;
+    }
+
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
 
@@ -907,9 +938,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     if (params.kv_is_q8) {
-        auto gk = q8_k(n_block); auto gs = q8_ks(n_block);
-        flash::copy_dequant_q8<Is_even_MN, Is_even_K>(gk, gs, tKsK, tKVcKV, tKVpKV,
-                                                      binfo.actual_seqlen_k - n_block * kBlockN);
+        auto gk = q8_k(n_block);
+        Tensor tKgK8 = gmem_thr_copy_q8.partition_S(gk);
+        flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_q8, tKgK8, tKsK8, tKVcKV8, tKVpKV8,
+                                           binfo.actual_seqlen_k - n_block * kBlockN);
     } else {
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
@@ -961,17 +993,20 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
             }
             if (params.kv_is_q8) {
-                auto gv = q8_v(n_block); auto gvs = q8_vs(n_block);
-                flash::copy_dequant_q8</*Is_even_MN=*/true, Is_even_K>(gv, gvs, tVsV, tKVcKV, tKVpKV);
+                auto gv = q8_v(n_block);
+                Tensor tVgV8 = gmem_thr_copy_q8.partition_S(gv);
+                flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_q8, tVgV8, tVsV8, tKVcKV8, tKVpKV8);
             } else {
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
             }
         } else {
             // Clear the smem tiles to account for predicated off loads
             if (params.kv_is_q8) {
-                auto gv = q8_v(n_block); auto gvs = q8_vs(n_block);
-                flash::copy_dequant_q8<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
-                    gv, gvs, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN);
+                auto gv = q8_v(n_block);
+                Tensor tVgV8 = gmem_thr_copy_q8.partition_S(gv);
+                flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+                    gmem_tiled_copy_q8, tVgV8, tVsV8, tKVcKV8, tKVpKV8,
+                    binfo.actual_seqlen_k - n_block * kBlockN);
             } else {
             flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
                 gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
@@ -980,6 +1015,17 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
         cute::cp_async_fence();
 
+        // Распаковка int8 -> половинная точность. Стоит здесь, между выдачей
+        // следующей копии и умножением: так она перекрывается с загрузкой,
+        // а не конкурирует с ней. Строки за пределами длины обнуляем —
+        // иначе чтение масштаба ушло бы за границу массива.
+        if (params.kv_is_q8) {
+            auto gs_k = q8_ks(n_block);
+            flash::copy_dequant_q8</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
+                sK8, gs_k, tKsK, tKVcKV, tKVpKV,
+                binfo.actual_seqlen_k - n_block * kBlockN);
+            __syncthreads();  // K готов в smem, дальше его читает MMA
+        }
         flash::gemm(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -1011,8 +1057,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
             }
             if (params.kv_is_q8) {
-                auto gk = q8_k(n_block - 1); auto gs = q8_ks(n_block - 1);
-                flash::copy_dequant_q8</*Is_even_MN=*/true, Is_even_K>(gk, gs, tKsK, tKVcKV, tKVpKV);
+                auto gk = q8_k(n_block - 1);
+                Tensor tKgK8 = gmem_thr_copy_q8.partition_S(gk);
+                flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_q8, tKgK8, tKsK8, tKVcKV8, tKVpKV8);
             } else {
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
             }
@@ -1033,6 +1080,17 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
 
+        // Распаковка int8 -> половинная точность. Стоит здесь, между выдачей
+        // следующей копии и умножением: так она перекрывается с загрузкой,
+        // а не конкурирует с ней. Строки за пределами длины обнуляем —
+        // иначе чтение масштаба ушло бы за границу массива.
+        if (params.kv_is_q8) {
+            auto gs_v = q8_vs(n_block);
+            flash::copy_dequant_q8</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
+                sV8, gs_v, tVsV, tKVcKV, tKVpKV,
+                binfo.actual_seqlen_k - n_block * kBlockN);
+            __syncthreads();  // V готов в smem, дальше его читает MMA
+        }
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -1059,13 +1117,25 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
         }
         if (params.kv_is_q8) {
-            auto gv = q8_v(n_block); auto gvs = q8_vs(n_block);
-            flash::copy_dequant_q8</*Is_even_MN=*/true, Is_even_K>(gv, gvs, tVsV, tKVcKV, tKVpKV);
+            auto gv = q8_v(n_block);
+            Tensor tVgV8 = gmem_thr_copy_q8.partition_S(gv);
+            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_q8, tVgV8, tVsV8, tKVcKV8, tKVpKV8);
         } else {
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
         }
         cute::cp_async_fence();
 
+        // Распаковка int8 -> половинная точность. Стоит здесь, между выдачей
+        // следующей копии и умножением: так она перекрывается с загрузкой,
+        // а не конкурирует с ней. Строки за пределами длины обнуляем —
+        // иначе чтение масштаба ушло бы за границу массива.
+        if (params.kv_is_q8) {
+            auto gs_k = q8_ks(n_block);
+            flash::copy_dequant_q8</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
+                sK8, gs_k, tKsK, tKVcKV, tKVpKV,
+                binfo.actual_seqlen_k - n_block * kBlockN);
+            __syncthreads();  // K готов в smem, дальше его читает MMA
+        }
         flash::gemm(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -1088,8 +1158,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
             }
             if (params.kv_is_q8) {
-                auto gk = q8_k(n_block - 1); auto gs = q8_ks(n_block - 1);
-                flash::copy_dequant_q8</*Is_even_MN=*/true, Is_even_K>(gk, gs, tKsK, tKVcKV, tKVpKV);
+                auto gk = q8_k(n_block - 1);
+                Tensor tKgK8 = gmem_thr_copy_q8.partition_S(gk);
+                flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_q8, tKgK8, tKsK8, tKVcKV8, tKVpKV8);
             } else {
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
             }
@@ -1108,6 +1179,17 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
 
+        // Распаковка int8 -> половинная точность. Стоит здесь, между выдачей
+        // следующей копии и умножением: так она перекрывается с загрузкой,
+        // а не конкурирует с ней. Строки за пределами длины обнуляем —
+        // иначе чтение масштаба ушло бы за границу массива.
+        if (params.kv_is_q8) {
+            auto gs_v = q8_vs(n_block);
+            flash::copy_dequant_q8</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
+                sV8, gs_v, tVsV, tKVcKV, tKVpKV,
+                binfo.actual_seqlen_k - n_block * kBlockN);
+            __syncthreads();  // V готов в smem, дальше его читает MMA
+        }
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
