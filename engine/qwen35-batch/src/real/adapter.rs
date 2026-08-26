@@ -158,9 +158,14 @@ enum PgraphMode {
 fn pgraph_mode() -> PgraphMode {
     static MODE: std::sync::OnceLock<PgraphMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("QWEN36_PGRAPH").as_deref() {
-        Ok("1") | Ok("on") => PgraphMode::On,
+        Ok("0") | Ok("off") => PgraphMode::Off,
         Ok("check") => PgraphMode::Check,
-        _ => PgraphMode::Off,
+        // Умолчание — включено. Graph-префилл пишет KV прямо в paged-пул,
+        // минуя batched-кэш и его миграцию: замер 2026-08-26 на 9B при
+        // ctx=65536 дал VRAM 10393 -> 8016 МБ, окно пула 14016 -> 65536
+        // (то есть скольжение окна прекратилось) и декод 18.8 -> 39.1 ток/с.
+        // Перплексия совпадает до знака. Откат — QWEN36_PGRAPH=off.
+        _ => PgraphMode::On,
     })
 }
 
@@ -902,6 +907,11 @@ impl BatchModel for Qwen35BatchAdapter {
             // (он пуст после graph-префилла) затёрла бы его.
             self.paged_dirty[sidx] = false;
             self.pg_paged_only[sidx] = true;
+            // Отмечаем длину: batched-кэша нет, но пул её знает, и обратная
+            // миграция должна знать, сколько восстанавливать, если понадобится
+            // eager-путь.
+            self.model
+                .set_kv_len_batched(sidx, chunk.start_pos + chunk.tokens.len());
         } else if pg_logits.is_some() {
             // check-режим: авторитет — batched KV eager-пути, пул пересоберётся.
             self.paged_dirty[sidx] = true;
@@ -1008,28 +1018,16 @@ impl BatchModel for Qwen35BatchAdapter {
         }
         // Hidden decode_batch'а больше не нужен MTP: verify идёт через
         // speculative_verify (multi-token), hidden собирает speculative_accept.
-        #[cfg(feature = "cuda")]
-        if let Some(it) = batch
-            .items
-            .iter()
-            .find(|it| self.pg_paged_only[it.slot_idx])
-        {
-            // graph-префилл писал KV только в пул и не вёл хостовую длину,
-            // поэтому собрать batched-кэш обратно нечем.
-            return Err(anyhow!(
-                "slot {}: KV после graph-префилла живёт только в paged pool — \
-                 eager decode дал бы мусор (нужны CUDA-графы декода)",
-                it.slot_idx
-            ));
-        }
-        // После миграции KV в пул batched-кэш освобождён (он стоит ~84 КБ на
-        // токен промпта). Eager-путь без него не работает — собираем обратно
-        // из пула. Ничего не делает, если кэш на месте.
+        // Авторитетная копия KV может жить только в пуле: после миграции
+        // batched-кэш освобождён, а после graph-префилла его и не было.
+        // Eager-путь без кэша не работает — собираем его из пула. Ничего не
+        // делает, если кэш на месте.
         #[cfg(feature = "cuda")]
         for it in batch.items.iter() {
             self.model
                 .rehydrate_kv_from_paged(it.slot_idx)
                 .map_err(|e| anyhow!("rehydrate KV slot {}: {e}", it.slot_idx))?;
+            self.pg_paged_only[it.slot_idx] = false;
         }
         let logits = self
             .model

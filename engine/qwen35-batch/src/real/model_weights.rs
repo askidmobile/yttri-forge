@@ -8020,6 +8020,22 @@ impl ModelWeights {
         Ok(len)
     }
 
+    /// Записать хостовую длину KV слота, не трогая сам кэш.
+    ///
+    /// Нужна graph-префиллу: он пишет KV прямо в пул и batched-кэш не создаёт,
+    /// поэтому без этой отметки обратная миграция не знала бы, сколько токенов
+    /// восстанавливать, и eager-путь оставался бы закрыт.
+    #[cfg(feature = "cuda")]
+    pub fn set_kv_len_batched(&mut self, slot: usize, len: usize) {
+        for block in self.blocks.iter_mut() {
+            if let HybridLayerType::Attention(a) = &mut block.layer {
+                if slot < a.kv_cache_len_batched.len() {
+                    a.kv_cache_len_batched[slot] = len;
+                }
+            }
+        }
+    }
+
     /// Собрать batched-кэш слота обратно из paged-пула.
     ///
     /// Обратная к `migrate_kv_to_paged`. Нужна, чтобы после переноса KV в пул
