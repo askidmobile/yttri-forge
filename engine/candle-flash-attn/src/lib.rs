@@ -461,9 +461,6 @@ struct FlashAttnVarLen {
     pub seqlens_q: Tensor,
     pub seqlens_k: Tensor,
     pub block_table: Option<Tensor>,
-    /// Масштабы int8-пула: (k_scale, v_scale, шаг_по_блоку, шаг_по_токену).
-    /// Тензоры [num_blocks*page_size*n_kv] half. None — обычный F16-пул.
-    pub kv_q8_scales: Option<(Tensor, Tensor, u32, u32)>,
     pub mm_prefix_ranges: Option<Tensor>,
     pub page_block_size: Option<usize>,
     pub alibi_slopes: Option<Tensor>,
@@ -743,39 +740,6 @@ impl FlashAttnVarLen {
             let (softmax_lse_ptr, _guard) = softmax_lse.device_ptr_mut(&stream);
             let (seqlens_q_ptr, _guard) = seqlens_q.device_ptr(&stream);
             let (seqlens_k_ptr, _guard) = seqlens_k.device_ptr(&stream);
-            // Масштабы int8-пула. Держим guard'ы живыми до конца вызова.
-            let q8_storages = match self.kv_q8_scales.as_ref() {
-                Some((ks, vs, bs, rs)) => {
-                    let (ks_st, ks_l) = ks.storage_and_layout();
-                    let (vs_st, vs_l) = vs.storage_and_layout();
-                    Some((ks_st, ks_l, vs_st, vs_l, *bs, *rs))
-                }
-                None => None,
-            };
-            let mut _q8_guards = Vec::new();
-            let kv_q8: Option<(*const core::ffi::c_void, *const core::ffi::c_void, u32, u32)> =
-                match q8_storages.as_ref() {
-                    Some((ks_st, ks_l, vs_st, vs_l, bs, rs)) => {
-                        let (candle::Storage::Cuda(kc), candle::Storage::Cuda(vc)) =
-                            (&***ks_st, &***vs_st)
-                        else {
-                            candle::bail!("kv_q8_scales must be CUDA tensors")
-                        };
-                        let kslice = kc.as_cuda_slice::<half::f16>()?.slice(ks_l.start_offset()..);
-                        let vslice = vc.as_cuda_slice::<half::f16>()?.slice(vs_l.start_offset()..);
-                        let (kp, g1) = kslice.device_ptr(&stream);
-                        let (vp, g2) = vslice.device_ptr(&stream);
-                        _q8_guards.push(g1);
-                        _q8_guards.push(g2);
-                        Some((
-                            kp as *const core::ffi::c_void,
-                            vp as *const core::ffi::c_void,
-                            *bs,
-                            *rs,
-                        ))
-                    }
-                    None => None,
-                };
             let (block_table_ptr, block_table_batch_stride) =
                 if let Some((block_table, offset, stride)) = block_table.as_ref() {
                     match (&**block_table, self.block_table.as_ref().unwrap().dtype()) {
@@ -857,13 +821,15 @@ impl FlashAttnVarLen {
                 /* mm_prefix_ranges_ptr */ mm_prefix_ranges_ptr,
                 /* mm_prefix_range_batch_stride */ mm_prefix_range_batch_stride,
                 /* max_mm_prefix_ranges */ max_mm_prefix_ranges,
-                /* k_scale_ptr */ kv_q8.map(|q| q.0).unwrap_or(std::ptr::null()),
-                /* v_scale_ptr */ kv_q8.map(|q| q.1).unwrap_or(std::ptr::null()),
-                /* k_scale_batch_stride */ kv_q8.map(|q| q.2).unwrap_or(0),
-                /* k_scale_row_stride */ kv_q8.map(|q| q.3).unwrap_or(0),
-                /* v_scale_batch_stride */ kv_q8.map(|q| q.2).unwrap_or(0),
-                /* v_scale_row_stride */ kv_q8.map(|q| q.3).unwrap_or(0),
-                /* kv_is_q8 */ if kv_q8.is_some() { 1 } else { 0 },
+                // int8-пул идёт своим вызовом (real::paged_attn), не через эту
+                // обёртку: ей мешают дженерики по dtype.
+                /* k_scale_ptr */ std::ptr::null(),
+                /* v_scale_ptr */ std::ptr::null(),
+                /* k_scale_batch_stride */ 0,
+                /* k_scale_row_stride */ 0,
+                /* v_scale_batch_stride */ 0,
+                /* v_scale_row_stride */ 0,
+                /* kv_is_q8 */ 0,
                 /* stream_ptr */ stream.cu_stream() as *mut core::ffi::c_void,
             )
         }
@@ -943,7 +909,6 @@ pub fn flash_attn_varlen(
     let window_size_right = if causal { Some(0) } else { None };
 
     let op = FlashAttnVarLen {
-        kv_q8_scales: None,
         softmax_scale,
         max_seqlen_q,
         max_seqlen_k,
@@ -1001,7 +966,6 @@ pub fn flash_attn_varlen_windowed(
     window_size_right: Option<usize>,
 ) -> Result<Tensor> {
     let op = FlashAttnVarLen {
-        kv_q8_scales: None,
         softmax_scale,
         max_seqlen_q,
         max_seqlen_k,
@@ -1059,7 +1023,6 @@ pub fn flash_attn_varlen_paged_windowed(
     softcap: Option<f32>,
 ) -> Result<Tensor> {
     let op = FlashAttnVarLen {
-        kv_q8_scales: None,
         softmax_scale,
         max_seqlen_q,
         max_seqlen_k,
@@ -1114,7 +1077,6 @@ pub fn flash_attn_varlen_alibi(
     let window_size_right = if causal { Some(0) } else { None };
 
     let op = FlashAttnVarLen {
-        kv_q8_scales: None,
         softmax_scale,
         max_seqlen_q,
         max_seqlen_k,
@@ -1174,7 +1136,6 @@ pub fn flash_attn_varlen_alibi_windowed(
     window_size_right: Option<usize>,
 ) -> Result<Tensor> {
     let op = FlashAttnVarLen {
-        kv_q8_scales: None,
         softmax_scale,
         max_seqlen_q,
         max_seqlen_k,
@@ -1236,7 +1197,6 @@ pub fn flash_attn_varlen_alibi_windowed_softcap(
     softcap: f32,
 ) -> Result<Tensor> {
     let op = FlashAttnVarLen {
-        kv_q8_scales: None,
         softmax_scale,
         max_seqlen_q,
         max_seqlen_k,
