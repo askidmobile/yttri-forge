@@ -24,6 +24,9 @@ pub mod model_weights;
 pub mod moe;
 pub mod mtp;
 pub mod multimodal;
+/// Постраничное внимание своим вызовом, мимо op-механики candle.
+#[cfg(feature = "cuda")]
+pub mod paged_attn;
 /// Paged KV decode + CUDA graph plumbing.
 #[cfg(feature = "cuda")]
 pub mod paged_kv_cuda;

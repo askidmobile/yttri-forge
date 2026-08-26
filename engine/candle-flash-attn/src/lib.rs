@@ -1,4 +1,6 @@
-mod ffi;
+/// Прямой доступ к ядру: постраничному вниманию op-механика candle не нужна,
+/// а её дженерики по dtype мешают подать байтовый int8-пул.
+pub mod ffi;
 
 use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
