@@ -7593,9 +7593,14 @@ impl ModelWeights {
         let max_blocks = window.div_ceil(ps);
         let num_blocks = capacity_b * max_blocks;
         let pool_vram_mb = (num_blocks * ps * num_attn_layers * 2 * n_kv * hd * 2) / (1024 * 1024);
-        log::info!(
-            "[qwen35-batch] auto paged decode: window={window} (max_blocks={max_blocks}, pool_vram={pool_vram_mb}MB, served_ctx={served_ctx}, model_window={model_attn_window}, free_vram={:.0}MB)",
-            free_vram as f64 / (1024.0 * 1024.0)
+        // Печатаем всегда: если окно оказалось меньше обслуживаемого контекста,
+        // движок начнёт вытеснять блоки — это скольжение окна, а не длинный
+        // контекст, и в отчёте это должно быть видно, а не угадываться.
+        eprintln!(
+            "[kv] paged pool: window={window} blocks={max_blocks} pool={pool_vram_mb}MB served_ctx={} model_window={model_attn_window} free={:.0}MB{}",
+            if served_ctx == usize::MAX { "unset".to_string() } else { served_ctx.to_string() },
+            free_vram as f64 / (1024.0 * 1024.0),
+            if served_ctx != usize::MAX && window < served_ctx { "  WARN: окно меньше контекста, будет вытеснение" } else { "" }
         );
 
         let ctx = crate::real::paged_kv_cuda::PagedModelCtx::new(cuda_dev, capacity_b, max_blocks)?;
