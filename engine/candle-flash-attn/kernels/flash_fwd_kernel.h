@@ -531,7 +531,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, bool Is_kv_q8, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
@@ -937,7 +937,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    if (params.kv_is_q8) {
+    if constexpr (Is_kv_q8) {
         auto gk = q8_k(n_block);
         Tensor tKgK8 = gmem_thr_copy_q8.partition_S(gk);
         flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_q8, tKgK8, tKsK8, tKVcKV8, tKVpKV8,
@@ -992,7 +992,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
                 tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
             }
-            if (params.kv_is_q8) {
+            if constexpr (Is_kv_q8) {
                 auto gv = q8_v(n_block);
                 Tensor tVgV8 = gmem_thr_copy_q8.partition_S(gv);
                 flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_q8, tVgV8, tVsV8, tKVcKV8, tKVpKV8);
@@ -1001,7 +1001,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             }
         } else {
             // Clear the smem tiles to account for predicated off loads
-            if (params.kv_is_q8) {
+            if constexpr (Is_kv_q8) {
                 auto gv = q8_v(n_block);
                 Tensor tVgV8 = gmem_thr_copy_q8.partition_S(gv);
                 flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
@@ -1019,7 +1019,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // следующей копии и умножением: так она перекрывается с загрузкой,
         // а не конкурирует с ней. Строки за пределами длины обнуляем —
         // иначе чтение масштаба ушло бы за границу массива.
-        if (params.kv_is_q8) {
+        if constexpr (Is_kv_q8) {
             auto gs_k = q8_ks(n_block);
             flash::copy_dequant_q8</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
                 sK8, gs_k, tKsK, tKVcKV, tKVpKV,
@@ -1056,7 +1056,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 const int block_table_offset_next =(n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
                 tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
             }
-            if (params.kv_is_q8) {
+            if constexpr (Is_kv_q8) {
                 auto gk = q8_k(n_block - 1);
                 Tensor tKgK8 = gmem_thr_copy_q8.partition_S(gk);
                 flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_q8, tKgK8, tKsK8, tKVcKV8, tKVpKV8);
@@ -1084,7 +1084,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // следующей копии и умножением: так она перекрывается с загрузкой,
         // а не конкурирует с ней. Строки за пределами длины обнуляем —
         // иначе чтение масштаба ушло бы за границу массива.
-        if (params.kv_is_q8) {
+        if constexpr (Is_kv_q8) {
             auto gs_v = q8_vs(n_block);
             flash::copy_dequant_q8</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
                 sV8, gs_v, tVsV, tKVcKV, tKVpKV,
@@ -1116,7 +1116,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
             tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
         }
-        if (params.kv_is_q8) {
+        if constexpr (Is_kv_q8) {
             auto gv = q8_v(n_block);
             Tensor tVgV8 = gmem_thr_copy_q8.partition_S(gv);
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_q8, tVgV8, tVsV8, tKVcKV8, tKVpKV8);
@@ -1129,7 +1129,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // следующей копии и умножением: так она перекрывается с загрузкой,
         // а не конкурирует с ней. Строки за пределами длины обнуляем —
         // иначе чтение масштаба ушло бы за границу массива.
-        if (params.kv_is_q8) {
+        if constexpr (Is_kv_q8) {
             auto gs_k = q8_ks(n_block);
             flash::copy_dequant_q8</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
                 sK8, gs_k, tKsK, tKVcKV, tKVpKV,
@@ -1157,7 +1157,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
                 tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
             }
-            if (params.kv_is_q8) {
+            if constexpr (Is_kv_q8) {
                 auto gk = q8_k(n_block - 1);
                 Tensor tKgK8 = gmem_thr_copy_q8.partition_S(gk);
                 flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_q8, tKgK8, tKsK8, tKVcKV8, tKVpKV8);
@@ -1183,7 +1183,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // следующей копии и умножением: так она перекрывается с загрузкой,
         // а не конкурирует с ней. Строки за пределами длины обнуляем —
         // иначе чтение масштаба ушло бы за границу массива.
-        if (params.kv_is_q8) {
+        if constexpr (Is_kv_q8) {
             auto gs_v = q8_vs(n_block);
             flash::copy_dequant_q8</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
                 sV8, gs_v, tVsV, tKVcKV, tKVpKV,
@@ -1294,7 +1294,7 @@ inline __device__ void compute_attn(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, bool Is_kv_q8, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1303,7 +1303,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV, Is_kv_q8>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
