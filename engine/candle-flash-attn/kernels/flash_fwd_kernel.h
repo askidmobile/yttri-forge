@@ -651,6 +651,45 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
                             make_stride(params.v_row_stride, _1{}));
 
+    // int8-пул: адрес тайла считаем из n_block прямо на месте загрузки, а не
+    // ведём параллельные указатели через все точки продвижения. Страница (64) и
+    // тайл kBlockN (32/64) выровнены, поэтому тайл никогда не пересекает
+    // границу страницы — на этом же свойстве держится и одиночный поиск в
+    // block_table у F16-пути.
+    auto q8_tile_offset = [&](int nb, index_t batch_stride, index_t row_stride, index_t head_stride) {
+        const int bt_idx = block_table == nullptr ? 0 : nb * kBlockN / params.page_block_size;
+        const int bt_off = block_table == nullptr ? 0 : nb * kBlockN - bt_idx * params.page_block_size;
+        return block_table == nullptr
+            ? binfo.k_offset(batch_stride, row_stride, bidb_cache)
+              + nb * kBlockN * row_stride + (bidh / params.h_h_k_ratio) * head_stride
+            : block_table[bt_idx] * batch_stride + bt_off * row_stride
+              + (bidh / params.h_h_k_ratio) * head_stride;
+    };
+    auto q8_k = [&](int nb) {
+        return make_tensor(
+            make_gmem_ptr(reinterpret_cast<const int8_t *>(params.k_ptr)
+                          + q8_tile_offset(nb, params.k_batch_stride, params.k_row_stride, params.k_head_stride)),
+            Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_stride(params.k_row_stride, _1{}));
+    };
+    auto q8_v = [&](int nb) {
+        return make_tensor(
+            make_gmem_ptr(reinterpret_cast<const int8_t *>(params.v_ptr)
+                          + q8_tile_offset(nb, params.v_batch_stride, params.v_row_stride, params.v_head_stride)),
+            Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_stride(params.v_row_stride, _1{}));
+    };
+    auto q8_ks = [&](int nb) {
+        return make_tensor(
+            make_gmem_ptr(reinterpret_cast<const Element *>(params.k_scale_ptr)
+                          + q8_tile_offset(nb, params.k_scale_batch_stride, params.k_scale_row_stride, params.k_scale_head_stride)),
+            Shape<Int<kBlockN>>{}, make_stride(params.k_scale_row_stride));
+    };
+    auto q8_vs = [&](int nb) {
+        return make_tensor(
+            make_gmem_ptr(reinterpret_cast<const Element *>(params.v_scale_ptr)
+                          + q8_tile_offset(nb, params.v_scale_batch_stride, params.v_scale_row_stride, params.v_scale_head_stride)),
+            Shape<Int<kBlockN>>{}, make_stride(params.v_scale_row_stride));
+    };
+
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
     Tensor sK = make_tensor(sQ.data() + size(sQ), typename Kernel_traits::SmemLayoutKV{});
@@ -867,8 +906,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+    if (params.kv_is_q8) {
+        auto gk = q8_k(n_block); auto gs = q8_ks(n_block);
+        flash::copy_dequant_q8<Is_even_MN, Is_even_K>(gk, gs, tKsK, tKVcKV, tKVpKV,
+                                                      binfo.actual_seqlen_k - n_block * kBlockN);
+    } else {
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
+    }
     cute::cp_async_fence();
 
     // flash::cp_async_wait<0>();
@@ -915,12 +960,23 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
                 tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
             }
+            if (params.kv_is_q8) {
+                auto gv = q8_v(n_block); auto gvs = q8_vs(n_block);
+                flash::copy_dequant_q8</*Is_even_MN=*/true, Is_even_K>(gv, gvs, tVsV, tKVcKV, tKVpKV);
+            } else {
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+            }
         } else {
             // Clear the smem tiles to account for predicated off loads
+            if (params.kv_is_q8) {
+                auto gv = q8_v(n_block); auto gvs = q8_vs(n_block);
+                flash::copy_dequant_q8<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+                    gv, gvs, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN);
+            } else {
             flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
                 gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
             );
+            }
         }
         cute::cp_async_fence();
 
@@ -954,7 +1010,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 const int block_table_offset_next =(n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
                 tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
             }
+            if (params.kv_is_q8) {
+                auto gk = q8_k(n_block - 1); auto gs = q8_ks(n_block - 1);
+                flash::copy_dequant_q8</*Is_even_MN=*/true, Is_even_K>(gk, gs, tKsK, tKVcKV, tKVpKV);
+            } else {
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+            }
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
@@ -997,7 +1058,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
             tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
         }
+        if (params.kv_is_q8) {
+            auto gv = q8_v(n_block); auto gvs = q8_vs(n_block);
+            flash::copy_dequant_q8</*Is_even_MN=*/true, Is_even_K>(gv, gvs, tVsV, tKVcKV, tKVpKV);
+        } else {
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+        }
         cute::cp_async_fence();
 
         flash::gemm(
@@ -1021,7 +1087,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
                 tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
             }
+            if (params.kv_is_q8) {
+                auto gk = q8_k(n_block - 1); auto gs = q8_ks(n_block - 1);
+                flash::copy_dequant_q8</*Is_even_MN=*/true, Is_even_K>(gk, gs, tKsK, tKVcKV, tKVpKV);
+            } else {
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+            }
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();

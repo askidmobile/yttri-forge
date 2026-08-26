@@ -139,6 +139,20 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ alibi_slopes_ptr;
     index_t alibi_slopes_batch_stride;
 
+    // ── int8 постраничный KV ──────────────────────────────────────────────
+    // Пул хранит K/V как int8 с масштабом на пару (токен, голова). Раскладка
+    // масштабов зеркалит пул: [num_blocks, page_size, n_kv], поэтому шаги
+    // отличаются от K/V только отсутствием измерения head_dim.
+    void *__restrict__ k_scale_ptr;
+    void *__restrict__ v_scale_ptr;
+    index_t k_scale_batch_stride;
+    index_t k_scale_row_stride;
+    index_t k_scale_head_stride;
+    index_t v_scale_batch_stride;
+    index_t v_scale_row_stride;
+    index_t v_scale_head_stride;
+    bool kv_is_q8;
+
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
 };

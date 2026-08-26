@@ -291,6 +291,50 @@ void cp_async_wait() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Загрузка int8 K/V из постраничного пула с распаковкой прямо в разделяемую
+// память.
+//
+// Тайловое копирование cute здесь не подходит: его атом настроен на 128-битные
+// куски `Element` (half), а у байтов другая ширина вектора, и партиционирование
+// дало бы неверную раскладку. Поэтому идём по координатам назначения и читаем
+// int8 поэлементно. Смем-сторона от этого медленнее (нет cp.async), зато трафик
+// из глобальной памяти вдвое меньше — а декод упирается именно в него.
+//
+// Масштаб один на строку тайла (токен): 256 значений головы делят множитель.
+template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false,
+          typename EngineD, typename LayoutD, typename EngineI, typename LayoutI,
+          typename EngineS, typename LayoutS, typename EngineC, typename LayoutC,
+          typename EngineP, typename LayoutP>
+__forceinline__ __device__ void copy_dequant_q8(
+    Tensor<EngineI, LayoutI> const &src_i8,   // (kBlockN, kHeadDim) int8 gmem
+    Tensor<EngineS, LayoutS> const &scales,   // (kBlockN) half gmem
+    Tensor<EngineD, LayoutD> &D,              // партиционированный smem
+    Tensor<EngineC, LayoutC> const &identity_MN,
+    Tensor<EngineP, LayoutP> const &predicate_K,
+    const int max_MN = 0)
+{
+    using ElemD = typename EngineD::value_type;
+    #pragma unroll
+    for (int m = 0; m < size<1>(D); ++m) {
+        const int row = get<0>(identity_MN(0, m, 0));
+        const bool row_ok = Is_even_MN || row < max_MN;
+        const float s = row_ok ? static_cast<float>(scales(row)) : 0.f;
+        #pragma unroll
+        for (int k = 0; k < size<2>(D); ++k) {
+            const bool k_ok = Is_even_K || predicate_K(k);
+            #pragma unroll
+            for (int i = 0; i < size<0>(D); ++i) {
+                if (row_ok && k_ok) {
+                    const int col = get<1>(identity_MN(i, m, k));
+                    D(i, m, k) = static_cast<ElemD>(static_cast<float>(src_i8(row, col)) * s);
+                } else if (Clear_OOB_MN || !k_ok) {
+                    D(i, m, k) = ElemD(0.f);
+                }
+            }
+        }
+    }
+}
+
 template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
           typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>
