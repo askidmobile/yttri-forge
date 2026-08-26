@@ -7997,15 +7997,18 @@ impl ModelWeights {
         // Цена хранения двух копий не «актуальна только на 27B», как считалось:
         // замер 2026-08-26 на 4B дал 84 КБ на токен промпта сверх пула, то есть
         // 3.9 ГБ при 44K токенов — больше, чем сам пул на том же контексте.
+        let mut freed = 0usize;
         if len > 0 {
             for block in self.blocks.iter_mut() {
                 if let HybridLayerType::Attention(a) = &mut block.layer {
-                    if a.kv_cache_len_batched[slot] > 0 {
+                    if a.kv_cache_len_batched[slot] > 0 && a.kv_cache_batched[slot].is_some() {
                         a.kv_cache_batched[slot] = None;
+                        freed += 1;
                     }
                 }
             }
         }
+        eprintln!("[kv] migrate slot {slot}: len={len}, освобождено кэшей слоёв: {freed}");
         Ok(len)
     }
 
