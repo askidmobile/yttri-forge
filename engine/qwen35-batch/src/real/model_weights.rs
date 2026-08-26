@@ -8021,11 +8021,12 @@ impl ModelWeights {
     /// F16, и обратное квантование только потеряло бы точность.
     #[cfg(feature = "cuda")]
     pub fn rehydrate_kv_from_paged(&mut self, slot: usize) -> Result<()> {
-        let mb = self
-            .paged_ctx
-            .as_ref()
-            .ok_or_else(|| candle_core::Error::Msg("rehydrate: paged ctx missing".into()))?
-            .max_blocks;
+        // Без пула восстанавливать нечего и не из чего: путь без графов
+        // работает на batched-кэше, и вызов здесь должен быть пустым.
+        let Some(ctx) = self.paged_ctx.as_ref() else {
+            return Ok(());
+        };
+        let mb = ctx.max_blocks;
         let ps = crate::real::paged_kv_cuda::PAGE_SIZE;
         for block in self.blocks.iter_mut() {
             let HybridLayerType::Attention(a) = &mut block.layer else {

@@ -1534,6 +1534,12 @@ impl Qwen35BatchAdapter {
                     .model
                     .migrate_kv_to_paged(sidx)
                     .map_err(|e| anyhow!("migrate KV slot {sidx}: {e}"))?;
+                // Освобождённый batched-кэш возвращаем ОС: без trim страницы
+                // остаются в пуле драйвера и экономии не видно.
+                #[cfg(feature = "cuda")]
+                if let Device::Cuda(c) = &self.device {
+                    let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+                }
                 if len > window {
                     return Ok(None);
                 }
