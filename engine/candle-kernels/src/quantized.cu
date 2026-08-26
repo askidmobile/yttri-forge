@@ -7052,6 +7052,115 @@ extern "C" __global__ void kv_append_paged_f16_multi(
     }
 }
 
+// ── int8 paged KV ─────────────────────────────────────────────────────────
+//
+// Пул хранит K/V как int8 с масштабом на пару (токен, голова): 256 значений
+// головы делят один множитель, ровно как в существующем q8-пути KV. Байтов на
+// токен: hd + 2 против hd*2 у F16, то есть вдвое меньше — а пул после снятия
+// дублирования KV стал доминирующей статьёй VRAM (на 128K это 4 ГБ из 10).
+//
+// Масштаб симметричный: s = amax/127, значение = round(x/s), диапазон
+// [-127, 127]. Ноль представим точно, что важно для паддинга страниц.
+
+extern "C" __global__ void kv_append_paged_q8_multi(
+    signed char* __restrict__ k_pool,
+    signed char* __restrict__ v_pool,
+    half* __restrict__ k_scale,       // [num_blocks * page_size * n_kv]
+    half* __restrict__ v_scale,
+    const half* __restrict__ k_rows,  // [B, T, n_kv, hd]
+    const half* __restrict__ v_rows,
+    const unsigned int* __restrict__ block_table,  // [B, max_blocks]
+    const unsigned int* __restrict__ slots,        // [B]
+    unsigned int* __restrict__ kv_len,             // [S] in/out
+    const int b,
+    const int t,
+    const int n_kv,
+    const int hd,
+    const int page_size,
+    const int max_blocks,
+    const int window)
+{
+    const int bidx = blockIdx.y;
+    const int head = blockIdx.x;
+    const int row = blockIdx.z;
+    if (bidx >= b || head >= n_kv || row >= t) return;
+    const unsigned int slot = slots[bidx];
+    const unsigned int len = kv_len[slot] + (unsigned int)row;
+    if (len >= (unsigned int)window) return; // eviction guard: host falls back
+    const unsigned int page = block_table[bidx * max_blocks + len / page_size];
+    const unsigned int off = len % page_size;
+    const size_t token_idx = (size_t)page * page_size + off;
+    const size_t dst_base = token_idx * n_kv * hd + (size_t)head * hd;
+    const size_t scale_idx = token_idx * n_kv + (size_t)head;
+    const size_t src_base = (((size_t)bidx * t) + row) * n_kv * hd + (size_t)head * hd;
+    const half* k_src = k_rows + src_base;
+    const half* v_src = v_rows + src_base;
+
+    // Максимум по голове через редукцию блока фиксированным порядком.
+    __shared__ float sh_k[32];
+    __shared__ float sh_v[32];
+    float amax_k = 0.f, amax_v = 0.f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        amax_k = fmaxf(amax_k, fabsf(__half2float(k_src[i])));
+        amax_v = fmaxf(amax_v, fabsf(__half2float(v_src[i])));
+    }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (int off2 = 16; off2 > 0; off2 >>= 1) {
+        amax_k = fmaxf(amax_k, __shfl_down_sync(0xffffffff, amax_k, off2));
+        amax_v = fmaxf(amax_v, __shfl_down_sync(0xffffffff, amax_v, off2));
+    }
+    if (lane == 0) { sh_k[warp] = amax_k; sh_v[warp] = amax_v; }
+    __syncthreads();
+    const int warps = (blockDim.x + 31) >> 5;
+    if (threadIdx.x == 0) {
+        float mk = 0.f, mv = 0.f;
+        for (int w = 0; w < warps; ++w) { mk = fmaxf(mk, sh_k[w]); mv = fmaxf(mv, sh_v[w]); }
+        // Пустая голова: масштаб не должен быть нулём, иначе деление даст NaN.
+        sh_k[0] = mk > 0.f ? mk / 127.f : 1.f;
+        sh_v[0] = mv > 0.f ? mv / 127.f : 1.f;
+        k_scale[scale_idx] = __float2half(sh_k[0]);
+        v_scale[scale_idx] = __float2half(sh_v[0]);
+    }
+    __syncthreads();
+    const float ks = sh_k[0];
+    const float vs = sh_v[0];
+    signed char* k_dst = k_pool + dst_base;
+    signed char* v_dst = v_pool + dst_base;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        float kq = rintf(__half2float(k_src[i]) / ks);
+        float vq = rintf(__half2float(v_src[i]) / vs);
+        k_dst[i] = (signed char)fminf(fmaxf(kq, -127.f), 127.f);
+        v_dst[i] = (signed char)fminf(fmaxf(vq, -127.f), 127.f);
+    }
+}
+
+// Распаковка диапазона токенов пула обратно в F16 [n, n_kv, hd].
+// Нужна обратной миграции и сверке точности.
+extern "C" __global__ void kv_pool_dequant_q8(
+    const signed char* __restrict__ pool,
+    const half* __restrict__ scale,
+    half* __restrict__ out,           // [n, n_kv, hd]
+    const unsigned int* __restrict__ block_table,  // [max_blocks] одного слота
+    const int n,                      // сколько токенов распаковать
+    const int n_kv,
+    const int hd,
+    const int page_size)
+{
+    const int token = blockIdx.x;
+    const int head = blockIdx.y;
+    if (token >= n || head >= n_kv) return;
+    const unsigned int page = block_table[token / page_size];
+    const unsigned int off = token % page_size;
+    const size_t src_token = (size_t)page * page_size + off;
+    const signed char* src = pool + src_token * n_kv * hd + (size_t)head * hd;
+    const float s = __half2float(scale[src_token * n_kv + (size_t)head]);
+    half* dst = out + ((size_t)token * n_kv + head) * hd;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        dst[i] = __float2half((float)src[i] * s);
+    }
+}
+
 // Cumulative seqlens_k for varlen FA2 from device kv_len. kv_len is the
 // pre-step length; FA2 must see len+1 (the row appended this step).
 extern "C" __global__ void cumsum_seqlens_from_kvlen(
