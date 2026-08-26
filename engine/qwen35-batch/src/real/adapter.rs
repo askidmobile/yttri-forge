@@ -1014,11 +1014,22 @@ impl BatchModel for Qwen35BatchAdapter {
             .iter()
             .find(|it| self.pg_paged_only[it.slot_idx])
         {
+            // graph-префилл писал KV только в пул и не вёл хостовую длину,
+            // поэтому собрать batched-кэш обратно нечем.
             return Err(anyhow!(
                 "slot {}: KV после graph-префилла живёт только в paged pool — \
                  eager decode дал бы мусор (нужны CUDA-графы декода)",
                 it.slot_idx
             ));
+        }
+        // После миграции KV в пул batched-кэш освобождён (он стоит ~84 КБ на
+        // токен промпта). Eager-путь без него не работает — собираем обратно
+        // из пула. Ничего не делает, если кэш на месте.
+        #[cfg(feature = "cuda")]
+        for it in batch.items.iter() {
+            self.model
+                .rehydrate_kv_from_paged(it.slot_idx)
+                .map_err(|e| anyhow!("rehydrate KV slot {}: {e}", it.slot_idx))?;
         }
         let logits = self
             .model

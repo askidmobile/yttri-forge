@@ -4170,6 +4170,15 @@ impl GatedAttentionLayer {
             let q = &q_slots[bidx];
             let row = &cache_rows[bidx];
             if self.kv_cache_batched[slot].is_none() {
+                // Кэш освобождён после миграции в пул, а длина ненулевая —
+                // обнулить её здесь значило бы молча потерять контекст и
+                // выдать мусор. Восстановление делает адаптер до захода сюда.
+                if self.kv_cache_len_batched[slot] > 0 {
+                    candle_core::bail!(
+                        "slot {slot}: batched KV освобождён (len={}), нужен rehydrate_kv_from_paged",
+                        self.kv_cache_len_batched[slot]
+                    );
+                }
                 let init_cap = 512.min(self.attn_window); // Revert: pre-alloc 40960*5B*10attn*2slots = 8.4 GB — catastrophically too much for 12GB VRAM
                 self.kv_cache_batched[slot] = Some(row.empty_like(
                     init_cap,
@@ -7978,11 +7987,117 @@ impl ModelWeights {
                 }
             }
         }
-        // ВАЖНО: НЕ освобождаем kv_cache_batched после миграции (ранняя правка
-        // 2026-08-24 делала None): любой eager-fallback после миграции требует
-        // batched кэш — без него запрос умирает ("cache length 0"). Double-VRAM
-        // актуален только на 27B@12GB, где graphs всё равно OFF.
+        // Освобождаем batched-кэш: после миграции авторитетная копия KV — пул.
+        //
+        // Ранняя правка 2026-08-24 тоже это делала и была откачена, потому что
+        // eager-fallback без кэша умирал с "cache length 0". Теперь есть
+        // обратная миграция (`rehydrate_kv_from_paged`), и откат собирает кэш
+        // из пула — данные там те же.
+        //
+        // Цена хранения двух копий не «актуальна только на 27B», как считалось:
+        // замер 2026-08-26 на 4B дал 84 КБ на токен промпта сверх пула, то есть
+        // 3.9 ГБ при 44K токенов — больше, чем сам пул на том же контексте.
+        if len > 0 {
+            for block in self.blocks.iter_mut() {
+                if let HybridLayerType::Attention(a) = &mut block.layer {
+                    if a.kv_cache_len_batched[slot] > 0 {
+                        a.kv_cache_batched[slot] = None;
+                    }
+                }
+            }
+        }
         Ok(len)
+    }
+
+    /// Собрать batched-кэш слота обратно из paged-пула.
+    ///
+    /// Обратная к `migrate_kv_to_paged`. Нужна, чтобы после переноса KV в пул
+    /// можно было освободить batched-кэш: он стоит ~84 КБ на токен промпта и
+    /// при длинном контексте съедает больше, чем сам пул. Eager-путь без кэша
+    /// не работает, поэтому перед откатом кэш собирается заново — данные в
+    /// пуле те же самые.
+    ///
+    /// Собирает всегда F16, даже если модель настроена на Q8-кэш: пул хранит
+    /// F16, и обратное квантование только потеряло бы точность.
+    #[cfg(feature = "cuda")]
+    pub fn rehydrate_kv_from_paged(&mut self, slot: usize) -> Result<()> {
+        let mb = self
+            .paged_ctx
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("rehydrate: paged ctx missing".into()))?
+            .max_blocks;
+        let ps = crate::real::paged_kv_cuda::PAGE_SIZE;
+        for block in self.blocks.iter_mut() {
+            let HybridLayerType::Attention(a) = &mut block.layer else {
+                continue;
+            };
+            let kv_len = a.kv_cache_len_batched[slot];
+            if kv_len == 0 || a.kv_cache_batched[slot].is_some() {
+                continue;
+            }
+            let n_kv = a.n_kv_head;
+            let hd = a.head_dim;
+            let elem_per_token = n_kv * hd;
+            let cap = (kv_len + 512).min(a.attn_window);
+            let pool = a
+                .paged_pool
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::Msg("rehydrate: paged pool missing".into()))?;
+            let device = pool.k_pool.device().clone();
+            let k = Tensor::zeros((1, cap, n_kv, hd), DType::F16, &device)?;
+            let v = Tensor::zeros((1, cap, n_kv, hd), DType::F16, &device)?;
+
+            let (kp_st, _) = pool.k_pool.storage_and_layout();
+            let (vp_st, _) = pool.v_pool.storage_and_layout();
+            let (k_st, k_l) = k.storage_and_layout();
+            let (v_st, v_l) = v.storage_and_layout();
+            if let (
+                candle_core::Storage::Cuda(kpc),
+                candle_core::Storage::Cuda(vpc),
+                candle_core::Storage::Cuda(kc),
+                candle_core::Storage::Cuda(vc),
+            ) = (&*kp_st, &*vp_st, &*k_st, &*v_st)
+            {
+                let kp_src = kpc.as_cuda_slice::<half::f16>()?;
+                let vp_src = vpc.as_cuda_slice::<half::f16>()?;
+                let k_dst = kc.as_cuda_slice::<half::f16>()?;
+                let v_dst = vc.as_cuda_slice::<half::f16>()?;
+                let stream = kc.device.cuda_stream();
+                let (kp_src_ptr, _) = cudarc::driver::DevicePtr::device_ptr(kp_src, &stream);
+                let (vp_src_ptr, _) = cudarc::driver::DevicePtr::device_ptr(vp_src, &stream);
+                let (k_dst_ptr, _) = cudarc::driver::DevicePtr::device_ptr(k_dst, &stream);
+                let (v_dst_ptr, _) = cudarc::driver::DevicePtr::device_ptr(v_dst, &stream);
+
+                let pages = kv_len.div_ceil(ps);
+                for page in 0..pages {
+                    let start = page * ps;
+                    let n = (kv_len - start).min(ps);
+                    let phys = slot * mb + page;
+                    let src_start = (phys * ps) * elem_per_token;
+                    let dst_start = k_l.start_offset() + start * elem_per_token;
+                    let dst_v_start = v_l.start_offset() + start * elem_per_token;
+                    let count_bytes = n * elem_per_token * 2; // f16 = 2 байта
+                    unsafe {
+                        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                            k_dst_ptr + (dst_start * 2) as u64,
+                            kp_src_ptr + (src_start * 2) as u64,
+                            count_bytes,
+                            stream.cu_stream(),
+                        );
+                        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                            v_dst_ptr + (dst_v_start * 2) as u64,
+                            vp_src_ptr + (src_start * 2) as u64,
+                            count_bytes,
+                            stream.cu_stream(),
+                        );
+                    }
+                }
+            } else {
+                candle_core::bail!("rehydrate: ожидались CUDA-тензоры");
+            }
+            a.kv_cache_batched[slot] = Some(BatchedKvCache::F16(F16KvCache { k, v }));
+        }
+        Ok(())
     }
 
     pub(crate) fn shared_output(&self) -> QMatMul {
