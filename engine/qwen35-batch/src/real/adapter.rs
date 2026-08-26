@@ -1539,7 +1539,7 @@ impl Qwen35BatchAdapter {
                 // освобождать ещё нечего — trim без неё не делает ничего.
                 #[cfg(feature = "cuda")]
                 if let Device::Cuda(c) = &self.device {
-                    let _ = c.synchronize();
+                    let _ = c.cuda_stream().synchronize();
                     let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
                 }
                 if len > window {
