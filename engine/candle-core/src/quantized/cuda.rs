@@ -1855,7 +1855,16 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     };
     let dtype = T::DTYPE;
     let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
-    let mut inner = device.alloc_zeros::<u8>(padded_len)?;
+    // Буфер целиком перезаписывается данными, кроме хвоста-паддинга. Паддинг
+    // существует, чтобы матмуль-ядра могли безопасно читать за концом строки,
+    // и его содержимое попадает в расчёт — поэтому обнуляем, но только его
+    // (сотни байт). Раньше здесь зануляли весь буфер и тут же перезаписывали:
+    // при загрузке 9B это 5.6 ГБ бессмысленных записей в VRAM.
+    let mut inner = unsafe { device.alloc::<u8>(padded_len)? };
+    if padded_len > data.len() {
+        let tail = vec![0u8; padded_len - data.len()];
+        device.memcpy_htod(&tail, &mut inner.slice_mut(data.len()..))?;
+    }
     device.memcpy_htod(data, &mut inner.slice_mut(..data.len()))?;
     Ok(QStorage::Cuda(QCudaStorage {
         data: PaddedCudaSlice {
