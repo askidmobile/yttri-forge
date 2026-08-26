@@ -72,6 +72,17 @@ impl PagedAttn<'_> {
         if self.d % 8 != 0 {
             candle_core::bail!("paged_attn: head_dim={} должен быть кратен 8", self.d);
         }
+        // Ядро с int8-KV инстанцируется только для hdim=256 (см. kQ8Allowed в
+        // flash_fwd_launch_template.h): собирать q8-вариант для всех девяти
+        // размерностей головы стоило часов компиляции. Проверяем здесь, потому что
+        // C10_CUDA_CHECK в форке — пустышка, и тихий откат на F16 прочитал бы
+        // int8-пул как f16, то есть выдал бы правдоподобный мусор вместо ошибки.
+        if self.kv_scales.is_some() && self.d != 256 {
+            candle_core::bail!(
+                "paged_attn: int8-KV поддержан только при head_dim=256, получено {}",
+                self.d
+            );
+        }
         Ok(())
     }
 
