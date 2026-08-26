@@ -434,13 +434,22 @@ fn run_pack(args: &Args) -> Result<(), String> {
                 .unwrap_or_else(|| "model.ytf".into()),
         );
 
+    // Без раскладки перепаковка v-голов не выполняется, и веса остаются в
+    // HF-порядке — модель выдаёт мусор. Это должно останавливать упаковку, а
+    // не печатать предупреждение.
     let delta_layout = read_delta_layout(dir);
     match delta_layout {
         Some(l) => println!(
             "раскладка DeltaNet: n_k={} n_v={} head_k={} head_v={} (v-голов на k-голову: {})",
             l.n_k, l.n_v, l.hk, l.hv, l.n_per_k()
         ),
-        None => println!("раскладка DeltaNet: config.json не найден — перепаковка НЕ выполняется"),
+        None => {
+            return Err(format!(
+                "не прочитана раскладка DeltaNet из {}/config.json — без неё веса \
+                 останутся в HF-порядке и модель выдаст мусор",
+                dir.display()
+            ))
+        }
     }
 
     let t0 = std::time::Instant::now();
