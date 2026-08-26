@@ -253,8 +253,21 @@ impl PagedModelCtx {
 /// Per-layer paged KV pool (k/v).
 #[derive(Debug, Clone)]
 pub struct PagedKvPool {
-    pub k_pool: Tensor, // [num_blocks, page_size, n_kv, hd] F16
+    /// [num_blocks, page_size, n_kv, hd]: F16 либо U8 при int8-режиме.
+    pub k_pool: Tensor,
     pub v_pool: Tensor,
+    /// Масштабы int8 [num_blocks*page_size*n_kv] F16, по одному на пару
+    /// (токен, голова). None — пул в F16.
+    pub k_scale: Option<Tensor>,
+    pub v_scale: Option<Tensor>,
+}
+
+/// Включён ли int8-пул: вдвое меньше байтов на токен (hd + 2 против hd*2).
+/// После снятия дублирования KV пул стал главной статьёй VRAM, а точность
+/// int8 на KV (0.75% по замеру round-trip) впятеро лучше, чем у весов Q4_K.
+pub fn kv_pool_is_q8() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN36_KV_POOL_Q8").as_deref() == Ok("1"))
 }
 
 impl PagedKvPool {
@@ -264,27 +277,43 @@ impl PagedKvPool {
             .map_err(|_| candle_core::Error::Msg("paged pool requires CUDA".into()))?;
         let shape = (num_blocks, PAGE_SIZE, n_kv, hd);
         let total_elems = num_blocks * PAGE_SIZE * n_kv * hd;
-        let k_slice = unsafe { cuda_dev.alloc::<half::f16>(total_elems)? };
-        let v_slice = unsafe { cuda_dev.alloc::<half::f16>(total_elems)? };
-        let k_pool = Tensor::from_storage(
-            candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
-                k_slice,
-                cuda_dev.clone(),
-            )),
-            shape,
-            candle_core::op::BackpropOp::none(),
-            false,
-        );
-        let v_pool = Tensor::from_storage(
-            candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
-                v_slice,
-                cuda_dev.clone(),
-            )),
-            shape,
-            candle_core::op::BackpropOp::none(),
-            false,
-        );
-        Ok(Self { k_pool, v_pool })
+        let q8 = kv_pool_is_q8();
+        let mk = |cuda_dev: &CudaDevice| -> Result<Tensor> {
+            let storage = if q8 {
+                candle_core::CudaStorage::wrap_cuda_slice(
+                    unsafe { cuda_dev.alloc::<u8>(total_elems)? },
+                    cuda_dev.clone(),
+                )
+            } else {
+                candle_core::CudaStorage::wrap_cuda_slice(
+                    unsafe { cuda_dev.alloc::<half::f16>(total_elems)? },
+                    cuda_dev.clone(),
+                )
+            };
+            Ok(Tensor::from_storage(
+                candle_core::Storage::Cuda(storage),
+                shape,
+                candle_core::op::BackpropOp::none(),
+                false,
+            ))
+        };
+        let k_pool = mk(cuda_dev)?;
+        let v_pool = mk(cuda_dev)?;
+        let (k_scale, v_scale) = if q8 {
+            let n = num_blocks * PAGE_SIZE * n_kv;
+            (
+                Some(Tensor::zeros(n, DType::F16, dev)?),
+                Some(Tensor::zeros(n, DType::F16, dev)?),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            k_pool,
+            v_pool,
+            k_scale,
+            v_scale,
+        })
     }
 
     /// Append текущих K/V строк [B, n_kv, hd] F16 в pool по device kv_len.
@@ -307,8 +336,15 @@ impl PagedKvPool {
         let slots_ptr = ctx.dev.cuda_stream();
         let (slots_ptr, _g2) = cudarc::driver::DevicePtr::device_ptr(&ctx.slots_dev, &slots_ptr);
         let block_table_ptr = tensor_cuda_ptr(&ctx.block_table_t)?;
+        // int8-пул пишется квантующим ядром: оно же считает масштаб на пару
+        // (токен, голова) и кладёт его рядом.
+        let q8 = self.k_scale.is_some();
+        let (k_scale_ptr, v_scale_ptr) = match (&self.k_scale, &self.v_scale) {
+            (Some(ks), Some(vs)) => (tensor_cuda_ptr(ks)?, tensor_cuda_ptr(vs)?),
+            _ => (0u64, 0u64),
+        };
         let func = ctx.dev.get_or_load_func(
-            "kv_append_paged_f16",
+            if q8 { "kv_append_paged_q8" } else { "kv_append_paged_f16" },
             &candle_core::cuda_backend::kernels::QUANTIZED,
         )?;
         let cfg = LaunchConfig {
@@ -325,6 +361,10 @@ impl PagedKvPool {
         let mut builder = func.builder();
         builder.arg(&k_pool_ptr);
         builder.arg(&v_pool_ptr);
+        if q8 {
+            builder.arg(&k_scale_ptr);
+            builder.arg(&v_scale_ptr);
+        }
         builder.arg(&k_rows_ptr);
         builder.arg(&v_rows_ptr);
         builder.arg(&block_table_ptr);
@@ -361,8 +401,15 @@ impl PagedKvPool {
         let (kv_len_ptr, _g1) = cudarc::driver::DevicePtr::device_ptr(&ctx.kv_len_dev, &stream);
         let (slots_ptr, _g2) = cudarc::driver::DevicePtr::device_ptr(&ctx.slots_dev, &stream);
         let block_table_ptr = tensor_cuda_ptr(&ctx.block_table_t)?;
+        // int8-пул пишется квантующим ядром: оно же считает масштаб на пару
+        // (токен, голова) и кладёт его рядом.
+        let q8 = self.k_scale.is_some();
+        let (k_scale_ptr, v_scale_ptr) = match (&self.k_scale, &self.v_scale) {
+            (Some(ks), Some(vs)) => (tensor_cuda_ptr(ks)?, tensor_cuda_ptr(vs)?),
+            _ => (0u64, 0u64),
+        };
         let func = ctx.dev.get_or_load_func(
-            "kv_append_paged_f16_multi",
+            if q8 { "kv_append_paged_q8_multi" } else { "kv_append_paged_f16_multi" },
             &candle_core::cuda_backend::kernels::QUANTIZED,
         )?;
         // Ось z — токены чанка: без неё копию вели n_kv*b блоков (4 на 28 SM).
@@ -374,6 +421,10 @@ impl PagedKvPool {
         let mut builder = func.builder();
         builder.arg(&k_pool_ptr);
         builder.arg(&v_pool_ptr);
+        if q8 {
+            builder.arg(&k_scale_ptr);
+            builder.arg(&v_scale_ptr);
+        }
         builder.arg(&k_rows_ptr);
         builder.arg(&v_rows_ptr);
         builder.arg(&block_table_ptr);

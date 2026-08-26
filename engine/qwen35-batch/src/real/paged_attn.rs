@@ -35,7 +35,12 @@ pub struct PagedAttn<'a> {
     pub max_seqlen_q: usize,
     pub max_seqlen_k: usize,
     pub softmax_scale: f32,
-    pub causal: bool,
+    /// Окна как у FA2: отрицательное — без ограничения. Причинность это частный
+    /// случай (левое < 0, правое = 0), и её надо задавать именно так: при
+    /// q_len < k_len FA2 выравнивает маску по правому-нижнему углу, иначе
+    /// токены чанка увидят будущее.
+    pub window_left: i32,
+    pub window_right: i32,
     pub page_block_size: usize,
 }
 
@@ -136,10 +141,14 @@ impl PagedAttn<'_> {
                 round_multiple(self.max_seqlen_k, 128) as u32,
                 self.q.dim(0)? as u32,
                 0, // is_bf16
-                if self.causal { 1 } else { 0 },
+                if self.window_left < 0 && self.window_right == 0 { 1 } else { 0 },
                 1, // unpadded_lse: varlen
-                -1,
-                -1,
+                if self.window_left < 0 && self.window_right >= 0 {
+                    self.max_seqlen_k as i32
+                } else {
+                    self.window_left
+                },
+                self.window_right,
                 0.0, // softcap
                 tensor_cuda_ptr(self.block_table)? as *const i32,
                 self.block_table.dim(1)? as u32,

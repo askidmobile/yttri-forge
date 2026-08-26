@@ -3887,22 +3887,36 @@ impl GatedAttentionLayer {
         let block_table = ctx.block_table(b_sz)?;
         let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
         let window = ctx.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE;
-        let out = candle_flash_attn::flash_attn_varlen_paged_windowed(
-            &q_f16,
-            &pool.k_pool,
-            &pool.v_pool,
-            &seqlens_q,
-            &seqlens_k,
-            &block_table,
-            None,
-            1,
-            window,
-            scale,
-            None,
-            None,
-            crate::real::paged_kv_cuda::PAGE_SIZE,
-            None,
-        )?;
+        // Свой вызов: op-механика candle здесь не нужна, а её дженерики по
+        // dtype не дают подать байтовый int8-пул.
+        let total_q = q_f16.dim(0)?;
+        let out = Tensor::zeros(q_f16.shape(), DType::F16, q_f16.device())?;
+        let lse = Tensor::zeros((self.n_head, total_q), DType::F32, q_f16.device())?;
+        crate::real::paged_attn::PagedAttn {
+            q: &q_f16,
+            k_pool: &pool.k_pool,
+            v_pool: &pool.v_pool,
+            kv_scales: match (&pool.k_scale, &pool.v_scale) {
+                (Some(ks), Some(vs)) => Some((ks, vs)),
+                _ => None,
+            },
+            seqlens_q: &seqlens_q,
+            seqlens_k: &seqlens_k,
+            block_table: &block_table,
+            out: &out,
+            softmax_lse: &lse,
+            b: b_sz,
+            h: self.n_head,
+            h_k: self.n_kv_head,
+            d: self.head_dim,
+            max_seqlen_q: 1,
+            max_seqlen_k: window,
+            softmax_scale: scale,
+            window_left: -1,
+            window_right: -1,
+            page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+        }
+        .forward()?;
 
         // 7. Gate + Wo (как eager path).
         if crate::scheduler::trace_on() { eprintln!("[attn-paged] 7. out"); let _ = std::io::stderr().flush(); }
@@ -4008,25 +4022,37 @@ impl GatedAttentionLayer {
         let seqlens_q = ctx.seqlens_q_prefill();
         let seqlens_k = ctx.seqlens_k(b_sz)?;
         let block_table = ctx.block_table(b_sz)?;
-        let out = candle_flash_attn::flash_attn_varlen_paged_windowed(
-            &q_f16,
-            &pool.k_pool,
-            &pool.v_pool,
-            &seqlens_q,
-            &seqlens_k,
-            &block_table,
-            None,
-            seq_len,
-            window,
-            scale,
-            None,
-            // window_size_right=0 → causal. При q_len<k_len FA2 v2 выравнивает
-            // маску по правому-нижнему углу: строка i видит 0..kv0+i. Без этого
-            // токены чанка видят будущее (eager путь идёт с causal=true).
-            Some(0),
-            crate::real::paged_kv_cuda::PAGE_SIZE,
-            None,
-        )?;
+        let total_q = q_f16.dim(0)?;
+        let out = Tensor::zeros(q_f16.shape(), DType::F16, q_f16.device())?;
+        let lse = Tensor::zeros((self.n_head, total_q), DType::F32, q_f16.device())?;
+        crate::real::paged_attn::PagedAttn {
+            q: &q_f16,
+            k_pool: &pool.k_pool,
+            v_pool: &pool.v_pool,
+            kv_scales: match (&pool.k_scale, &pool.v_scale) {
+                (Some(ks), Some(vs)) => Some((ks, vs)),
+                _ => None,
+            },
+            seqlens_q: &seqlens_q,
+            seqlens_k: &seqlens_k,
+            block_table: &block_table,
+            out: &out,
+            softmax_lse: &lse,
+            b: b_sz,
+            h: self.n_head,
+            h_k: self.n_kv_head,
+            d: self.head_dim,
+            max_seqlen_q: seq_len,
+            max_seqlen_k: window,
+            softmax_scale: scale,
+            window_left: -1,
+            // Правое окно 0 — причинность. При q_len<k_len FA2 выравнивает
+            // маску по правому-нижнему углу: строка i видит 0..kv0+i. Без
+            // этого токены чанка видят будущее.
+            window_right: 0,
+            page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+        }
+        .forward()?;
 
         // 7. Gate + Wo
         let y_all = out.to_dtype(DType::F32)?.unsqueeze(2)?; // [B, T, nh, 1?] — проверка формы
@@ -7561,7 +7587,9 @@ impl ModelWeights {
             .map_err(|e| candle_core::Error::Msg(format!("cuMemGetInfo failed: {e}")))?;
 
         // Размер 1 токена (K+V в F16) для всех слоёв внимания и всех B слотов
-        let bytes_per_token_all_layers = num_attn_layers * capacity_b * (2 * n_kv * hd * 2);
+        let q8_budget = crate::real::paged_kv_cuda::kv_pool_is_q8();
+        let kv_bytes_per_head = if q8_budget { hd + 2 } else { hd * 2 };
+        let bytes_per_token_all_layers = num_attn_layers * capacity_b * (2 * n_kv * kv_bytes_per_head);
         // Резервируем 512 МиБ на рабочие буферы активаций и драйвера (было 1536)
         let reserved_headroom = 512 * 1024 * 1024;
         let vram_for_paged_kv = free_vram.saturating_sub(reserved_headroom);
@@ -7609,7 +7637,12 @@ impl ModelWeights {
 
         let max_blocks = window.div_ceil(ps);
         let num_blocks = capacity_b * max_blocks;
-        let pool_vram_mb = (num_blocks * ps * num_attn_layers * 2 * n_kv * hd * 2) / (1024 * 1024);
+        // Байтов на элемент: F16 — два, int8 — один плюс масштаб (2 байта на
+        // голову, то есть 2/hd на элемент).
+        let q8 = crate::real::paged_kv_cuda::kv_pool_is_q8();
+        let bytes_per_elem_num = if q8 { hd + 2 } else { 2 * hd };
+        let pool_vram_mb =
+            (num_blocks * ps * num_attn_layers * 2 * n_kv * bytes_per_elem_num) / (1024 * 1024);
         // Печатаем всегда: если окно оказалось меньше обслуживаемого контекста,
         // движок начнёт вытеснять блоки — это скольжение окна, а не длинный
         // контекст, и в отчёте это должно быть видно, а не угадываться.
@@ -7940,6 +7973,15 @@ impl ModelWeights {
                 let pool = a.paged_pool.as_ref().ok_or_else(|| {
                     candle_core::Error::Msg("migrate: paged pool missing".into())
                 })?;
+                if pool.k_scale.is_some() {
+                    // Миграция копирует F16 постранично; для байтового пула
+                    // нужна квантующая копия. При graph-префилле (умолчание)
+                    // миграции не бывает — KV пишется в пул сразу.
+                    candle_core::bail!(
+                        "int8-пул несовместим с миграцией из batched-кэша: \
+                         нужен graph-префилл (QWEN36_PGRAPH=on, это умолчание)"
+                    );
+                }
                 let n_kv = a.n_kv_head;
                 let hd = a.head_dim;
                 let elem_per_token = n_kv * hd;
@@ -8071,6 +8113,15 @@ impl ModelWeights {
                 .paged_pool
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::Msg("rehydrate: paged pool missing".into()))?;
+            if pool.k_scale.is_some() {
+                // Обратная миграция читает F16 постранично; для байтового пула
+                // нужна распаковка (ядро kv_pool_dequant_q8 готово, но путь
+                // ещё не собран).
+                candle_core::bail!(
+                    "int8-пул: обратная миграция пока не поддержана — \
+                     eager-откат недоступен"
+                );
+            }
             let device = pool.k_pool.device().clone();
             let k = Tensor::zeros((1, cap, n_kv, hd), DType::F16, &device)?;
             let v = Tensor::zeros((1, cap, n_kv, hd), DType::F16, &device)?;

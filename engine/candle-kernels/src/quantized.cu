@@ -7062,6 +7062,77 @@ extern "C" __global__ void kv_append_paged_f16_multi(
 // Масштаб симметричный: s = amax/127, значение = round(x/s), диапазон
 // [-127, 127]. Ноль представим точно, что важно для паддинга страниц.
 
+// Одиночная запись (декод): одна строка на слот. Логика квантования та же,
+// что в пакетном варианте.
+extern "C" __global__ void kv_append_paged_q8(
+    signed char* __restrict__ k_pool,
+    signed char* __restrict__ v_pool,
+    half* __restrict__ k_scale,
+    half* __restrict__ v_scale,
+    const half* __restrict__ k_rows,  // [B, n_kv, hd]
+    const half* __restrict__ v_rows,
+    const unsigned int* __restrict__ block_table,
+    const unsigned int* __restrict__ slots,
+    unsigned int* __restrict__ kv_len,
+    const int b,
+    const int n_kv,
+    const int hd,
+    const int page_size,
+    const int max_blocks,
+    const int window)
+{
+    const int bidx = blockIdx.y;
+    const int head = blockIdx.x;
+    if (bidx >= b || head >= n_kv) return;
+    const unsigned int slot = slots[bidx];
+    unsigned int len = kv_len[slot];
+    if (len >= (unsigned int)window) len = window - 1; // eviction guard
+    const unsigned int page = block_table[bidx * max_blocks + len / page_size];
+    const unsigned int off = len % page_size;
+    const size_t token_idx = (size_t)page * page_size + off;
+    const size_t dst_base = token_idx * n_kv * hd + (size_t)head * hd;
+    const size_t scale_idx = token_idx * n_kv + (size_t)head;
+    const size_t src_base = ((size_t)bidx * n_kv + head) * hd;
+    const half* k_src = k_rows + src_base;
+    const half* v_src = v_rows + src_base;
+
+    __shared__ float sh_k[32];
+    __shared__ float sh_v[32];
+    float amax_k = 0.f, amax_v = 0.f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        amax_k = fmaxf(amax_k, fabsf(__half2float(k_src[i])));
+        amax_v = fmaxf(amax_v, fabsf(__half2float(v_src[i])));
+    }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (int o = 16; o > 0; o >>= 1) {
+        amax_k = fmaxf(amax_k, __shfl_down_sync(0xffffffff, amax_k, o));
+        amax_v = fmaxf(amax_v, __shfl_down_sync(0xffffffff, amax_v, o));
+    }
+    if (lane == 0) { sh_k[warp] = amax_k; sh_v[warp] = amax_v; }
+    __syncthreads();
+    const int warps = (blockDim.x + 31) >> 5;
+    if (threadIdx.x == 0) {
+        float mk = 0.f, mv = 0.f;
+        for (int w = 0; w < warps; ++w) { mk = fmaxf(mk, sh_k[w]); mv = fmaxf(mv, sh_v[w]); }
+        sh_k[0] = mk > 0.f ? mk / 127.f : 1.f;
+        sh_v[0] = mv > 0.f ? mv / 127.f : 1.f;
+        k_scale[scale_idx] = __float2half(sh_k[0]);
+        v_scale[scale_idx] = __float2half(sh_v[0]);
+    }
+    __syncthreads();
+    const float ks = sh_k[0];
+    const float vs = sh_v[0];
+    signed char* k_dst = k_pool + dst_base;
+    signed char* v_dst = v_pool + dst_base;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        float kq = rintf(__half2float(k_src[i]) / ks);
+        float vq = rintf(__half2float(v_src[i]) / vs);
+        k_dst[i] = (signed char)fminf(fmaxf(kq, -127.f), 127.f);
+        v_dst[i] = (signed char)fminf(fmaxf(vq, -127.f), 127.f);
+    }
+}
+
 extern "C" __global__ void kv_append_paged_q8_multi(
     signed char* __restrict__ k_pool,
     signed char* __restrict__ v_pool,
