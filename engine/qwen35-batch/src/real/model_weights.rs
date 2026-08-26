@@ -7565,12 +7565,21 @@ impl ModelWeights {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(usize::MAX);
 
-        // Базовое окно: минимум из ограничения модели, обслуживаемого контекста,
-        // доступной VRAM и потолка 32K (кратно PAGE_SIZE=64)
+        // Потолок окна: 32K по умолчанию, но явно заданный CTX его поднимает.
+        // Иначе сервер, настроенный на 128K, получал бы пул на 32K и начинал
+        // вытеснять блоки — это молчаливое скольжение окна, а не длинный
+        // контекст. VRAM при этом всё равно ограничивает через
+        // max_tokens_by_vram, так что снятие потолка не даёт уйти за карту.
+        let ceiling = if served_ctx == usize::MAX {
+            32768
+        } else {
+            served_ctx
+        };
+        // Базовое окно: минимум из ограничения модели, потолка и доступной
+        // VRAM (кратно PAGE_SIZE=64)
         let auto_window = max_tokens_by_vram
             .min(model_attn_window)
-            .min(served_ctx)
-            .min(32768)
+            .min(ceiling)
             .max(512); // минимум 512 токенов
         let ps = crate::real::paged_kv_cuda::PAGE_SIZE;
         let auto_window_aligned = (auto_window / ps) * ps;

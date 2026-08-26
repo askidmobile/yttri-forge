@@ -26,6 +26,11 @@ pub fn hf_to_gguf(hf: &str) -> Option<String> {
     match hf {
         "model.language_model.embed_tokens.weight" => return Some("token_embd.weight".into()),
         "model.language_model.norm.weight" => return Some("output_norm.weight".into()),
+        // Отдельная выходная голова. У 4B её нет (tie_word_embeddings=true) и
+        // конструктор откатывается на token_embd; у 9B она есть, и без этой
+        // строки контейнер молча остался бы со связанными эмбеддингами.
+        "lm_head.weight" => return Some("output.weight".into()),
+        "model.lm_head.weight" => return Some("output.weight".into()),
         _ => {}
     }
     let rest = hf.strip_prefix("model.language_model.layers.")?;
@@ -640,6 +645,18 @@ mod tests {
         assert_eq!(
             l("post_attention_layernorm.weight").as_deref(),
             Some("blk.3.post_attention_norm.weight")
+        );
+    }
+
+    /// У 4B эмбеддинги связаны и головы нет, у 9B она отдельная. Без этой
+    /// карты контейнер 9B молча остался бы со связанными эмбеддингами —
+    /// падения не будет, будет тихо худшее качество.
+    #[test]
+    fn separate_output_head_is_mapped() {
+        assert_eq!(hf_to_gguf("lm_head.weight").as_deref(), Some("output.weight"));
+        assert_eq!(
+            hf_to_gguf("model.lm_head.weight").as_deref(),
+            Some("output.weight")
         );
     }
 
