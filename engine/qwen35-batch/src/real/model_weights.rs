@@ -7545,7 +7545,15 @@ impl ModelWeights {
             .ok_or_else(|| candle_core::Error::Msg("no attention layers found in model".into()))?;
         let (n_kv, hd) = dims.unwrap();
 
-        // 2. Автоматический расчет окна на основе доступной свободной памяти VRAM
+        // 2. Автоматический расчет окна на основе доступной свободной памяти VRAM.
+        //
+        // Пул создаётся лениво на первом декоде, когда транзиенты префилла ещё
+        // держатся пулом драйвера. Без возврата их ОС mem_get_info показывает
+        // почти пустую карту, и окно зажимается: замер на 9B при ctx=65536 дал
+        // окно 14016 вместо 65536, то есть движок молча скользил окном.
+        // cuMemFreeAsync упорядочен по потоку, поэтому сначала синхронизация.
+        let _ = cuda_dev.cuda_stream().synchronize();
+        let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(cuda_dev);
         let (free_vram, _total_vram) = cuda_dev
             .cuda_stream()
             .context()
