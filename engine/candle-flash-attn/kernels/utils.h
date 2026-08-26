@@ -314,42 +314,22 @@ __forceinline__ __device__ void copy_dequant_q8(
     const int max_MN = 0)
 {
     using ElemD = typename EngineD::value_type;
-    constexpr int kVec = size<0>(LayoutD{});
-    #pragma unroll
+    // Простой цикл без развёртки и без локального массива: источник лежит в
+    // разделяемой памяти, широкая загрузка там ничего не даёт, а развёрнутый
+    // вариант раздувал ядро настолько, что ptxas уходил в часы и три гигабайта
+    // на распределении регистров.
     for (int m = 0; m < size<1>(D); ++m) {
         const int row = get<0>(identity_MN(0, m, 0));
         const bool row_ok = Is_even_MN || row < max_MN;
         const float s = row_ok ? static_cast<float>(scales(row)) : 0.f;
-        #pragma unroll
         for (int k = 0; k < size<2>(D); ++k) {
-            const bool k_ok = Is_even_K || predicate_K(k);
-            if (row_ok && k_ok) {
-                // Элементы фрагмента идут подряд по head_dim, поэтому берём их
-                // одной широкой загрузкой вместо kVec однобайтовых: скалярное
-                // чтение стоило дороже, чем экономил вдвое меньший трафик
-                // (замер: декод -16..-40% против F16).
-                const int col0 = get<1>(identity_MN(0, m, k));
-                const int8_t *base = &src_i8(row, col0);
-                int8_t buf[kVec];
-                if (kVec == 16 && (reinterpret_cast<uintptr_t>(base) & 15) == 0) {
-                    *reinterpret_cast<uint4 *>(buf) = *reinterpret_cast<const uint4 *>(base);
-                } else if (kVec == 8 && (reinterpret_cast<uintptr_t>(base) & 7) == 0) {
-                    *reinterpret_cast<uint2 *>(buf) = *reinterpret_cast<const uint2 *>(base);
-                } else if (kVec == 4 && (reinterpret_cast<uintptr_t>(base) & 3) == 0) {
-                    *reinterpret_cast<unsigned int *>(buf) =
-                        *reinterpret_cast<const unsigned int *>(base);
-                } else {
-                    #pragma unroll
-                    for (int i = 0; i < kVec; ++i) { buf[i] = base[i]; }
-                }
-                #pragma unroll
-                for (int i = 0; i < kVec; ++i) {
-                    D(i, m, k) = static_cast<ElemD>(static_cast<float>(buf[i]) * s);
-                }
-            } else {
-                #pragma unroll
-                for (int i = 0; i < kVec; ++i) {
-                    if (Clear_OOB_MN || !k_ok) { D(i, m, k) = ElemD(0.f); }
+            const bool ok = row_ok && (Is_even_K || predicate_K(k));
+            for (int i = 0; i < size<0>(D); ++i) {
+                if (ok) {
+                    const int col = get<1>(identity_MN(i, m, k));
+                    D(i, m, k) = static_cast<ElemD>(static_cast<float>(src_i8(row, col)) * s);
+                } else if (Clear_OOB_MN) {
+                    D(i, m, k) = ElemD(0.f);
                 }
             }
         }
