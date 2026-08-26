@@ -9,22 +9,11 @@
 
 use anyhow::{bail, Result};
 use candle_core::{DType, Device, Tensor};
-use cudarc::driver::LaunchConfig;
-
-const PAGE_SIZE: usize = 64;
+use cudarc::driver::{LaunchConfig, PushKernelArg};
+use qwen35_batch::real::paged_kv_cuda::{tensor_cuda_ptr, PAGE_SIZE};
 
 fn ptr(t: &Tensor) -> Result<u64> {
-    let (st, l) = t.storage_and_layout();
-    let candle_core::Storage::Cuda(c) = &*st else {
-        bail!("нужен CUDA-тензор")
-    };
-    let slice = c.as_cuda_slice::<u8>().map(|s| s.clone());
-    let _ = slice;
-    // Универсально: берём указатель через сырой срез байтов устройства.
-    let stream = c.device().cuda_stream();
-    let bytes = c.as_cuda_slice::<u8>()?;
-    let (p, _g) = cudarc::driver::DevicePtr::device_ptr(bytes, &stream);
-    Ok(p + (l.start_offset() * t.dtype().size_in_bytes()) as u64)
+    Ok(tensor_cuda_ptr(t)?)
 }
 
 fn main() -> Result<()> {

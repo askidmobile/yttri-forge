@@ -38,7 +38,8 @@ pub struct PagedModelCtx {
     pub slots_host: Vec<u32>,
 }
 
-fn tensor_cuda_ptr(t: &Tensor) -> Result<u64> {
+/// Указатель на данные CUDA-тензора (для передачи в сырые ядра).
+pub fn tensor_cuda_ptr(t: &Tensor) -> Result<u64> {
     let (storage, layout) = t.storage_and_layout();
     let cuda = match &*storage {
         candle_core::Storage::Cuda(c) => c,
