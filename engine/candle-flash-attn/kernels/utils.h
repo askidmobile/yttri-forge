@@ -314,23 +314,37 @@ __forceinline__ __device__ void copy_dequant_q8(
     const int max_MN = 0)
 {
     using ElemD = typename EngineD::value_type;
-    // Простой цикл без развёртки и без локального массива: источник лежит в
-    // разделяемой памяти, широкая загрузка там ничего не даёт, а развёрнутый
-    // вариант раздувал ядро настолько, что ptxas уходил в часы и три гигабайта
-    // на распределении регистров.
+    // Вдоль i раскладка непрерывна — это ширина векторного атома копирования,
+    // поэтому столбец считаем один раз на (m, k) и дальше идём по смежным байтам
+    // от сырого указателя. Прошлый вариант пересчитывал раскладку CuTe на каждый
+    // элемент и читал байты вразнобой, конфликтуя по банкам; именно это, а не
+    // сама арифметика, съедало декод (провал рос вместе с длиной контекста).
+    // Непрерывность проверяется прогоном bench_kvq8 — при её нарушении расхождение
+    // вылезет сразу.
     for (int m = 0; m < size<1>(D); ++m) {
         const int row = get<0>(identity_MN(0, m, 0));
         const bool row_ok = Is_even_MN || row < max_MN;
-        const float s = row_ok ? static_cast<float>(scales(row)) : 0.f;
-        for (int k = 0; k < size<2>(D); ++k) {
-            const bool ok = row_ok && (Is_even_K || predicate_K(k));
-            for (int i = 0; i < size<0>(D); ++i) {
-                if (ok) {
-                    const int col = get<1>(identity_MN(i, m, k));
-                    D(i, m, k) = static_cast<ElemD>(static_cast<float>(src_i8(row, col)) * s);
-                } else if (Clear_OOB_MN) {
-                    D(i, m, k) = ElemD(0.f);
+        if (!row_ok) {
+            if (Clear_OOB_MN) {
+                for (int k = 0; k < size<2>(D); ++k) {
+                    #pragma unroll
+                    for (int i = 0; i < size<0>(D); ++i) { D(i, m, k) = ElemD(0.f); }
                 }
+            }
+            continue;
+        }
+        const float s = static_cast<float>(scales(row));
+        const int8_t *src_row = &src_i8(row, 0);
+        for (int k = 0; k < size<2>(D); ++k) {
+            if (Is_even_K || predicate_K(k)) {
+                const int col0 = get<1>(identity_MN(0, m, k));
+                #pragma unroll
+                for (int i = 0; i < size<0>(D); ++i) {
+                    D(i, m, k) = static_cast<ElemD>(static_cast<float>(src_row[col0 + i]) * s);
+                }
+            } else if (Clear_OOB_MN) {
+                #pragma unroll
+                for (int i = 0; i < size<0>(D); ++i) { D(i, m, k) = ElemD(0.f); }
             }
         }
     }
