@@ -116,6 +116,17 @@ extern "C" void run_mha(
     int32_t *mm_prefix_ranges_ptr,
     uint32_t mm_prefix_range_batch_stride,
     int max_mm_prefix_ranges,
+
+    // int8 постраничный KV: масштабы на пару (токен, голова). Раскладка
+    // зеркалит пул без измерения head_dim. Нули = обычный F16-пул.
+    void *k_scale_ptr,
+    void *v_scale_ptr,
+    uint32_t k_scale_batch_stride,
+    uint32_t k_scale_row_stride,
+    uint32_t v_scale_batch_stride,
+    uint32_t v_scale_row_stride,
+    int kv_is_q8,
+
     void *stream_ptr
 ) {
     Flash_fwd_params params;
@@ -191,6 +202,16 @@ extern "C" void run_mha(
     params.is_causal = is_causal;
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
+
+    params.k_scale_ptr = k_scale_ptr;
+    params.v_scale_ptr = v_scale_ptr;
+    params.k_scale_batch_stride = k_scale_batch_stride;
+    params.k_scale_row_stride = k_scale_row_stride;
+    params.k_scale_head_stride = 1;
+    params.v_scale_batch_stride = v_scale_batch_stride;
+    params.v_scale_row_stride = v_scale_row_stride;
+    params.v_scale_head_stride = 1;
+    params.kv_is_q8 = kv_is_q8 != 0;
 
     params.is_seqlens_k_cumulative = true;
     params.unpadded_lse = unpadded_lse;

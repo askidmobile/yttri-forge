@@ -57,6 +57,17 @@ extern "C" {
         mm_prefix_ranges_ptr: *const i32,
         mm_prefix_range_batch_stride: u32,
         max_mm_prefix_ranges: c_int,
+
+        // int8 постраничный KV: масштабы на пару (токен, голова).
+        // Нулевые указатели и kv_is_q8=0 — обычный F16-пул.
+        k_scale_ptr: *const c_void,
+        v_scale_ptr: *const c_void,
+        k_scale_batch_stride: u32,
+        k_scale_row_stride: u32,
+        v_scale_batch_stride: u32,
+        v_scale_row_stride: u32,
+        kv_is_q8: c_int,
+
         stream_ptr: *mut c_void,
     );
 
