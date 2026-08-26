@@ -8047,6 +8047,9 @@ impl ModelWeights {
             let k = Tensor::zeros((1, cap, n_kv, hd), DType::F16, &device)?;
             let v = Tensor::zeros((1, cap, n_kv, hd), DType::F16, &device)?;
 
+            // Заимствования storage_and_layout должны умереть до того, как k и v
+            // уедут в кэш, поэтому копирование живёт в своей области.
+            {
             let (kp_st, _) = pool.k_pool.storage_and_layout();
             let (vp_st, _) = pool.v_pool.storage_and_layout();
             let (k_st, k_l) = k.storage_and_layout();
@@ -8094,6 +8097,7 @@ impl ModelWeights {
                 }
             } else {
                 candle_core::bail!("rehydrate: ожидались CUDA-тензоры");
+            }
             }
             a.kv_cache_batched[slot] = Some(BatchedKvCache::F16(F16KvCache { k, v }));
         }
