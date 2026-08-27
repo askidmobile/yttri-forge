@@ -211,6 +211,12 @@ pub struct Qwen35BatchAdapter {
     /// шаге. Захват дорог, поэтому держим небольшой пул с вытеснением, как у
     /// графов префила.
     decode_graphs: Vec<DecodeGraphState>,
+    /// hidden последнего чанка, посчитанного графовым префилом. Нужен, чтобы
+    /// графовая ветка заполнила mtp_inputs тем же способом, что и eager, и оба
+    /// пути сошлись в ОДНУ точку вызова catch_up. Отдельный вызов внутри
+    /// графовой функции приводил к тому, что MTP переставал приниматься.
+    #[cfg(feature = "cuda")]
+    pg_last_hidden: Option<Tensor>,
     /// LRU графов префилла (QWEN36_PGRAPH), ключ — (T, slot); хвост = свежий.
     #[cfg(feature = "cuda")]
     prefill_graphs: Vec<PrefillGraphState>,
@@ -390,6 +396,8 @@ impl Qwen35BatchAdapter {
             slot_seeded: vec![false; num_slots],
             #[cfg(feature = "cuda")]
             decode_graphs: Vec::new(),
+            #[cfg(feature = "cuda")]
+            pg_last_hidden: None,
             #[cfg(feature = "cuda")]
             paged_dirty: vec![true; num_slots],
             state_owner: None,
@@ -715,7 +723,29 @@ impl BatchModel for Qwen35BatchAdapter {
 
         let pf_fwd0 = std::time::Instant::now();
         let (logits, mtp_inputs) = if pg_used {
-            (None, None)
+            // Графовый префил посчитал hidden всех позиций — собираем такие же
+            // mtp_inputs, как в eager-ветке, чтобы штатный catch_up ниже отработал.
+            // Без этого MTP остаётся без префикса, черновики не принимаются, и
+            // адаптивная ширина молча выключает спекуляцию (drafted=2 accepted=0).
+            #[cfg(feature = "cuda")]
+            let mi = match self.pg_last_hidden.take() {
+                Some(hidden) if self.multimodal[sidx].is_none() => {
+                    let ids_g = Tensor::from_vec(
+                        chunk.tokens.clone(),
+                        (1usize, chunk.tokens.len()),
+                        &self.device,
+                    )?;
+                    let embeds = self
+                        .model
+                        .embed_tokens(&ids_g, &self.device)
+                        .map_err(|e| anyhow!("pgraph embed for MTP: {e}"))?;
+                    Some((embeds, hidden))
+                }
+                _ => None,
+            };
+            #[cfg(not(feature = "cuda"))]
+            let mi = None;
+            (None, mi)
         } else if let Some(media) = self.multimodal[sidx].as_mut() {
             let end = chunk
                 .start_pos
@@ -1551,26 +1581,10 @@ impl Qwen35BatchAdapter {
             }
         };
 
-        // MTP догоняет состояние по этому чанку: ему нужны эмбеддинги и hidden
-        // всех позиций (mtp.rs:201 требует [1, seq, hidden]). Вызов стоит ПОСЛЕ
-        // ветвления, чтобы отработать и на первом чанке, идущем веткой захвата —
-        // иначе голова остаётся без начала префикса и угадывает мимо: замер дал
-        // drafted=2 accepted=0 против drafted=19 accepted=9 до правки.
-        if let Some(hid) = mtp_hidden {
-            if self.mtp.is_some() && self.multimodal[slot].is_none() {
-                let ids_for_mtp =
-                    Tensor::from_vec(chunk.tokens.clone(), (1usize, t), &self.device)?;
-                let embeds = self
-                    .model
-                    .embed_tokens(&ids_for_mtp, &self.device)
-                    .map_err(|e| anyhow!("pgraph embed for MTP: {e}"))?;
-                let start = chunk.start_pos;
-                if let Some(mtp) = self.mtp.as_mut() {
-                    mtp.catch_up(slot, &embeds, &hid, start, None)
-                        .map_err(|e| anyhow!("pgraph MTP catch-up: {e}"))?;
-                }
-            }
-        }
+        // hidden отдаём наружу, а не вызываем catch_up здесь: пусть графовая
+        // ветка prefill_chunk заполнит mtp_inputs тем же способом, что и eager,
+        // и оба пути сойдутся в одну точку вызова.
+        self.pg_last_hidden = mtp_hidden;
 
         // Device kv_len продвинут ядром на +T — синхронизируем хостовое зеркало.
         {
