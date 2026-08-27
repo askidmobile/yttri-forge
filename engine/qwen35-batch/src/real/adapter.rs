@@ -114,6 +114,10 @@ struct PrefillGraphState {
     /// Внешний буфер выхода (D2D-нода внутри графа) — graph-pool адреса
     /// невалидны для D2H снаружи launch.
     logits_t: Tensor,
+    /// Второй внешний буфер: hidden всех T позиций чанка. Нужен MTP::catch_up,
+    /// которому требуется [1, T, hidden] для построения собственного KV над
+    /// префиксом. Без него графовый префил был закрыт для MTP гейтом PD-204.
+    hidden_t: Tensor,
 }
 
 #[cfg(feature = "cuda")]
@@ -1398,10 +1402,13 @@ impl Qwen35BatchAdapter {
                 let rope_pos_t = Tensor::from_vec(rope_host.clone(), t, &self.device)?;
                 // 1) Eager-прогон: это и есть результат чанка (захват ядра не
                 //    исполняет) + прогрев ядер/htod-кэша.
-                let (logits, _hidden) = self
+                let (logits, prime_hidden) = self
                     .model
                     .forward_prefill_graphed(&ids_t, &rope_pos_t, t)
                     .map_err(|e| anyhow!("pgraph eager prime: {e}"))?;
+                let hid_shape = prime_hidden.shape().clone();
+                let hid_dtype = prime_hidden.dtype();
+                drop(prime_hidden);
                 let flat = logits
                     .to_dtype(DType::F32)?
                     .flatten_all()?
@@ -1414,6 +1421,8 @@ impl Qwen35BatchAdapter {
                 let captured = (|| -> Result<PrefillGraphState> {
                     use cudarc::driver::{result as cres, sys as csys};
                     let logits_out = Tensor::zeros(out_shape, out_dtype, &self.device)?;
+                    let hidden_out =
+                        Tensor::zeros(hid_shape.clone(), hid_dtype, &self.device)?;
                     unsafe {
                         cres::stream::begin_capture(
                             stream.cu_stream(),
@@ -1433,6 +1442,10 @@ impl Qwen35BatchAdapter {
                     if let Err(e) = logits_out.slice_set(&logits_t, 0, 0) {
                         let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
                         return Err(anyhow!("pgraph logits_out copy: {e}"));
+                    }
+                    if let Err(e) = hidden_out.slice_set(&hidden_t, 0, 0) {
+                        let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
+                        return Err(anyhow!("pgraph hidden_out copy: {e}"));
                     }
                     drop(logits_t);
                     drop(hidden_t);
@@ -1459,6 +1472,7 @@ impl Qwen35BatchAdapter {
                         ids_t: ids_t.clone(),
                         rope_pos_t: rope_pos_t.clone(),
                         logits_t: logits_out,
+                        hidden_t: hidden_out,
                     })
                 })();
                 match captured {
