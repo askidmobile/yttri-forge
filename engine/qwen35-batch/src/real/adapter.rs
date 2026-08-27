@@ -140,6 +140,13 @@ impl PrefillGraphState {
 #[cfg(feature = "cuda")]
 impl Drop for PrefillGraphState {
     fn drop(&mut self) {
+        // Дождаться потока ОБЯЗАТЕЛЬНО: уничтожение exec'а, работа которого ещё
+        // не завершена, делает недействительным всё последующее на этом потоке.
+        // Проявлялось при вытеснении из пула по LRU: девятый захваченный граф
+        // вытеснял первый, и следующий же шаг падал с
+        // DriverError(CUDA_ERROR_INVALID_VALUE) — при том что сам вытесненный
+        // граф больше не запускался.
+        let _ = self.stream.synchronize();
         unsafe {
             cudarc::driver::sys::cuGraphExecDestroy(self.exec);
             cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
@@ -147,9 +154,37 @@ impl Drop for PrefillGraphState {
     }
 }
 
-/// Сколько графов префилла держим одновременно (PD-A5).
+/// Сколько графов префилла держим одновременно (PD-A5). Умолчание 8,
+/// переопределяется QWEN36_PGRAPH_LRU.
 #[cfg(feature = "cuda")]
-const PGRAPH_LRU: usize = 8;
+fn pgraph_lru() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("QWEN36_PGRAPH_LRU")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(8)
+    })
+}
+
+/// Чанки короче этого порога не захватываем в граф — считаем прогревочным
+/// проходом и всё. Ключ пула — (T, slot), а длина хвостового чанка
+/// (prompt mod chunk) у агентских сессий почти всегда новая: пул на 8
+/// вытеснялся на каждом запросе, и первое же вытеснение роняло следующий
+/// шаг CUDA_ERROR_INVALID_VALUE (2026-08-28, T=45 при lru=8). Выигрыш графа на
+/// хвосте — десятки мс один раз на запрос, терять нечего. QWEN36_PGRAPH_MIN_T,
+/// умолчание 256; 0 — захватывать всё (прежнее поведение, для диагностики).
+#[cfg(feature = "cuda")]
+fn pgraph_min_capture_t() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("QWEN36_PGRAPH_MIN_T")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256)
+    })
+}
 /// Размер пула декодных графов: обычный декод плюс формы проверки спекуляции
 /// при ширинах 1..8. Каждый экземпляр держит свои внешние буферы, поэтому
 /// пул небольшой.
@@ -184,6 +219,10 @@ fn pgraph_mode() -> PgraphMode {
 #[cfg(feature = "cuda")]
 impl Drop for DecodeGraphState {
     fn drop(&mut self) {
+        // То же, что у префил-графа: сначала дождаться потока, потом
+        // уничтожать. Декодный пул тоже вытесняет по LRU (DGRAPH_LRU),
+        // а формы проверки спекуляции при разных ширинах создают новые ключи.
+        let _ = self.stream.synchronize();
         unsafe {
             cudarc::driver::sys::cuGraphExecDestroy(self.exec);
             cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
@@ -1648,6 +1687,11 @@ impl Qwen35BatchAdapter {
                 let out_shape = logits.shape().clone();
                 let out_dtype = logits.dtype();
                 drop(logits);
+                // Хвост короче порога: результат уже посчитан прогревочным
+                // проходом, KV в пуле, состояние консистентно — захват не нужен.
+                if !verify && t < pgraph_min_capture_t() {
+                    return Ok((flat, prime_hidden, false));
+                }
                 let stream = cuda_dev.cuda_stream();
                 let captured = (|| -> Result<PrefillGraphState> {
                     use cudarc::driver::{result as cres, sys as csys};
@@ -1706,8 +1750,15 @@ impl Qwen35BatchAdapter {
                 match captured {
                     Ok(g) => {
                         pool.push(g);
-                        while pool.len() > PGRAPH_LRU {
-                            pool.remove(0);
+                        while pool.len() > pgraph_lru() {
+                            let evicted = pool.remove(0);
+                            // Диагностика вытеснения: QWEN36_PGRAPH_EVICT_LEAK=1
+                            // не разрушает граф и его буферы (утечка), чтобы
+                            // отделить «Drop ломает следующий шаг» от «сам
+                            // девятый захват». Не для прода.
+                            if std::env::var("QWEN36_PGRAPH_EVICT_LEAK").as_deref() == Ok("1") {
+                                std::mem::forget(evicted);
+                            }
                         }
                     }
                     // Захват не удался — результат уже посчитан eager-прогоном,
