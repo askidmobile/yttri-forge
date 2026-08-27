@@ -140,13 +140,6 @@ impl PrefillGraphState {
 #[cfg(feature = "cuda")]
 impl Drop for PrefillGraphState {
     fn drop(&mut self) {
-        // Дождаться потока ОБЯЗАТЕЛЬНО: уничтожение exec'а, работа которого ещё
-        // не завершена, делает недействительным всё последующее на этом потоке.
-        // Проявлялось при вытеснении из пула по LRU: девятый захваченный граф
-        // вытеснял первый, и следующий же шаг падал с
-        // DriverError(CUDA_ERROR_INVALID_VALUE) — при том что сам вытесненный
-        // граф больше не запускался.
-        let _ = self.stream.synchronize();
         unsafe {
             cudarc::driver::sys::cuGraphExecDestroy(self.exec);
             cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
@@ -219,10 +212,6 @@ fn pgraph_mode() -> PgraphMode {
 #[cfg(feature = "cuda")]
 impl Drop for DecodeGraphState {
     fn drop(&mut self) {
-        // То же, что у префил-графа: сначала дождаться потока, потом
-        // уничтожать. Декодный пул тоже вытесняет по LRU (DGRAPH_LRU),
-        // а формы проверки спекуляции при разных ширинах создают новые ключи.
-        let _ = self.stream.synchronize();
         unsafe {
             cudarc::driver::sys::cuGraphExecDestroy(self.exec);
             cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
