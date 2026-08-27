@@ -1552,9 +1552,11 @@ impl Qwen35BatchAdapter {
         // drafted=2 accepted=0 против drafted=19 accepted=9 до правки.
         if let Some(hid) = mtp_hidden {
             if self.mtp.is_some() && self.multimodal[slot].is_none() {
+                let ids_for_mtp =
+                    Tensor::from_vec(chunk.tokens.clone(), (1usize, t), &self.device)?;
                 let embeds = self
                     .model
-                    .embed_tokens(&ids_t, &self.device)
+                    .embed_tokens(&ids_for_mtp, &self.device)
                     .map_err(|e| anyhow!("pgraph embed for MTP: {e}"))?;
                 let start = chunk.start_pos;
                 if let Some(mtp) = self.mtp.as_mut() {
