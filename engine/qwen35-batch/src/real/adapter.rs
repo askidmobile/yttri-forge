@@ -84,6 +84,10 @@ struct DecodeGraphState {
     ids_t: Tensor,
     /// Alias захваченных выходов (graph-pool память).
     logits_t: Tensor,
+    /// Второй внешний буфер: hidden декодируемых позиций. Нужен MTP —
+    /// speculative_accept собирает из него verified_target_hidden. Без него
+    /// декод с активной транзакцией MTP вынужден уходить на eager (гейт 1512).
+    hidden_t: Tensor,
 }
 
 #[cfg(feature = "cuda")]
@@ -1671,6 +1675,11 @@ impl Qwen35BatchAdapter {
                 .model
                 .forward_decode_batch_graphed(&ids_eager, slots)
                 .map_err(|e| anyhow!("graphed forward (eager prime): {e}"))?;
+            // Форма hidden для внешнего буфера захвата: берём с прогрева, он и так
+            // выполняется перед захватом. Раньше hidden прогрева использовался
+            // только как результат шага и в граф не выводился.
+            let hid_shape = hidden.shape().clone();
+            let hid_dtype = hidden.dtype();
             // Второй eager прогон (замер тёплого пути): ТОЛЬКО диагностика.
             // ВАЖНО: двигает device KV на +1 — рассинхронизирует scheduler
             // позиции после capture. Поэтому gprof+graphs даёт корректные
@@ -1763,6 +1772,8 @@ impl Qwen35BatchAdapter {
                 // выделен ДО захвата) буфер D2D-нодой внутри графа.
                 let ids_eager = Tensor::from_vec(tokens.to_vec(), (b, 1usize), &self.device)?;
                 let logits_out = Tensor::zeros((b, self.vocab), DType::F32, &self.device)?;
+                let hidden_out =
+                    Tensor::zeros(hid_shape.clone(), hid_dtype, &self.device)?;
                 unsafe {
                     cres::stream::begin_capture(
                         stream.cu_stream(),
@@ -1784,6 +1795,10 @@ impl Qwen35BatchAdapter {
                 if let Err(e) = logits_out.slice_set(&logits_t, 0, 0) {
                     let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
                     return Err(anyhow!("logits_out copy: {e}"));
+                }
+                if let Err(e) = hidden_out.slice_set(&hidden_t, 0, 0) {
+                    let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
+                    return Err(anyhow!("hidden_out copy: {e}"));
                 }
                 drop(logits_t);
                 drop(hidden_t);
@@ -1820,6 +1835,7 @@ impl Qwen35BatchAdapter {
                     slots: slots.to_vec(),
                     ids_t: ids_eager.clone(),
                     logits_t: logits_out,
+                    hidden_t: hidden_out,
                 })
             })();
             match capture_result {
