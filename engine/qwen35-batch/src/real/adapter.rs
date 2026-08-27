@@ -1016,7 +1016,7 @@ impl BatchModel for Qwen35BatchAdapter {
         #[cfg(feature = "cuda")]
         {
             match self.decode_batch_graphed(b, &tokens, &rope_positions, &slots, &positions) {
-                Ok(Some(out)) => {
+                Ok(Some((out, _hidden))) => {
                     for i in 0..b {
                         let sidx = slot_order[i];
                         if let Some(snap) = self.slot_snaps[sidx].as_mut() {
@@ -1560,7 +1560,7 @@ impl Qwen35BatchAdapter {
         rope_positions: &[usize],
         slots: &[u32],
         positions: &[usize],
-    ) -> Result<Option<Vec<Vec<f32>>>> {
+    ) -> Result<Option<(Vec<Vec<f32>>, Tensor)>> {
         if !self.graphs_enabled {
             return Ok(None);
         }
@@ -1862,7 +1862,17 @@ impl Qwen35BatchAdapter {
                 }
             }
             let _ = hidden;
-            return Ok(Some(out));
+            // Глубокая копия, а не clone: clone разделяет хранилище, а внешний
+            // буфер графа перезаписывается следующим launch. Проверка спекуляции
+            // держит hidden между вызовами (PendingVerify), поэтому копируем.
+            // Для [K, hidden] это десятки килобайт — цена пренебрежимая.
+            let hidden_copy = {
+                let src = &self.decode_graphs[idx].hidden_t;
+                let dst = Tensor::zeros(src.shape().clone(), src.dtype(), &self.device)?;
+                dst.slice_set(src, 0, 0)?;
+                dst
+            };
+            return Ok(Some((out, hidden_copy)));
         }
 
         // Replay path.
