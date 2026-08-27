@@ -1421,7 +1421,7 @@ impl Qwen35BatchAdapter {
             .prefill_graphs
             .iter()
             .position(|g| g.t == t && g.slot == slot);
-        let (flat, hit_flag) = match hit {
+        let (flat, hit_flag, mtp_hidden) = match hit {
             Some(i) => {
                 {
                     let g = &self.prefill_graphs[i];
@@ -1442,25 +1442,11 @@ impl Qwen35BatchAdapter {
                     .flatten_all()?
                     .to_vec1::<f32>()
                     .map_err(|e| anyhow!("pgraph logits read: {e}"))?;
-                // MTP догоняет состояние по тому же чанку: ему нужны эмбеддинги
-                // и hidden всех позиций. Hidden берём из графового буфера,
-                // эмбеддинги считаем отдельно — это табличный поиск, дёшево.
-                // Без этого вызова снятие гейта PD-204 тихо сломало бы голову:
-                // она осталась бы с устаревшим KV над префиксом.
-                if self.mtp.is_some() && self.multimodal[slot].is_none() {
-                    let embeds = self
-                        .model
-                        .embed_tokens(&g.ids_t, &self.device)
-                        .map_err(|e| anyhow!("pgraph embed for MTP: {e}"))?;
-                    let hidden = g.hidden_t.clone();
-                    let start = chunk.start_pos;
-                    if let Some(mtp) = self.mtp.as_mut() {
-                        mtp.catch_up(slot, &embeds, &hidden, start, None)
-                            .map_err(|e| anyhow!("pgraph MTP catch-up: {e}"))?;
-                    }
-                }
+                // hidden отдаём наружу: catch_up вызывается ПОСЛЕ ветвления,
+                // иначе первый чанк (идущий веткой захвата) остаётся без него.
+                let hid = g.hidden_t.clone();
                 self.prefill_graphs.push(g);
-                (flat, true)
+                (flat, true, Some(hid))
             }
             None => {
                 // htod-кэш: промах параметров при захвате → явная ошибка вместо
@@ -1476,7 +1462,6 @@ impl Qwen35BatchAdapter {
                     .map_err(|e| anyhow!("pgraph eager prime: {e}"))?;
                 let hid_shape = prime_hidden.shape().clone();
                 let hid_dtype = prime_hidden.dtype();
-                drop(prime_hidden);
                 let flat = logits
                     .to_dtype(DType::F32)?
                     .flatten_all()?
@@ -1554,9 +1539,30 @@ impl Qwen35BatchAdapter {
                     // состояние консистентно; графы остаются включёнными.
                     Err(e) => eprintln!("[pg] capture failed (чанк отдан eager-прогоном): {e}"),
                 }
-                (flat, false)
+                // При захвате операции записываются, а не исполняются, поэтому
+                // буфер графа тогда пуст: настоящие hidden даёт прогревочный проход.
+                (flat, false, Some(prime_hidden))
             }
         };
+
+        // MTP догоняет состояние по этому чанку: ему нужны эмбеддинги и hidden
+        // всех позиций (mtp.rs:201 требует [1, seq, hidden]). Вызов стоит ПОСЛЕ
+        // ветвления, чтобы отработать и на первом чанке, идущем веткой захвата —
+        // иначе голова остаётся без начала префикса и угадывает мимо: замер дал
+        // drafted=2 accepted=0 против drafted=19 accepted=9 до правки.
+        if let Some(hid) = mtp_hidden {
+            if self.mtp.is_some() && self.multimodal[slot].is_none() {
+                let embeds = self
+                    .model
+                    .embed_tokens(&ids_t, &self.device)
+                    .map_err(|e| anyhow!("pgraph embed for MTP: {e}"))?;
+                let start = chunk.start_pos;
+                if let Some(mtp) = self.mtp.as_mut() {
+                    mtp.catch_up(slot, &embeds, &hid, start, None)
+                        .map_err(|e| anyhow!("pgraph MTP catch-up: {e}"))?;
+                }
+            }
+        }
 
         // Device kv_len продвинут ядром на +T — синхронизируем хостовое зеркало.
         {
