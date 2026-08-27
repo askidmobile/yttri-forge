@@ -90,6 +90,32 @@ pub fn prefill_chunk_size() -> usize {
 /// выигрывает у большего K. Замер 27B IQ2_XXS (128 ток): K=3 → 26.6 tok/s,
 /// K=2 → 22.8, K=4 → 15.1 при baseline 18.6 — всплески упираются в ~3.
 #[inline]
+/// Порог принятия для гейта окупаемости (QWEN36_MTP_MIN_ACCEPT, доля).
+/// Ноль отключает гейт целиком.
+fn mtp_gate_acceptance() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("QWEN36_MTP_MIN_ACCEPT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f64| (0.0..=1.0).contains(v))
+            .unwrap_or(0.70)
+    })
+}
+
+/// Сколько черновиков нужно, прежде чем судить о принятии
+/// (QWEN36_MTP_GATE_MIN_DRAFTED).
+fn mtp_gate_min_drafted() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("QWEN36_MTP_GATE_MIN_DRAFTED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(16)
+    })
+}
+
 pub fn speculative_width() -> usize {
     static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *W.get_or_init(|| {
@@ -333,6 +359,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             }
             if !self.model.speculative_available(slot)
                 || self.slots[slot].remaining_new_tokens() < 2
+                || self.mtp_unprofitable(slot)
             {
                 fallback.push(slot);
                 continue;
@@ -352,6 +379,35 @@ impl<M: BatchModel> BatchScheduler<M> {
         self.stats.decode_ns += t0.elapsed().as_nanos();
         self.stats.decode_steps += 1;
         Ok(StepOutcome::DidDecode(active))
+    }
+
+    /// Гейт окупаемости: при просевшем принятии MTP выключается на остаток
+    /// запроса целиком.
+    ///
+    /// Замер (Q8_0, RTX 4090, графы, ширина 2): раунд стоит около 48 мс и даёт
+    /// в среднем 1.74 токена против 65 мс за два обычных шага — запас 26%. При
+    /// принятии около 65% запас съедается, и MTP уходит в минус: на 24K
+    /// получилось 0.90x против базовых 29.30 ток/с.
+    ///
+    /// Сужение ширины тут не помогает, и это проверено замером: адаптив даёт на
+    /// той же точке 0.90x, а ширина 1 — 0.87x, потому что раунд шириной в один
+    /// токен дороже обычного шага, а выиграть можно максимум один токен. То
+    /// есть у адаптива нет выигрышного состояния при низком принятии, и
+    /// правильный ответ — не сужаться, а перестать спекулировать.
+    ///
+    /// Порог по принятию, а не по длине контекста: замер немонотонен по длине
+    /// (32K даёт 1.04x, 24K — 0.90x), и различает эти точки именно принятие
+    /// (73% против 65%). Гейт по длине отключал бы MTP там, где он выгоден.
+    ///
+    /// Счётчики живут в SpeculativeMetrics и сбрасываются на каждый запрос в
+    /// admit_from_queue, поэтому отдельного состояния не нужно.
+    fn mtp_unprofitable(&self, slot: usize) -> bool {
+        let m = &self.speculative[slot];
+        // Пока черновиков мало, оценка принятия недостоверна: не выключаем.
+        if m.drafted < mtp_gate_min_drafted() {
+            return false;
+        }
+        (m.accepted as f64) < mtp_gate_acceptance() * (m.drafted as f64)
     }
 
     fn speculative_slot(
