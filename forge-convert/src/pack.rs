@@ -279,7 +279,14 @@ fn apply_hf_transforms(
     shape: &[usize],
     lay: Option<crate::DeltaLayout>,
 ) -> Vec<f32> {
-    if hf.ends_with("norm.weight") && !hf.ends_with("linear_attn.norm.weight") {
+    // Нормы MTP-головы называются иначе: pre_fc_norm_embedding.weight и
+    // pre_fc_norm_hidden.weight. Проверка по "norm.weight" их не ловила, и они
+    // уходили в артефакт без сдвига — сверка показывала 185% и 119% расхождения,
+    // а голова давала ноль принятых черновиков.
+    let is_norm = hf.ends_with("norm.weight")
+        || hf.ends_with("pre_fc_norm_embedding.weight")
+        || hf.ends_with("pre_fc_norm_hidden.weight");
+    if is_norm && !hf.ends_with("linear_attn.norm.weight") {
         for v in values.iter_mut() {
             *v += 1.0;
         }
