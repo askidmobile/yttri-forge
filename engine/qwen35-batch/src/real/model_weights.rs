@@ -7434,7 +7434,7 @@ impl ModelWeights {
     /// yttri-forge: полный prefill-проход, capture-safe (CUDA graphs).
     /// ids_t: [1,T] u32 (device staging); rope_pos_dev: [T] u32 (start..start+T).
     /// kv_len_dev[slot] должен быть выставлен в start_pos ДО вызова (host H2D).
-    /// Возвращает (logits_last [1,vocab] F32, hidden_last [1,n_embd]).
+    /// Возвращает (logits_last [1,vocab] F32, hidden_all [1,T,n_embd]).
     /// Требует: MTP off, vision off, cuda_ctx на DeltaNet слоях, paged pool.
     pub fn forward_prefill_graphed(
         &mut self,
@@ -7468,7 +7468,12 @@ impl ModelWeights {
         // head только над последней позицией
         let hidden_last = hidden_all.i((.., t_len - 1..t_len, ..))?;
         let logits = self.output.forward(&hidden_last)?;
-        Ok((logits, hidden_last))
+        // Отдаём hidden ВСЕХ позиций чанка, а не только последней:
+        // MTP::catch_up (mtp.rs:201) требует [1, seq, hidden], чтобы построить
+        // собственный KV над префиксом. hidden_all здесь уже посчитан и раньше
+        // просто выбрасывался — именно из-за этого графовый префил был закрыт
+        // для MTP гейтом PD-204. Цена буфера при чанке 512 и hidden 5120 — ~5 МБ.
+        Ok((logits, hidden_all))
     }
 
     pub fn forward_decode_batch_graphed(
