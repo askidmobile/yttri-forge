@@ -1391,6 +1391,23 @@ impl Qwen35BatchAdapter {
                     .flatten_all()?
                     .to_vec1::<f32>()
                     .map_err(|e| anyhow!("pgraph logits read: {e}"))?;
+                // MTP догоняет состояние по тому же чанку: ему нужны эмбеддинги
+                // и hidden всех позиций. Hidden берём из графового буфера,
+                // эмбеддинги считаем отдельно — это табличный поиск, дёшево.
+                // Без этого вызова снятие гейта PD-204 тихо сломало бы голову:
+                // она осталась бы с устаревшим KV над префиксом.
+                if self.mtp.is_some() && self.multimodal[slot].is_none() {
+                    let embeds = self
+                        .model
+                        .embed_tokens(&g.ids_t, &self.device)
+                        .map_err(|e| anyhow!("pgraph embed for MTP: {e}"))?;
+                    let hidden = g.hidden_t.clone();
+                    let start = chunk.start_pos;
+                    if let Some(mtp) = self.mtp.as_mut() {
+                        mtp.catch_up(slot, &embeds, &hidden, start, None)
+                            .map_err(|e| anyhow!("pgraph MTP catch-up: {e}"))?;
+                    }
+                }
                 self.prefill_graphs.push(g);
                 (flat, true)
             }
