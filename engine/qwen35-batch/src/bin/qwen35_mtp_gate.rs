@@ -60,7 +60,12 @@ struct RunOut {
     accepted: usize,
     enabled: bool,
     used: bool,
-    secs: f64,
+    /// Полное время прогона (с), ВКЛЮЧАЯ prefill — на длинном контексте им и занято.
+    wall_s: f64,
+    /// Скорость декода (ток/с): только decode-фаза, без prefill.
+    decode_tps: f64,
+    /// Скорость prefill (ток/с).
+    prefill_tps: f64,
     /// Зазор top1-top2 на каждом вызове сэмплера (baseline: по токену на позицию).
     gaps: Vec<f32>,
 }
@@ -72,6 +77,7 @@ fn run(
     slots: usize,
 ) -> Result<RunOut> {
     let t0 = Instant::now();
+    let st0 = sched.stats_snapshot();
     let gaps = Arc::new(Mutex::new(Vec::new()));
     sched.set_sampler(Box::new(GapSampler { gaps: Arc::clone(&gaps) }));
     for _ in 0..slots {
@@ -105,13 +111,20 @@ fn run(
         }
     }
     let gaps = gaps.lock().unwrap().clone();
+    // Дельта по статистике: она копится в scheduler'е между прогонами.
+    let st = sched.stats_snapshot();
+    let d_tok = st.total_decode_tokens - st0.total_decode_tokens;
+    let d_dec = (st.decode_ns - st0.decode_ns) as f64 / 1e9;
+    let d_pre = (st.prefill_ns - st0.prefill_ns) as f64 / 1e9;
     Ok(RunOut {
         tokens,
         drafted,
         accepted,
         enabled,
         used,
-        secs: t0.elapsed().as_secs_f64(),
+        wall_s: t0.elapsed().as_secs_f64(),
+        decode_tps: if d_dec > 0.0 { d_tok as f64 / d_dec } else { 0.0 },
+        prefill_tps: if d_pre > 0.0 { prompt.len() as f64 / d_pre } else { 0.0 },
         gaps,
     })
 }
@@ -146,12 +159,19 @@ fn main() -> Result<()> {
     let mut argv = std::env::args().skip(1);
     let text = argv
         .next()
-        .context("usage: qwen35_mtp_gate TEXT.gguf MTP.gguf [--prompt N] [--new M] [--slots S] [--offset K] [--control]")?;
+        .context("usage: qwen35_mtp_gate TEXT.gguf MTP.gguf [--prompt N] [--new M] [--slots S] [--offset K] [--control] [--no-mtp] [--ignore-eos]")?;
     let mtp = argv.next().context("missing MTP.gguf")?;
     let (mut prompt_len, mut max_new, mut slots, mut control) = (1024usize, 64usize, 1usize, false);
     // Смещение по корпусу: разные промпты той же длины дают независимые
     // выборки первого расхождения — из них считается частота.
     let mut offset = 0usize;
+    // --no-mtp: только baseline. Нужен, чтобы снять пик VRAM без MTP отдельным
+    // процессом (внутри одного процесса MTP грузится поверх и пик уже общий).
+    let mut no_mtp = false;
+    // --ignore-eos: замеру скорости нужна одинаковая длина генерации на всех
+    // точках, а EOS обрывает её через несколько токенов. Подменяем eos на
+    // несуществующий id — слот идёт ровно max_new токенов.
+    let mut ignore_eos = false;
     let rest: Vec<String> = argv.collect();
     let mut i = 0;
     while i < rest.len() {
@@ -178,6 +198,14 @@ fn main() -> Result<()> {
                 offset = need(i)?;
                 i += 2;
             }
+            "--ignore-eos" => {
+                ignore_eos = true;
+                i += 1;
+            }
+            "--no-mtp" => {
+                no_mtp = true;
+                i += 1;
+            }
             "--control" => {
                 control = true;
                 i += 1;
@@ -195,7 +223,7 @@ fn main() -> Result<()> {
     let prompt = build_prompt(Path::new(&text), prompt_len, offset)?;
     let device = Device::new_cuda(0)?;
     let adapter = Qwen35BatchAdapter::load(Path::new(&text), device, slots)?;
-    let eos = adapter.eos();
+    let eos = if ignore_eos { u32::MAX } else { adapter.eos() };
     let vocab = adapter.vocab_size();
     let mut sched = BatchScheduler::new(adapter, slots, eos, vocab);
 
@@ -210,6 +238,25 @@ fn main() -> Result<()> {
         None
     };
 
+    if no_mtp {
+        println!(
+            "[gate] BASELINE prompt={prompt_len} decode={:.2} ток/с prefill={:.0} ток/с wall={:.1} с",
+            base.decode_tps, base.prefill_tps, base.wall_s
+        );
+        println!(
+            "{}",
+            json!({
+                "schema_version": "qwen35-mtp-gate-v3",
+                "mode": "baseline_only",
+                "prompt_tokens": prompt_len,
+                "max_new": max_new,
+                "base_decode_tps": base.decode_tps,
+                "base_prefill_tps": base.prefill_tps,
+                "base_wall_s": base.wall_s,
+            })
+        );
+        return Ok(());
+    }
     sched.model_mut().load_mtp(Path::new(&mtp))?;
     let spec = run(&mut sched, &prompt, max_new, slots)?;
 
@@ -218,15 +265,19 @@ fn main() -> Result<()> {
     println!(
         "[gate] prompt={prompt_len} offset={offset} width={width} adaptive={adaptive} \
          base_len={} mtp_len={} drafted={} accepted={} enabled={} used={} \
-         base_s={:.1} mtp_s={:.1}",
+         base_decode={:.2} ток/с mtp_decode={:.2} ток/с ускорение={:.2}x \
+         base_wall={:.1} с mtp_wall={:.1} с",
         base.tokens[0].len(),
         spec.tokens[0].len(),
         spec.drafted,
         spec.accepted,
         spec.enabled,
         spec.used,
-        base.secs,
-        spec.secs,
+        base.decode_tps,
+        spec.decode_tps,
+        if base.decode_tps > 0.0 { spec.decode_tps / base.decode_tps } else { 0.0 },
+        base.wall_s,
+        spec.wall_s,
     );
     match diff {
         None => println!("[gate] VERDICT match (совпало {matched} токенов)"),
@@ -288,8 +339,13 @@ fn main() -> Result<()> {
             "gap_tight_lt_0_1": tight,
             "gap_at_diff": diff.and_then(|p| base.gaps.get(p).copied()),
             "base_gaps": base.gaps,
-            "base_secs": base.secs,
-            "mtp_secs": spec.secs,
+            "base_decode_tps": base.decode_tps,
+            "mtp_decode_tps": spec.decode_tps,
+            "speedup": if base.decode_tps > 0.0 { spec.decode_tps / base.decode_tps } else { 0.0 },
+            "base_prefill_tps": base.prefill_tps,
+            "base_wall_s": base.wall_s,
+            "mtp_wall_s": spec.wall_s,
+            "acceptance": if spec.drafted > 0 { spec.accepted as f64 / spec.drafted as f64 } else { 0.0 },
             "base_tokens": base.tokens[0],
             "mtp_tokens": spec.tokens[0],
         })
