@@ -422,7 +422,22 @@ impl<M: BatchModel> BatchScheduler<M> {
         let t_verify = Instant::now();
         let rows = match self.model.speculative_verify(slot, &inputs, pos) {
             Ok(rows) if rows.len() == inputs.len() => rows,
-            _ => {
+            other => {
+                // Ошибку проверки НЕЛЬЗЯ глотать молча. Из-за этого целый день
+                // ушёл на поиск причины: при графовом префиле verify падал с
+                // «batched KV освобождён, нужен rehydrate_kv_from_paged»
+                // (model_weights.rs:4203), ветка `_` откатывала раунд, used
+                // оставался false, слот доживал запрос графовым декодом — и все
+                // внешние признаки выглядели исправными: вердикт «совпадает»,
+                // ошибок нет, скорость даже выше.
+                match other {
+                    Err(e) => eprintln!("[mtp] проверка сорвалась, откат раунда: {e}"),
+                    Ok(rows) => eprintln!(
+                        "[mtp] проверка вернула {} строк вместо {}, откат раунда",
+                        rows.len(),
+                        inputs.len()
+                    ),
+                }
                 self.model.speculative_rollback(slot)?;
                 self.sampler.restore(slot, sampler_checkpoint)?;
                 return Ok(Some(SpeculativeFallback::Commit));
