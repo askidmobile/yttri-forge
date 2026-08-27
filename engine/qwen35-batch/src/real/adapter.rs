@@ -745,7 +745,6 @@ impl BatchModel for Qwen35BatchAdapter {
             };
             #[cfg(not(feature = "cuda"))]
             let mi = None;
-            eprintln!("[mtpdbg] графовая ветка: mtp_inputs={}", mi.is_some());
             (None, mi)
         } else if let Some(media) = self.multimodal[sidx].as_mut() {
             let end = chunk
@@ -818,23 +817,12 @@ impl BatchModel for Qwen35BatchAdapter {
                 None,
             )
         };
-        eprintln!(
-            "[mtpdbg] перед catch_up: mtp={} inputs={}",
-            self.mtp.is_some(),
-            mtp_inputs.is_some()
-        );
         if let (Some(mtp), Some((embeds, hidden))) = (self.mtp.as_mut(), mtp_inputs) {
             let rope_positions = self.multimodal[sidx]
                 .as_ref()
                 .map(|media| slice_position_plan(&media.plan, chunk.start_pos, chunk.tokens.len()))
                 .transpose()?
                 .map(|plan| plan.rope_positions);
-            eprintln!(
-                "[mtpdbg] catch_up slot={sidx} pos={} embeds={:?} hidden={:?}",
-                chunk.start_pos,
-                embeds.dims(),
-                hidden.dims()
-            );
             mtp.catch_up(
                 sidx,
                 &embeds,
@@ -1431,7 +1419,7 @@ impl Qwen35BatchAdapter {
         // Условие снятия: графовый префил должен засевать состояние DeltaNet
         // так же, как это делает путь через снимок, либо speculative_available
         // должен признавать засев через страничный пул.
-        if self.multimodal[slot].is_some() || !self.graphs_enabled {
+        if self.mtp.is_some() || self.multimodal[slot].is_some() || !self.graphs_enabled {
             return Ok(None);
         }
         self.model
@@ -1596,7 +1584,6 @@ impl Qwen35BatchAdapter {
         // hidden отдаём наружу, а не вызываем catch_up здесь: пусть графовая
         // ветка prefill_chunk заполнит mtp_inputs тем же способом, что и eager,
         // и оба пути сойдутся в одну точку вызова.
-        eprintln!("[mtpdbg] pgraph чанк T={t} slot={slot} hidden={}", mtp_hidden.is_some());
         self.pg_last_hidden = mtp_hidden;
 
         // Device kv_len продвинут ядром на +T — синхронизируем хостовое зеркало.
