@@ -364,19 +364,17 @@ impl<M: BatchModel> BatchScheduler<M> {
         let timing = mtp_timing_on();
         let t_begin = Instant::now();
         self.speculative[slot].enabled = true;
-        let sampler_checkpoint = self.sampler.checkpoint(slot);
-        if let Err(e) = self.model.speculative_begin(slot) {
-            eprintln!("[mtp] начало раунда сорвалось: {e}");
-            self.model.speculative_rollback(slot)?;
-            self.sampler.restore(slot, sampler_checkpoint)?;
-            return Ok(Some(SpeculativeFallback::Begin));
-        }
-        let t_draft = Instant::now();
-
         // P0.5c adaptive width (QWEN36_MTP_ADAPTIVE=0 для отката): ширина
         // следующего раунда следует за фактической принимаемостью. Полный
         // успех (m>=K) наращивает K; провал (m<=1) срезает к 1 → раунд
         // пропускается (дешёвый baseline decode вместо draft+rollback ~65мс).
+        //
+        // Блок стоит ВЫШЕ speculative_begin намеренно. Раньше он шёл ниже, и
+        // ранний возврат при пропуске раунда оставлял транзакцию открытой:
+        // target_transactions[slot] = Some, speculative_available навсегда false,
+        // MTP мёртв до конца запроса. При включённом по умолчанию адаптиве это
+        // случалось на втором-четвёртом раунде каждого запроса. Заодно пропуск
+        // больше не платит чекпоинтом DeltaNet (копия всех слоёв) впустую.
         let mut width = self.slots[slot].remaining_new_tokens().min(speculative_width());
         if mtp_adaptive_on() {
             let (last_m, last_k) = (self.slot_last_m[slot], self.slot_last_k[slot]);
@@ -396,6 +394,15 @@ impl<M: BatchModel> BatchScheduler<M> {
             }
             width = width.min(k_next);
         }
+
+        let sampler_checkpoint = self.sampler.checkpoint(slot);
+        if let Err(e) = self.model.speculative_begin(slot) {
+            eprintln!("[mtp] начало раунда сорвалось: {e}");
+            self.model.speculative_rollback(slot)?;
+            self.sampler.restore(slot, sampler_checkpoint)?;
+            return Ok(Some(SpeculativeFallback::Begin));
+        }
+        let t_draft = Instant::now();
 
         let draft = match self.model.speculative_draft(
             slot,
