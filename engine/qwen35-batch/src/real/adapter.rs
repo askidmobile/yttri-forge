@@ -1158,21 +1158,19 @@ impl BatchModel for Qwen35BatchAdapter {
         let cache_positions: Vec<usize> = (pos..pos + k).collect();
         let rope_positions = self.rope_positions_for(slot, pos, k)?;
         let slots = vec![slot as u32; k];
-        // Сначала графовый путь: форма проверки — k строк по батчу на один слот,
-        // ровно та же, под которую захватывается декодный граф. Пул по ключу
-        // (b, slots) держит и обычную форму, и формы проверки, поэтому
-        // чередование не вызывает пересборки.
-        #[cfg(feature = "cuda")]
-        if let Some((rows, hidden)) =
-            self.decode_batch_graphed(k, inputs, &rope_positions, &slots, &cache_positions)?
-        {
-            self.verify_pending[slot] = Some(PendingVerify {
-                inputs: inputs.to_vec(),
-                pos,
-                hidden,
-            });
-            return Ok(rows);
-        }
+        // ПОПЫТКА ОТКАЧЕНА 2026-08-27. Здесь стоял вызов decode_batch_graphed:
+        // форма проверки (k строк по батчу) внешне совпадает с формой декодного
+        // графа [B, 1], и я счёл их взаимозаменяемыми. Совпадают ФОРМЫ, но не
+        // СМЫСЛ: в декоде b — число слотов по одному токену каждый, а в проверке
+        // это k токенов на ОДНОМ слоте с позициями pos..pos+k. У страничного пула
+        // kv_len на слот один, поэтому граф писал бы все k строк в одну позицию.
+        //
+        // Замер поймал: доля принятия упала с 9/19 до 0/2, при том что вердикт
+        // остался «совпадает» и скорость выросла (за счёт графового префила) —
+        // то есть по всем внешним признакам правка выглядела успешной.
+        //
+        // Условие для новой попытки: графовый путь должен принимать позиции
+        // ПОСТРОЧНО, а не одну на слот.
         let ids = Tensor::from_vec(inputs.to_vec(), (k, 1usize), &self.device)?;
         let (logits, hidden) = self
             .model
