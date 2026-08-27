@@ -4049,18 +4049,23 @@ impl GatedAttentionLayer {
         let block_table = ctx.block_table(b_sz)?;
         let total_q = q_f16.dim(0)?;
         let out = Tensor::zeros(q_f16.shape(), DType::F16, q_f16.device())?;
-        let lse = Tensor::zeros((self.n_head, total_q), DType::F32, q_f16.device())?;
         if per_row_gqa {
             // Построчно: строка i — декодный вызов (seqlen_q = 1, маска noop),
             // ключи 0..kv0+i задаются через seqlens_k = kv0+i+1. Строки уже
             // дописаны в пул выше, kv_len_dev ещё не инкрементирован.
             let seqlens_q1 = ctx.seqlens_q(1)?;
+            // LSE у varlen лежит как [h, total_q]; ядро её только пишет, читателей
+            // в крейте нет — один буфер [h, 1] на все строки.
+            let lse_row = Tensor::zeros((self.n_head, 1), DType::F32, q_f16.device())?;
             for i in 0..seq_len {
-                let seqlens_k_i = ctx.seqlens_k_for_prefill(1, i + 1)?;
+                // ВНИМАНИЕ: это не отдельный буфер, а narrow ОБЩЕГО seqlens_k_t,
+                // который перезаписывается на каждой строке каждого слоя.
+                // Корректность держится на порядке одного стрима (cumsum →
+                // run_mha → следующий cumsum) и на том, что захват графа идёт
+                // на нём же. Второй стрим или асинхронная копия сломают это молча.
+                let seqlens_k_shared = ctx.seqlens_k_for_prefill(1, i + 1)?;
                 let q_i = q_f16.narrow(0, i, 1)?; // [1, nh, hd]
                 let out_i = out.narrow(0, i, 1)?;
-                // LSE у varlen лежит как [h, total_q]; для строки — свой [h, 1].
-                let lse_i = Tensor::zeros((self.n_head, 1), DType::F32, q_f16.device())?;
                 crate::real::paged_attn::PagedAttn {
                     q: &q_i,
                     k_pool: &pool.k_pool,
@@ -4070,10 +4075,10 @@ impl GatedAttentionLayer {
                         _ => None,
                     },
                     seqlens_q: &seqlens_q1,
-                    seqlens_k: &seqlens_k_i,
+                    seqlens_k: &seqlens_k_shared,
                     block_table: &block_table,
                     out: &out_i,
-                    softmax_lse: &lse_i,
+                    softmax_lse: &lse_row,
                     b: 1,
                     h: self.n_head,
                     h_k: self.n_kv_head,
@@ -4090,6 +4095,7 @@ impl GatedAttentionLayer {
         } else {
             let seqlens_q = ctx.seqlens_q_prefill();
             let seqlens_k = ctx.seqlens_k(b_sz)?;
+            let lse = Tensor::zeros((self.n_head, total_q), DType::F32, q_f16.device())?;
             crate::real::paged_attn::PagedAttn {
                 q: &q_f16,
                 k_pool: &pool.k_pool,
@@ -7599,7 +7605,9 @@ impl ModelWeights {
     /// Проверка спекуляции, capture-safe: k токенов одного слота на страничном
     /// пути (см. `HybridBlock::forward_verify_paged`). ids_t: [1,k] u32;
     /// rope_pos_dev: [k] u32. Снаружи, до вызова: slots_dev = [slot],
-    /// kv_len_dev[slot] = pos, seqlens_q = [0,k]. Внутри kv_len[slot] += k.
+    /// kv_len_dev[slot] = pos. seqlens_k каждая строка attention выставляет
+    /// себе сама (kv0+i+1, построчные декодные вызовы со свёрткой GQA).
+    /// Внутри kv_len[slot] += k после всех слоёв.
     /// Возвращает (logits [k,vocab], hidden [k,n_embd] после выходной нормы) —
     /// те же формы, что у eager `forward_decode_batch_with_hidden`.
     #[cfg(feature = "cuda")]
@@ -7619,8 +7627,6 @@ impl ModelWeights {
         let ctx = self.paged_ctx.as_ref().ok_or_else(|| {
             candle_core::Error::Msg("verify graph: paged ctx missing".into())
         })?;
-        // seqlens_k = kv_len[slot] + k — одинаков для всех слоёв прохода.
-        ctx.seqlens_k_for_prefill(1, k)?;
         let slots = vec![slot; k];
         for block in self.blocks.iter_mut() {
             layer_in = block.forward_verify_paged(&layer_in, ctx, rope_pos_dev, &slots)?;
