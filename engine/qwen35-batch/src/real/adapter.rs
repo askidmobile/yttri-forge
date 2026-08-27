@@ -1419,7 +1419,7 @@ impl Qwen35BatchAdapter {
         // Условие снятия: графовый префил должен засевать состояние DeltaNet
         // так же, как это делает путь через снимок, либо speculative_available
         // должен признавать засев через страничный пул.
-        if self.mtp.is_some() || self.multimodal[slot].is_some() || !self.graphs_enabled {
+        if self.multimodal[slot].is_some() || !self.graphs_enabled {
             return Ok(None);
         }
         self.model
