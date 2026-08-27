@@ -150,6 +150,10 @@ impl Drop for PrefillGraphState {
 /// Сколько графов префилла держим одновременно (PD-A5).
 #[cfg(feature = "cuda")]
 const PGRAPH_LRU: usize = 8;
+/// Размер пула декодных графов: обычный декод плюс формы проверки спекуляции
+/// при ширинах 1..8. Каждый экземпляр держит свои внешние буферы, поэтому
+/// пул небольшой.
+const DGRAPH_LRU: usize = 6;
 
 /// Режим graph-prefill: `QWEN36_PGRAPH` = off (умолчание) | on | check.
 /// `check` — прогнать граф, откатить state и посчитать чанк ещё раз eager'ом,
@@ -201,7 +205,12 @@ pub struct Qwen35BatchAdapter {
     slot_seeded: Vec<bool>,
     /// CUDA-graph replay состояние (env QWEN36_CUDA_GRAPHS=1).
     #[cfg(feature = "cuda")]
-    decode_graph: Option<DecodeGraphState>,
+    /// Пул декодных графов по ключу (b, slots). Раньше хранился единственный
+    /// экземпляр, и чередование обычного декода (b = число слотов) с проверкой
+    /// спекуляции (b = K, все строки на один слот) пересобирало граф на каждом
+    /// шаге. Захват дорог, поэтому держим небольшой пул с вытеснением, как у
+    /// графов префила.
+    decode_graphs: Vec<DecodeGraphState>,
     /// LRU графов префилла (QWEN36_PGRAPH), ключ — (T, slot); хвост = свежий.
     #[cfg(feature = "cuda")]
     prefill_graphs: Vec<PrefillGraphState>,
@@ -380,7 +389,7 @@ impl Qwen35BatchAdapter {
             slot_snaps: (0..num_slots).map(|_| None).collect(),
             slot_seeded: vec![false; num_slots],
             #[cfg(feature = "cuda")]
-            decode_graph: None,
+            decode_graphs: Vec::new(),
             #[cfg(feature = "cuda")]
             paged_dirty: vec![true; num_slots],
             state_owner: None,
@@ -966,8 +975,8 @@ impl BatchModel for Qwen35BatchAdapter {
                 {
                     self.paged_dirty[sidx] = true;
                     // Seed меняет состав state — graph состав-зависим, инвалидируем.
-                    if self.decode_graph.is_some() {
-                        self.decode_graph = None;
+                    if !self.decode_graphs.is_empty() {
+                        self.decode_graphs.clear();
                     }
                     // Prefill оставил в пуле пиковые страницы интермедиатов
                     // (512-token chunk buffers). Trim при первом decode после
@@ -1019,7 +1028,7 @@ impl BatchModel for Qwen35BatchAdapter {
                 Ok(None) => {}
                 Err(e) => {
                     eprintln!("[graphs] graphed decode failed, eager fallback: {e}");
-                    self.decode_graph = None;
+                    self.decode_graphs.clear();
                     self.graphs_enabled = false;
                 }
             }
@@ -1635,15 +1644,13 @@ impl Qwen35BatchAdapter {
         };
         let _ = max_blocks;
 
-        let need_capture = match &self.decode_graph {
-            Some(g) => {
-                let why = if g.b != b {
-                    format!("b {}!={}", g.b, b)
-                } else if g.slots != slots {
-                    format!("slots {:?}!={:?}", g.slots, slots)
-                } else {
-                    String::new()
-                };
+        let hit = self
+            .decode_graphs
+            .iter()
+            .position(|g| g.b == b && g.slots == slots);
+        let need_capture = match hit {
+            Some(_) => {
+                let why = String::new();
                 if crate::scheduler::trace_on() && !why.is_empty() {
                     eprintln!("[graphs] recapture reason: {why}");
                 }
@@ -1661,7 +1668,7 @@ impl Qwen35BatchAdapter {
         }
 
         if need_capture {
-            self.decode_graph = None;
+            // пул не чистим: другие формы остаются валидными
             // Eager graphed-forward: реальный результат шага + prime всех ядер/кэшей.
             // Guard включает htod param cache: params_from_vec идёт в кэш (prime),
             // а при захвате промах → явная ошибка вместо pageable memcpy в графе.
@@ -1840,7 +1847,10 @@ impl Qwen35BatchAdapter {
             })();
             match capture_result {
                 Ok(state) => {
-                    self.decode_graph = Some(state);
+                    self.decode_graphs.push(state);
+                    while self.decode_graphs.len() > DGRAPH_LRU {
+                        self.decode_graphs.remove(0);
+                    }
                     if crate::scheduler::trace_on() {
                         eprintln!("[graphs] captured decode graph B={b} slots={slots:?}");
                     }
@@ -1856,7 +1866,12 @@ impl Qwen35BatchAdapter {
         }
 
         // Replay path.
-        let state = self.decode_graph.as_ref().unwrap();
+        let idx = self
+            .decode_graphs
+            .iter()
+            .position(|g| g.b == b && g.slots == slots)
+            .expect("декодный граф только что захвачен или найден");
+        let state = &self.decode_graphs[idx];
         let stream = cuda_dev.cuda_stream();
         {
             let ctx = self.model.paged_ctx.as_mut().unwrap();
