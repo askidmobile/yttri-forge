@@ -745,6 +745,7 @@ impl BatchModel for Qwen35BatchAdapter {
             };
             #[cfg(not(feature = "cuda"))]
             let mi = None;
+            eprintln!("[mtpdbg] графовая ветка: mtp_inputs={}", mi.is_some());
             (None, mi)
         } else if let Some(media) = self.multimodal[sidx].as_mut() {
             let end = chunk
@@ -823,6 +824,12 @@ impl BatchModel for Qwen35BatchAdapter {
                 .map(|media| slice_position_plan(&media.plan, chunk.start_pos, chunk.tokens.len()))
                 .transpose()?
                 .map(|plan| plan.rope_positions);
+            eprintln!(
+                "[mtpdbg] catch_up slot={sidx} pos={} embeds={:?} hidden={:?}",
+                chunk.start_pos,
+                embeds.dims(),
+                hidden.dims()
+            );
             mtp.catch_up(
                 sidx,
                 &embeds,
@@ -1584,6 +1591,7 @@ impl Qwen35BatchAdapter {
         // hidden отдаём наружу, а не вызываем catch_up здесь: пусть графовая
         // ветка prefill_chunk заполнит mtp_inputs тем же способом, что и eager,
         // и оба пути сойдутся в одну точку вызова.
+        eprintln!("[mtpdbg] pgraph чанк T={t} slot={slot} hidden={}", mtp_hidden.is_some());
         self.pg_last_hidden = mtp_hidden;
 
         // Device kv_len продвинут ядром на +T — синхронизируем хостовое зеркало.
