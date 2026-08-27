@@ -365,7 +365,8 @@ impl<M: BatchModel> BatchScheduler<M> {
         let t_begin = Instant::now();
         self.speculative[slot].enabled = true;
         let sampler_checkpoint = self.sampler.checkpoint(slot);
-        if self.model.speculative_begin(slot).is_err() {
+        if let Err(e) = self.model.speculative_begin(slot) {
+            eprintln!("[mtp] начало раунда сорвалось: {e}");
             self.model.speculative_rollback(slot)?;
             self.sampler.restore(slot, sampler_checkpoint)?;
             return Ok(Some(SpeculativeFallback::Begin));
@@ -404,7 +405,13 @@ impl<M: BatchModel> BatchScheduler<M> {
             width,
         ) {
             Ok(draft) if !draft.is_empty() => draft,
-            _ => {
+            other => {
+                // Ветка покрывает и пустой черновик, и ошибку — печатаем обе,
+                // иначе срыв до проверки неотличим от штатного пропуска раунда.
+                match other {
+                    Err(e) => eprintln!("[mtp] черновик сорвался: {e}"),
+                    Ok(_) => eprintln!("[mtp] черновик пуст, раунд пропущен"),
+                }
                 self.model.speculative_rollback(slot)?;
                 self.sampler.restore(slot, sampler_checkpoint)?;
                 return Ok(Some(SpeculativeFallback::Draft));
