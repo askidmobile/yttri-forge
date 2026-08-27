@@ -220,6 +220,11 @@ pub struct Qwen35BatchAdapter {
     /// LRU графов префилла (QWEN36_PGRAPH), ключ — (T, slot); хвост = свежий.
     #[cfg(feature = "cuda")]
     prefill_graphs: Vec<PrefillGraphState>,
+    /// Графы проверки спекуляции: k строк одного слота на страничном пути,
+    /// ключ (k, slot). Та же структура, что у префила, — это и есть префил-чанк
+    /// длины k, только DeltaNet идёт по batched-состоянию слота.
+    #[cfg(feature = "cuda")]
+    verify_graphs: Vec<PrefillGraphState>,
     /// Слот, чьё состояние сейчас лежит в single-slot буферах (DeltaNet
     /// cuda_ctx + attention kv_cache), и позиция, на которой оно остановилось.
     /// Пока владелец не сменился, snapshot/restore между чанками не нужны:
@@ -403,6 +408,8 @@ impl Qwen35BatchAdapter {
             state_owner: None,
             #[cfg(feature = "cuda")]
             prefill_graphs: Vec::new(),
+            #[cfg(feature = "cuda")]
+            verify_graphs: Vec::new(),
             #[cfg(feature = "cuda")]
             pg_paged_only: vec![false; num_slots],
             #[cfg(feature = "cuda")]
@@ -1052,6 +1059,12 @@ impl BatchModel for Qwen35BatchAdapter {
                         if let Some(snap) = self.slot_snaps[sidx].as_mut() {
                             snap.position = positions[i] + 1;
                         }
+                        // Хостовое зеркало длины batched-кеша: по нему
+                        // rehydrate_kv_from_paged собирает кеш из пула при
+                        // eager-откате и checkpoint_slot_batched снимает длину.
+                        // Без этого после графовых шагов оба видели бы длину
+                        // на момент миграции.
+                        self.model.set_kv_len_batched(sidx, positions[i] + 1);
                     }
                     return Ok(out);
                 }
@@ -1188,34 +1201,37 @@ impl BatchModel for Qwen35BatchAdapter {
         let cache_positions: Vec<usize> = (pos..pos + k).collect();
         let rope_positions = self.rope_positions_for(slot, pos, k)?;
         let slots = vec![slot as u32; k];
-        // ПОПЫТКА ОТКАЧЕНА 2026-08-27. Здесь стоял вызов decode_batch_graphed:
-        // форма проверки (k строк по батчу) внешне совпадает с формой декодного
-        // графа [B, 1], и я счёл их взаимозаменяемыми. Совпадают ФОРМЫ, но не
-        // СМЫСЛ: в декоде b — число слотов по одному токену каждый, а в проверке
-        // это k токенов на ОДНОМ слоте с позициями pos..pos+k. У страничного пула
-        // kv_len на слот один, поэтому граф писал бы все k строк в одну позицию.
-        //
-        // Замер поймал: доля принятия упала с 9/19 до 0/2, при том что вердикт
-        // остался «совпадает» и скорость выросла (за счёт графового префила) —
-        // то есть по всем внешним признакам правка выглядела успешной.
-        //
-        // Условие для новой попытки: графовый путь должен принимать позиции
-        // ПОСТРОЧНО, а не одну на слот.
-        let ids = Tensor::from_vec(inputs.to_vec(), (k, 1usize), &self.device)?;
-        let (logits, hidden) = self
-            .model
-            .forward_decode_batch_with_hidden(&ids, &cache_positions, &rope_positions, &slots)
-            .map_err(|error| anyhow!("speculative verify forward: {error}"))?;
+        #[cfg(feature = "cuda")]
+        let (flat, hidden) = if self.paged_authority(slot) {
+            // Пул — единственная копия KV слота: проверка идёт по нему графом.
+            // k строк одного слота — это префил-чанк длины k (append k позиций
+            // подряд + FA2 varlen с причинной маской), а НЕ декод B=k: у
+            // декодного пути одна позиция на слот, и k строк легли бы в одну —
+            // на этом сорвалась попытка 2026-08-27 через декодный граф.
+            // Уходить на eager здесь нельзя: batched-кеша нет, а его сборка из
+            // пула развела бы два хранилища, и следующий графовый шаг видел бы
+            // устаревшую длину.
+            let cur = self.model.paged_ctx.as_ref().unwrap().kv_len_host[slot] as usize;
+            let window = self.model.paged_window();
+            if cur != pos || pos + k > window {
+                return Err(anyhow!(
+                    "speculative verify: позиция {pos} против длины пула {cur}, окно {window}"
+                ));
+            }
+            let rope_host: Vec<u32> = rope_positions.iter().map(|&p| p as u32).collect();
+            let (flat, hidden, _) = self.paged_graph_run(true, slot, pos, inputs, rope_host)?;
+            self.model.paged_ctx.as_mut().unwrap().kv_len_host[slot] = (pos + k) as u32;
+            (flat, hidden)
+        } else {
+            self.verify_eager(inputs, &cache_positions, &rope_positions, &slots)?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let (flat, hidden) = self.verify_eager(inputs, &cache_positions, &rope_positions, &slots)?;
         self.verify_pending[slot] = Some(PendingVerify {
             inputs: inputs.to_vec(),
             pos,
             hidden,
         });
-        let flat = logits
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()
-            .map_err(|error| anyhow!("speculative verify logits: {error}"))?;
         let vocab = self.vocab_size();
         if flat.len() != k * vocab {
             return Err(anyhow!(
@@ -1238,6 +1254,10 @@ impl BatchModel for Qwen35BatchAdapter {
         if consumed > k {
             return Err(anyhow!("speculative accept {consumed} exceeds verified {k}"));
         }
+        #[cfg(feature = "cuda")]
+        let paged = self.paged_authority(slot);
+        #[cfg(not(feature = "cuda"))]
+        let paged = false;
         if consumed < k {
             let checkpoint = self.target_transactions[slot]
                 .as_ref()
@@ -1245,7 +1265,43 @@ impl BatchModel for Qwen35BatchAdapter {
             self.model
                 .restore_slot_batched(&self.device, checkpoint)
                 .map_err(|error| anyhow!("speculative accept restore: {error}"))?;
-            if consumed > 0 {
+            if paged {
+                // Откат отвергнутых строк в пуле — сдвиг длины (FR-007): строки
+                // pos..pos+consumed там уже верны, посчитаны по верному префиксу.
+                // DeltaNet восстановлен на начало раунда, поэтому принятые строки
+                // прогоняются той же графовой проверкой с длиной пула, откаченной
+                // на pos: attention допишет те же строки поверх, DeltaNet
+                // продвинется ровно на consumed. Это оставляет цену повторного
+                // прогона (Ф3 плана), но уже на графах.
+                #[cfg(feature = "cuda")]
+                {
+                    if consumed > 0 {
+                        let rope_host: Vec<u32> = self
+                            .rope_positions_for(slot, pending.pos, consumed)?
+                            .iter()
+                            .map(|&p| p as u32)
+                            .collect();
+                        self.paged_graph_run(
+                            true,
+                            slot,
+                            pending.pos,
+                            &pending.inputs[..consumed],
+                            rope_host,
+                        )?;
+                    } else {
+                        let ctx = self.model.paged_ctx.as_mut().unwrap();
+                        let mut lens = ctx.kv_len_host.clone();
+                        lens[slot] = pending.pos as u32;
+                        ctx.reset_kv_len(&lens)?;
+                    }
+                    self.model.paged_ctx.as_mut().unwrap().kv_len_host[slot] =
+                        (pending.pos + consumed) as u32;
+                }
+            } else if consumed > 0 {
+                #[cfg(feature = "cuda")]
+                self.model
+                    .rehydrate_kv_from_paged(slot)
+                    .map_err(|e| anyhow!("speculative accept rehydrate: {e}"))?;
                 let cache_positions: Vec<usize> =
                     (pending.pos..pending.pos + consumed).collect();
                 let rope_positions = self.rope_positions_for(slot, pending.pos, consumed)?;
@@ -1260,6 +1316,13 @@ impl BatchModel for Qwen35BatchAdapter {
                     .forward_decode_batch(&ids, &cache_positions, &rope_positions, &slots)
                     .map_err(|error| anyhow!("speculative accept re-run: {error}"))?;
             }
+        }
+        #[cfg(feature = "cuda")]
+        if paged {
+            // Зеркало длины batched-кеша (см. decode_batch): restore вернул
+            // длину на начало раунда, а eager-откат и следующий checkpoint
+            // должны видеть длину после принятых строк.
+            self.model.set_kv_len_batched(slot, pending.pos + consumed);
         }
         for row in 0..consumed {
             self.verified_target_hidden[slot].push(pending.hidden.i(row)?.unsqueeze(0)?);
@@ -1296,6 +1359,15 @@ impl BatchModel for Qwen35BatchAdapter {
             if let Some(position) = self.transaction_snapshot_positions[slot] {
                 if let Some(snapshot) = self.slot_snaps[slot].as_mut() {
                     snapshot.position = position;
+                }
+                // Проверка могла дописать k строк в пул до срыва раунда —
+                // длина слота возвращается на начало раунда (FR-007).
+                #[cfg(feature = "cuda")]
+                if self.paged_authority(slot) {
+                    let ctx = self.model.paged_ctx.as_mut().unwrap();
+                    let mut lens = ctx.kv_len_host.clone();
+                    lens[slot] = position as u32;
+                    ctx.reset_kv_len(&lens)?;
                 }
             }
         }
@@ -1387,39 +1459,12 @@ impl Qwen35BatchAdapter {
         };
         let slot = chunk.slot_idx;
         let t = chunk.tokens.len();
-        // PD-204 (частично снят 2026-08-27). Раньше сюда входило
-        // `self.mtp.is_some()`: графовый префил не отдавал hidden всех позиций,
-        // а MTP::catch_up без них не строит свой KV над префиксом. Теперь граф
-        // отдаёт hidden_all и catch_up вызывается сразу после replay, поэтому
-        // загруженные веса MTP больше не выключают графовый префил всему движку.
-        //
-        // Vision остаётся: mrope требует своих позиций, которых у графа нет.
-        // ВОЗВРАЩЕНО 2026-08-27 после проверки вехой. Сужение работает по своему
-        // предмету: графы захватываются, страничный пул наполняется (проверено —
-        // раньше и то и другое было нулевым). Но оно рассинхронизирует учёт длины:
-        // префил уходит в пул, а декод при активной транзакции MTP — на eager,
-        // к batched-кешу, и на втором шаге ловится
-        // «decode cache position 8193 is incompatible with slot 0 cache length 8192».
-        //
-        // Условие снятия: декод должен перестать переключаться между хранилищами
-        // внутри запроса. То есть гейт префила снимается ВМЕСТЕ с декодным, а не
-        // раньше него — фазы Ф2 и Ф3 плана (граф отдаёт hidden и принимает W токенов).
-        // ГЕЙТ ВОЗВРАЩЁН 2026-08-27. Подготовка сделана и работает: графовый
-        // префил отдаёт hidden всех позиций, catch_up вызывается на обоих путях,
-        // декодный граф выводит hidden и стал пулом по ключу формы.
-        //
-        // Но остаётся блокер, найденный замером: при графовом префиле не
-        // выставляется slot_seeded (он ставится только в ветке засева состояния
-        // из снимка, adapter.rs:900, работающей на eager-пути). А
-        // speculative_available требует этот флаг — значит спекуляцию НИ РАЗУ
-        // не запускают. Внешне всё исправно: вердикт «совпадает», ошибок нет,
-        // декод даже быстрее за счёт графового префила. Ловится только по
-        // счётчикам: drafted=2 accepted=0 used=false против 39/19 на eager.
-        //
-        // Условие снятия: графовый префил должен засевать состояние DeltaNet
-        // так же, как это делает путь через снимок, либо speculative_available
-        // должен признавать засев через страничный пул.
-        if self.mtp.is_some() || self.multimodal[slot].is_some() || !self.graphs_enabled {
+        // PD-204: MTP из гейта снят 2026-08-27 — проверка спекуляции идёт по
+        // страничному пулу (`speculative_verify` → `paged_graph_run`), поэтому
+        // загруженные веса MTP больше не отключают графовый префил всему
+        // движку. Vision остаётся: mrope требует своих позиций, которых у
+        // графа нет.
+        if self.multimodal[slot].is_some() || !self.graphs_enabled {
             return Ok(None);
         }
         self.model
@@ -1430,7 +1475,94 @@ impl Qwen35BatchAdapter {
             return Ok(None);
         }
 
-        let t_stage = std::time::Instant::now();
+        let t_run = std::time::Instant::now();
+        let rope_host: Vec<u32> = (chunk.start_pos..chunk.start_pos + t)
+            .map(|p| p as u32)
+            .collect();
+        let (flat, hidden, hit_flag) =
+            self.paged_graph_run(false, slot, chunk.start_pos, &chunk.tokens, rope_host)?;
+
+        // hidden отдаём наружу, а не вызываем catch_up здесь: пусть графовая
+        // ветка prefill_chunk заполнит mtp_inputs тем же способом, что и eager,
+        // и оба пути сойдутся в одну точку вызова.
+        self.pg_last_hidden = Some(hidden);
+
+        // Device kv_len продвинут ядром на +T — синхронизируем хостовое зеркало.
+        self.model.paged_ctx.as_mut().unwrap().kv_len_host[slot] = (chunk.start_pos + t) as u32;
+        eprintln!(
+            "[pg] chunk T={t} slot={slot} pos={} hit={} lru={} run={:.1}ms",
+            chunk.start_pos,
+            u8::from(hit_flag),
+            self.prefill_graphs.len(),
+            t_run.elapsed().as_secs_f64() * 1e3,
+        );
+        Ok(Some(flat))
+    }
+
+    /// Проверка спекуляции по batched-кешу (eager): k строк одного слота одним
+    /// multi-token forward — батчевая ось как ось позиций, те же decode-ядра,
+    /// что и k одиночных шагов. Возвращает (плоские F32-логиты, hidden [k,H]).
+    fn verify_eager(
+        &mut self,
+        inputs: &[u32],
+        cache_positions: &[usize],
+        rope_positions: &[usize],
+        slots: &[u32],
+    ) -> Result<(Vec<f32>, Tensor)> {
+        // После отказа графов batched-кеш мог быть освобождён миграцией —
+        // собрать обратно (пусто, если кеш на месте). Без этого
+        // forward_attn_decode_batch отказывает, а планировщик до 2026-08-27
+        // глотал отказ молча — так MTP «не принимался» при графовом префиле.
+        #[cfg(feature = "cuda")]
+        self.model
+            .rehydrate_kv_from_paged(slots[0] as usize)
+            .map_err(|e| anyhow!("speculative verify rehydrate: {e}"))?;
+        let ids = Tensor::from_vec(inputs.to_vec(), (inputs.len(), 1usize), &self.device)?;
+        let (logits, hidden) = self
+            .model
+            .forward_decode_batch_with_hidden(&ids, cache_positions, rope_positions, slots)
+            .map_err(|error| anyhow!("speculative verify forward: {error}"))?;
+        let flat = logits
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+            .map_err(|error| anyhow!("speculative verify logits: {error}"))?;
+        Ok((flat, hidden))
+    }
+
+    /// Хранилище KV слота — страничный пул (графы включены, пул актуален),
+    /// а не batched-кеш. Выбирает путь проверки спекуляции и отката.
+    #[cfg(feature = "cuda")]
+    fn paged_authority(&self, slot: usize) -> bool {
+        self.graphs_enabled && self.model.paged_ctx.is_some() && !self.paged_dirty[slot]
+    }
+
+    /// Прогон графа на страничном пути для T токенов одного слота: префил-чанк
+    /// (`verify=false`, пул `prefill_graphs`) или проверка спекуляции
+    /// (`verify=true`, пул `verify_graphs`). Вне графа стейджится вся динамика:
+    /// ids, позиции RoPE, kv_len[slot]=start_pos, seqlens_q=[0,T], block_table.
+    /// Граф ищется по ключу (T, slot); при промахе — прогрев eager-проходом
+    /// (он же результат) и захват. Возвращает (плоские F32-логиты, hidden,
+    /// попадание в пул): для префила логиты последней позиции и hidden [1,T,H],
+    /// для проверки — логиты всех T строк и hidden [T,H]. hidden — всегда
+    /// глубокая копия: внешний буфер графа перезаписывается следующим launch,
+    /// а проверка держит его между вызовами (PendingVerify, MTP commit).
+    /// После вызова device kv_len[slot] = start_pos + T; хостовое зеркало
+    /// обновляет вызывающий.
+    #[cfg(feature = "cuda")]
+    fn paged_graph_run(
+        &mut self,
+        verify: bool,
+        slot: usize,
+        start_pos: usize,
+        tokens: &[u32],
+        rope_host: Vec<u32>,
+    ) -> Result<(Vec<f32>, Tensor, bool)> {
+        let Device::Cuda(cuda_dev) = &self.device else {
+            return Err(anyhow!("paged graph: не CUDA-устройство"));
+        };
+        let t = tokens.len();
+        let kind = if verify { "verify" } else { "prefill" };
         // Слот владеет страницами [slot*mb .. (slot+1)*mb).
         let block_table = {
             let ctx = self.model.paged_ctx.as_ref().unwrap();
@@ -1439,30 +1571,35 @@ impl Qwen35BatchAdapter {
         };
         {
             let ctx = self.model.paged_ctx.as_mut().unwrap();
-            // rope_pos_t декода префиллом не используется (позиции идут своим
+            // rope_pos_t декода здесь не используется (позиции идут своим
             // буфером [T]), но slots/block_table нужны append-ядру.
-            ctx.stage_inputs(&[slot as u32], &[chunk.start_pos], &block_table)?;
+            ctx.stage_inputs(&[slot as u32], &[start_pos], &block_table)?;
             let mut lens = ctx.kv_len_host.clone();
-            lens[slot] = chunk.start_pos as u32;
+            lens[slot] = start_pos as u32;
             ctx.reset_kv_len(&lens)?;
             ctx.set_prefill_seqlens_q(t)?;
         }
-        let rope_host: Vec<u32> = (chunk.start_pos..chunk.start_pos + t)
-            .map(|p| p as u32)
-            .collect();
-        let stage_ms = t_stage.elapsed().as_secs_f64() * 1e3;
-
-        let t_run = std::time::Instant::now();
-        let hit = self
-            .prefill_graphs
-            .iter()
-            .position(|g| g.t == t && g.slot == slot);
-        let (flat, hit_flag, mtp_hidden) = match hit {
+        let slot_u = slot as u32;
+        let fwd = |m: &mut ModelWeights, ids: &Tensor, rope: &Tensor| -> Result<(Tensor, Tensor)> {
+            let r = if verify {
+                m.forward_verify_graphed(ids, rope, t, slot_u)
+            } else {
+                m.forward_prefill_graphed(ids, rope, t)
+            };
+            r.map_err(|e| anyhow!("pgraph {kind} forward: {e}"))
+        };
+        let pool = if verify {
+            &mut self.verify_graphs
+        } else {
+            &mut self.prefill_graphs
+        };
+        let hit = pool.iter().position(|g| g.t == t && g.slot == slot);
+        match hit {
             Some(i) => {
                 {
-                    let g = &self.prefill_graphs[i];
+                    let g = &pool[i];
                     let ids_staging =
-                        Tensor::from_vec(chunk.tokens.clone(), (1usize, t), &Device::Cpu)?
+                        Tensor::from_vec(tokens.to_vec(), (1usize, t), &Device::Cpu)?
                             .to_device(&self.device)?;
                     g.ids_t.slice_set(&ids_staging, 0, 0)?;
                     let rope_staging =
@@ -1471,38 +1608,35 @@ impl Qwen35BatchAdapter {
                     g.launch()?;
                 }
                 // LRU: свежий — в хвост.
-                let g = self.prefill_graphs.remove(i);
+                let g = pool.remove(i);
                 let flat = g
                     .logits_t
                     .to_dtype(DType::F32)?
                     .flatten_all()?
                     .to_vec1::<f32>()
-                    .map_err(|e| anyhow!("pgraph logits read: {e}"))?;
-                // hidden отдаём наружу: catch_up вызывается ПОСЛЕ ветвления,
-                // иначе первый чанк (идущий веткой захвата) остаётся без него.
-                let hid = g.hidden_t.clone();
-                self.prefill_graphs.push(g);
-                (flat, true, Some(hid))
+                    .map_err(|e| anyhow!("pgraph {kind} logits read: {e}"))?;
+                let hidden =
+                    Tensor::zeros(g.hidden_t.shape().clone(), g.hidden_t.dtype(), &self.device)?;
+                hidden.slice_set(&g.hidden_t, 0, 0)?;
+                pool.push(g);
+                Ok((flat, hidden, true))
             }
             None => {
                 // htod-кэш: промах параметров при захвате → явная ошибка вместо
                 // pageable memcpy внутри графа.
                 let _htod_guard = cuda_dev.enable_cuda_graph_htod_cache();
-                let ids_t = Tensor::from_vec(chunk.tokens.clone(), (1usize, t), &self.device)?;
-                let rope_pos_t = Tensor::from_vec(rope_host.clone(), t, &self.device)?;
-                // 1) Eager-прогон: это и есть результат чанка (захват ядра не
+                let ids_t = Tensor::from_vec(tokens.to_vec(), (1usize, t), &self.device)?;
+                let rope_pos_t = Tensor::from_vec(rope_host, t, &self.device)?;
+                // 1) Eager-прогон: это и есть результат (захват ядра не
                 //    исполняет) + прогрев ядер/htod-кэша.
-                let (logits, prime_hidden) = self
-                    .model
-                    .forward_prefill_graphed(&ids_t, &rope_pos_t, t)
-                    .map_err(|e| anyhow!("pgraph eager prime: {e}"))?;
+                let (logits, prime_hidden) = fwd(&mut self.model, &ids_t, &rope_pos_t)?;
                 let hid_shape = prime_hidden.shape().clone();
                 let hid_dtype = prime_hidden.dtype();
                 let flat = logits
                     .to_dtype(DType::F32)?
                     .flatten_all()?
                     .to_vec1::<f32>()
-                    .map_err(|e| anyhow!("pgraph prime logits: {e}"))?;
+                    .map_err(|e| anyhow!("pgraph {kind} prime logits: {e}"))?;
                 let out_shape = logits.shape().clone();
                 let out_dtype = logits.dtype();
                 drop(logits);
@@ -1510,8 +1644,7 @@ impl Qwen35BatchAdapter {
                 let captured = (|| -> Result<PrefillGraphState> {
                     use cudarc::driver::{result as cres, sys as csys};
                     let logits_out = Tensor::zeros(out_shape, out_dtype, &self.device)?;
-                    let hidden_out =
-                        Tensor::zeros(hid_shape.clone(), hid_dtype, &self.device)?;
+                    let hidden_out = Tensor::zeros(hid_shape.clone(), hid_dtype, &self.device)?;
                     unsafe {
                         cres::stream::begin_capture(
                             stream.cu_stream(),
@@ -1519,13 +1652,11 @@ impl Qwen35BatchAdapter {
                         )
                     }
                     .map_err(|e| anyhow!("pgraph begin_capture: {e}"))?;
-                    let forward_result =
-                        self.model.forward_prefill_graphed(&ids_t, &rope_pos_t, t);
-                    let (logits_t, hidden_t) = match forward_result {
+                    let (logits_t, hidden_t) = match fwd(&mut self.model, &ids_t, &rope_pos_t) {
                         Ok(v) => v,
                         Err(e) => {
                             let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
-                            return Err(anyhow!("pgraph capture forward: {e}"));
+                            return Err(anyhow!("pgraph capture: {e}"));
                         }
                     };
                     if let Err(e) = logits_out.slice_set(&logits_t, 0, 0) {
@@ -1551,7 +1682,7 @@ impl Qwen35BatchAdapter {
                         unsafe { csys::cuGraphDestroy(cu_graph) };
                         return Err(anyhow!("pgraph instantiate: {res:?}"));
                     }
-                    eprintln!("[pg] captured T={t} slot={slot} nodes={nodes}");
+                    eprintln!("[pg] captured {kind} T={t} slot={slot} nodes={nodes}");
                     Ok(PrefillGraphState {
                         exec,
                         cu_graph,
@@ -1566,39 +1697,20 @@ impl Qwen35BatchAdapter {
                 })();
                 match captured {
                     Ok(g) => {
-                        self.prefill_graphs.push(g);
-                        while self.prefill_graphs.len() > PGRAPH_LRU {
-                            self.prefill_graphs.remove(0);
+                        pool.push(g);
+                        while pool.len() > PGRAPH_LRU {
+                            pool.remove(0);
                         }
                     }
-                    // Захват не удался — чанк уже посчитан eager-прогоном,
+                    // Захват не удался — результат уже посчитан eager-прогоном,
                     // состояние консистентно; графы остаются включёнными.
-                    Err(e) => eprintln!("[pg] capture failed (чанк отдан eager-прогоном): {e}"),
+                    Err(e) => eprintln!("[pg] {kind} capture failed (результат отдан eager-прогоном): {e}"),
                 }
                 // При захвате операции записываются, а не исполняются, поэтому
-                // буфер графа тогда пуст: настоящие hidden даёт прогревочный проход.
-                (flat, false, Some(prime_hidden))
+                // буфер графа пуст: настоящие hidden даёт прогревочный проход.
+                Ok((flat, prime_hidden, false))
             }
-        };
-
-        // hidden отдаём наружу, а не вызываем catch_up здесь: пусть графовая
-        // ветка prefill_chunk заполнит mtp_inputs тем же способом, что и eager,
-        // и оба пути сойдутся в одну точку вызова.
-        self.pg_last_hidden = mtp_hidden;
-
-        // Device kv_len продвинут ядром на +T — синхронизируем хостовое зеркало.
-        {
-            let ctx = self.model.paged_ctx.as_mut().unwrap();
-            ctx.kv_len_host[slot] = (chunk.start_pos + t) as u32;
         }
-        eprintln!(
-            "[pg] chunk T={t} slot={slot} pos={} hit={} lru={} stage={stage_ms:.1}ms run={:.1}ms",
-            chunk.start_pos,
-            u8::from(hit_flag),
-            self.prefill_graphs.len(),
-            t_run.elapsed().as_secs_f64() * 1e3,
-        );
-        Ok(Some(flat))
     }
 
     #[cfg(feature = "cuda")]

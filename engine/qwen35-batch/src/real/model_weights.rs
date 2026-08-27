@@ -4710,6 +4710,38 @@ impl HybridBlock {
         Ok((ffn_out + residual)?)
     }
 
+    /// Проверка спекуляции на страничном пути: k строк ОДНОГО слота, capture-safe.
+    /// x: [k, 1, n_embd] — декодная форма. DeltaNet идёт batched-декодом по
+    /// batched-состоянию слота (повторяющиеся слоты — ветка serial_rows,
+    /// бит-эксактно k одиночным шагам). Attention — префил-append k строк в пул
+    /// и FA2 varlen с причинной маской (строка i видит 0..kv0+i); ему нужна
+    /// форма [1, k, ·], поэтому вокруг него reshape. Декодный append здесь не
+    /// годится: у него одна позиция на слот, и k строк легли бы в одну.
+    #[cfg(feature = "cuda")]
+    fn forward_verify_paged(
+        &mut self,
+        x: &Tensor,
+        ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
+        rope_pos_dev: &Tensor,
+        slots: &[u32],
+    ) -> Result<Tensor> {
+        let (k, _, n_embd) = x.dims3()?;
+        let residual = x;
+        let normed = self.attn_norm.forward(x)?;
+        let layer_out = match &mut self.layer {
+            HybridLayerType::DeltaNet(delta) => delta.forward_decode_batch(&normed, slots)?,
+            HybridLayerType::Attention(attn) => attn
+                .forward_attn_prefill_paged(&normed.reshape((1, k, n_embd))?, ctx, rope_pos_dev)?
+                .reshape((k, 1, n_embd))?,
+        };
+        let x = (layer_out + residual)?;
+
+        let residual = &x;
+        let normed = self.ffn_norm.forward(&x)?;
+        let ffn_out = self.ff.forward_decode_batch(&normed)?;
+        ffn_out + residual
+    }
+
     fn forward_decode_batch_paged(
         &mut self,
         x: &Tensor,
@@ -7474,6 +7506,40 @@ impl ModelWeights {
         // просто выбрасывался — именно из-за этого графовый префил был закрыт
         // для MTP гейтом PD-204. Цена буфера при чанке 512 и hidden 5120 — ~5 МБ.
         Ok((logits, hidden_all))
+    }
+
+    /// Проверка спекуляции, capture-safe: k токенов одного слота на страничном
+    /// пути (см. `HybridBlock::forward_verify_paged`). ids_t: [1,k] u32;
+    /// rope_pos_dev: [k] u32. Снаружи, до вызова: slots_dev = [slot],
+    /// kv_len_dev[slot] = pos, seqlens_q = [0,k]. Внутри kv_len[slot] += k.
+    /// Возвращает (logits [k,vocab], hidden [k,n_embd] после выходной нормы) —
+    /// те же формы, что у eager `forward_decode_batch_with_hidden`.
+    #[cfg(feature = "cuda")]
+    pub fn forward_verify_graphed(
+        &mut self,
+        ids_t: &Tensor,
+        rope_pos_dev: &Tensor,
+        k: usize,
+        slot: u32,
+    ) -> Result<(Tensor, Tensor)> {
+        let emb = self.tok_embeddings_cuda.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("verify graph: no CUDA embedding".into())
+        })?;
+        let mut layer_in = emb
+            .embedding(ids_t)?
+            .reshape((k, 1usize, self.hidden_size()))?;
+        let ctx = self.paged_ctx.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("verify graph: paged ctx missing".into())
+        })?;
+        // seqlens_k = kv_len[slot] + k — одинаков для всех слоёв прохода.
+        ctx.seqlens_k_for_prefill(1, k)?;
+        let slots = vec![slot; k];
+        for block in self.blocks.iter_mut() {
+            layer_in = block.forward_verify_paged(&layer_in, ctx, rope_pos_dev, &slots)?;
+        }
+        ctx.launch_increment_t(1, k)?;
+        let hidden = self.norm.forward(&layer_in.i((.., 0, ..))?)?;
+        Ok((self.output.forward(&hidden)?, hidden))
     }
 
     pub fn forward_decode_batch_graphed(
