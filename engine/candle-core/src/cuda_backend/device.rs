@@ -416,21 +416,6 @@ impl CudaDevice {
     pub fn new_with_stream(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         let stream = context.new_stream().w()?;
-        // Профиль показал: 68% драйверных вызовов на forward — событийная
-        // бухгалтерия cudarc (по 4424 create/wait/destroy на чанк против 1940
-        // запусков ядер). Она нужна для упорядочивания между потоками CUDA.
-        //
-        // ВНИМАНИЕ, УСЛОВИЕ БЕЗОПАСНОСТИ: отключать можно только если тензоры
-        // не пересекают границу потоков. Сервер сегодня создаёт ДВА устройства
-        // (модель и отдельное под запросы VRAM), то есть потока два, и доказать
-        // отсутствие пересечения нельзя. Поэтому флаг по умолчанию выключен —
-        // он существует, чтобы измерить потолок выигрыша, а не чтобы включать
-        // его в продакшене. Совпадение выхода при включённом флаге признаком
-        // безопасности НЕ является: гонка может не проявиться на одном прогоне.
-        if std::env::var("QWEN36_NO_EVENT_TRACKING").as_deref() == Ok("1") {
-            unsafe { context.disable_event_tracking() };
-            eprintln!("[cuda] event tracking: OFF (замер потолка, небезопасно при двух потоках)");
-        }
         Self::from_context_and_stream(context, stream)
     }
 
@@ -462,6 +447,22 @@ impl BackendDevice for CudaDevice {
 
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
+        // Профиль nsys: 68% драйверных вызовов на forward-чанк — событийная
+        // бухгалтерия cudarc, по 4424 create/wait/destroy против 1940 запусков
+        // ядер. Она упорядочивает работу между потоками CUDA.
+        //
+        // Это ЕДИНСТВЕННАЯ живая точка создания устройства: Device::new_cuda
+        // приходит сюда, а new_with_stream в проекте не вызывается (была
+        // попытка поставить флаг туда — линковщик выбросил его как мёртвый код).
+        //
+        // Флаг по умолчанию выключен: отключение безопасно лишь при отсутствии
+        // тензоров, пересекающих границу потоков, а per_thread_stream даёт свой
+        // поток на каждый поток ОС. Совпадение выхода при включённом флаге
+        // признаком безопасности НЕ является — гонка может не проявиться.
+        if std::env::var("QWEN36_NO_EVENT_TRACKING").as_deref() == Ok("1") {
+            unsafe { context.disable_event_tracking() };
+            eprintln!("[cuda] event tracking: OFF (замер потолка)");
+        }
         let stream = context.per_thread_stream();
         Self::from_context_and_stream(context, stream)
     }
