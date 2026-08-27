@@ -282,8 +282,21 @@ extern "C" void run_mha(
         const int block_n = d <= 64 ? 256 : (d <= 128 ? 128 : 64);
         const int num_n_blocks = fa_ceildiv(seqlen_k, block_n);
         const int num_m_blocks = fa_ceildiv(params.seqlen_q, 64);
+        // Проверка спекуляции: несколько строк одного слота, причинная маска,
+        // GQA не свёрнута. Апстримная эвристика считает волны по b*h*m (24 при
+        // h=24) и даёт 5 сплитов, а блоков на сплит берёт от seqlen_k — это
+        // ОКНО пула, не длина контекста. При окне 196608 и контексте 32K на
+        // сплит приходится 308 блоков: весь контекст обрабатывает один сплит
+        // на голову, остальные четыре простаивают. Отсюда цена ~9 мкс за
+        // страницу окна на 32K и её отсутствие на 8K (там при любом окне
+        // активен один сплит одной длины); на 128K одна цепочка тянула 1024
+        // блока (замер 2026-08-27). Правило как у декода: сплитов максимум,
+        // не меньше двух блоков на сплит.
+        const bool small_q = !is_decode && params.seqlen_q <= 16;
         int ns;
-        if (is_decode) {
+        if (small_q) {
+            ns = std::min(std::max(num_n_blocks / 2, 1), 128);
+        } else if (is_decode) {
             // Декод: запрос один, поэтому без сплитов сетка это b*h блоков
             // (16-32 на 28 SM) и карта простаивает. Апстримная эвристика
             // считает «волны» в предположении, что блок делает много работы,
@@ -306,7 +319,8 @@ extern "C" void run_mha(
         // Печатаем по одному разу для декода (seqlen_q==1) и для префилла.
         static bool reported_decode = false;
         static bool reported_prefill = false;
-        bool& reported = is_decode ? reported_decode : reported_prefill;
+        static bool reported_small = false;
+        bool& reported = is_decode ? reported_decode : (small_q ? reported_small : reported_prefill);
         if (!reported && std::getenv("QWEN36_FA_DEBUG") != nullptr) {
             reported = true;
             fprintf(stderr, "[fa] splits: b=%d h=%d->%d seqlen_q=%d->%d seqlen_k=%d n_blocks=%d sms=%d gqa_swap=%d -> num_splits=%d\n",
