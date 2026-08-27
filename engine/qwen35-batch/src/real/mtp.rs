@@ -20,12 +20,21 @@ const HEAD_DIM: usize = 256;
 const ROPE_DIM: usize = 64;
 const ROPE_BASE: f64 = 10_000_000.0;
 
+/// KV головы: предвыделенные буферы с запасом по длине, строки дописываются
+/// на месте. Раньше на каждом шаге черновика делался `Tensor::cat` всего KV —
+/// O(контекст) копия на шаг. Чекпоинт транзакции разделяет буферы и держит
+/// свою `len`: черновик пишет только за committed-префикс, откат — сдвиг длины,
+/// так что общий буфер безопасен (та же логика, что у batched-кеша модели).
 #[derive(Clone)]
 struct MtpKv {
-    k: Tensor, // [1, kv, KV_HEADS, HEAD_DIM], F16
+    k: Tensor, // [1, cap, KV_HEADS, HEAD_DIM], F16; валидны строки 0..len
     v: Tensor,
     len: usize,
 }
+
+/// Шаг роста буфера KV головы (строк). Черновик дописывает 1–8 строк на раунд,
+/// префил — по чанку; 4096 строк × 4 головы × 256 × F16 = 8 МБ на K.
+const MTP_KV_GROW: usize = 4096;
 
 #[derive(Clone, Default)]
 struct MtpSlot {
@@ -183,7 +192,7 @@ impl Qwen35Mtp {
             .kv
             .as_mut()
             .ok_or_else(|| candle_core::Error::Msg("MTP draft produced no KV state".into()))?;
-        if committed > cache.k.dim(1)? {
+        if committed > cache.len {
             candle_core::bail!("MTP committed length exceeds draft KV");
         }
         cache.len = committed;
@@ -362,22 +371,83 @@ impl Qwen35Mtp {
         let k = apply_partial_rope(&k, &cos, &sin)?;
         let k_new = k.transpose(1, 2)?.to_dtype(DType::F16)?.contiguous()?;
         let v_new = v.transpose(1, 2)?.to_dtype(DType::F16)?.contiguous()?;
+        let (k_all, v_all, total) = self.append_kv(slot, &k_new, &v_new)?;
+        let past = total - seq;
+        let scale = 1.0 / (HEAD_DIM as f64).sqrt();
 
-        let past = self.slots[slot].kv.as_ref().map(|cache| cache.len).unwrap_or(0);
-        let (k_all, v_all) = match self.slots[slot].kv.as_ref() {
-            Some(cache) if cache.len > 0 => (
-                Tensor::cat(&[&cache.k.narrow(1, 0, cache.len)?, &k_new], 1)?,
-                Tensor::cat(&[&cache.v.narrow(1, 0, cache.len)?, &v_new], 1)?,
-            ),
-            _ => (k_new, v_new),
+        // CUDA: flash-attn v2 — GQA нативно, F16 входы, F32 аккумулятор внутри.
+        // Причинная маска при q_len < k_len выравнивается по правому-нижнему
+        // углу: строка i видит 0..past+i — то же, что строила старая маска.
+        // Без этого черновик на каждом шаге разворачивал KV на все головы в F32
+        // (broadcast_as + contiguous: ~1.6 ГБ временных тензоров на шаг при 32K)
+        // и строил маску seq×total на хосте — O(контекст) на каждый токен.
+        #[cfg(feature = "cuda")]
+        let mixed = if q.device().is_cuda() {
+            let q_f = q.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?; // [1, seq, H, hd]
+            candle_flash_attn::flash_attn(&q_f, &k_all, &v_all, scale as f32, true)?
+                .transpose(1, 2)?
+                .to_dtype(DType::F32)?
+        } else {
+            self.attention_reference(&q, &k_all, &v_all, past, seq, total, scale)?
         };
-        let total = past + seq;
-        self.slots[slot].kv = Some(MtpKv {
-            k: k_all.clone(),
-            v: v_all.clone(),
-            len: total,
-        });
+        #[cfg(not(feature = "cuda"))]
+        let mixed = self.attention_reference(&q, &k_all, &v_all, past, seq, total, scale)?;
 
+        let mixed = (mixed * candle_nn::ops::sigmoid(&gate)?)?
+            .transpose(1, 2)?
+            .reshape((1, seq, self.profile.head_count * HEAD_DIM))?;
+        self.o.forward(&mixed)
+    }
+
+    /// Дописать строки в KV головы на месте; вернуть (k, v) валидной длины.
+    fn append_kv(
+        &mut self,
+        slot: usize,
+        k_new: &Tensor,
+        v_new: &Tensor,
+    ) -> Result<(Tensor, Tensor, usize)> {
+        let (_, seq, kv_heads, hd) = k_new.dims4()?;
+        let past = self.slots[slot].kv.as_ref().map(|cache| cache.len).unwrap_or(0);
+        let total = past + seq;
+        let fits = self.slots[slot]
+            .kv
+            .as_ref()
+            .map(|cache| cache.k.dim(1).map(|cap| cap >= total))
+            .transpose()?
+            .unwrap_or(false);
+        if !fits {
+            let cap = (total + MTP_KV_GROW).next_multiple_of(MTP_KV_GROW);
+            let k = Tensor::zeros((1, cap, kv_heads, hd), DType::F16, &self.device)?;
+            let v = Tensor::zeros((1, cap, kv_heads, hd), DType::F16, &self.device)?;
+            if let Some(old) = self.slots[slot].kv.as_ref() {
+                if old.len > 0 {
+                    k.slice_set(&old.k.narrow(1, 0, old.len)?, 1, 0)?;
+                    v.slice_set(&old.v.narrow(1, 0, old.len)?, 1, 0)?;
+                }
+            }
+            self.slots[slot].kv = Some(MtpKv { k, v, len: past });
+        }
+        let cache = self.slots[slot].kv.as_mut().expect("буфер только что обеспечен");
+        cache.k.slice_set(k_new, 1, past)?;
+        cache.v.slice_set(v_new, 1, past)?;
+        cache.len = total;
+        Ok((cache.k.narrow(1, 0, total)?, cache.v.narrow(1, 0, total)?, total))
+    }
+
+    /// Эталонное внимание (Metal/CPU и откат): F32, разворот GQA на все головы,
+    /// причинная маска на хосте. O(контекст) памяти на вызов — только там, где
+    /// flash-attn недоступен.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_reference(
+        &self,
+        q: &Tensor,
+        k_all: &Tensor,
+        v_all: &Tensor,
+        past: usize,
+        seq: usize,
+        total: usize,
+        scale: f64,
+    ) -> Result<Tensor> {
         let k = k_all.to_dtype(DType::F32)?.transpose(1, 2)?;
         let v = v_all.to_dtype(DType::F32)?.transpose(1, 2)?;
         let repeats = self.profile.head_count / self.profile.kv_head_count;
@@ -392,9 +462,7 @@ impl Qwen35Mtp {
             .contiguous()?
             .reshape((1, self.profile.head_count, total, HEAD_DIM))?;
         let q_f32 = q.to_dtype(DType::F32)?.contiguous()?;
-        let scores = (q_f32
-            .matmul(&k.transpose(2, 3)?.contiguous()?)?
-            * (1.0 / (HEAD_DIM as f64).sqrt()))?;
+        let scores = (q_f32.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
         let mask = (0..seq)
             .flat_map(|row| {
                 (0..total).map(move |column| {
@@ -408,11 +476,7 @@ impl Qwen35Mtp {
             .collect::<Vec<_>>();
         let mask = Tensor::from_vec(mask, (1, 1, seq, total), &self.device)?;
         let probs = candle_nn::ops::softmax_last_dim(&scores.broadcast_add(&mask)?)?;
-        let mixed = probs.contiguous()?.matmul(&v.contiguous()?)?;
-        let mixed = (mixed * candle_nn::ops::sigmoid(&gate)?)?
-            .transpose(1, 2)?
-            .reshape((1, seq, self.profile.head_count * HEAD_DIM))?;
-        self.o.forward(&mixed)
+        probs.contiguous()?.matmul(&v.contiguous()?)
     }
 
     fn check_slot(&self, slot: usize) -> Result<()> {
