@@ -1861,18 +1861,9 @@ impl Qwen35BatchAdapter {
                     self.graphs_enabled = false;
                 }
             }
-            let _ = hidden;
-            // Глубокая копия, а не clone: clone разделяет хранилище, а внешний
-            // буфер графа перезаписывается следующим launch. Проверка спекуляции
-            // держит hidden между вызовами (PendingVerify), поэтому копируем.
-            // Для [K, hidden] это десятки килобайт — цена пренебрежимая.
-            let hidden_copy = {
-                let src = &self.decode_graphs[idx].hidden_t;
-                let dst = Tensor::zeros(src.shape().clone(), src.dtype(), &self.device)?;
-                dst.slice_set(src, 0, 0)?;
-                dst
-            };
-            return Ok(Some((out, hidden_copy)));
+            // Путь захвата: hidden получен прогревочным проходом, это обычный
+            // тензор вне графового буфера — копировать не нужно.
+            return Ok(Some((out, hidden)));
         }
 
         // Replay path.
@@ -1935,7 +1926,20 @@ impl Qwen35BatchAdapter {
         if flat.len() != b * vocab {
             return Err(anyhow!("graph logits length mismatch"));
         }
-        Ok(Some(flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect()))
+        // Глубокая копия, а не clone: clone разделяет хранилище, а внешний буфер
+        // перезаписывается следующим launch, тогда как проверка спекуляции держит
+        // hidden между вызовами (PendingVerify). Для [K, hidden] это десятки
+        // килобайт — цена пренебрежимая.
+        let hidden_copy = {
+            let src = &self.decode_graphs[idx].hidden_t;
+            let dst = Tensor::zeros(src.shape().clone(), src.dtype(), &self.device)?;
+            dst.slice_set(src, 0, 0)?;
+            dst
+        };
+        Ok(Some((
+            flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect(),
+            hidden_copy,
+        )))
     }
 
     /// EOS token id модели.
