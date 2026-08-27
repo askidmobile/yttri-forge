@@ -1331,8 +1331,14 @@ impl Qwen35BatchAdapter {
         };
         let slot = chunk.slot_idx;
         let t = chunk.tokens.len();
-        // PD-204: MTP читает hidden всех позиций, vision — mrope; оба → eager.
-        if self.mtp.is_some() || self.multimodal[slot].is_some() || !self.graphs_enabled {
+        // PD-204 (частично снят 2026-08-27). Раньше сюда входило
+        // `self.mtp.is_some()`: графовый префил не отдавал hidden всех позиций,
+        // а MTP::catch_up без них не строит свой KV над префиксом. Теперь граф
+        // отдаёт hidden_all и catch_up вызывается сразу после replay, поэтому
+        // загруженные веса MTP больше не выключают графовый префил всему движку.
+        //
+        // Vision остаётся: mrope требует своих позиций, которых у графа нет.
+        if self.multimodal[slot].is_some() || !self.graphs_enabled {
             return Ok(None);
         }
         self.model
