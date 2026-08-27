@@ -90,32 +90,6 @@ pub fn prefill_chunk_size() -> usize {
 /// выигрывает у большего K. Замер 27B IQ2_XXS (128 ток): K=3 → 26.6 tok/s,
 /// K=2 → 22.8, K=4 → 15.1 при baseline 18.6 — всплески упираются в ~3.
 #[inline]
-/// Порог принятия для гейта окупаемости (QWEN36_MTP_MIN_ACCEPT, доля).
-/// Ноль отключает гейт целиком.
-fn mtp_gate_acceptance() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("QWEN36_MTP_MIN_ACCEPT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &f64| (0.0..=1.0).contains(v))
-            .unwrap_or(0.70)
-    })
-}
-
-/// Сколько черновиков нужно, прежде чем судить о принятии
-/// (QWEN36_MTP_GATE_MIN_DRAFTED).
-fn mtp_gate_min_drafted() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("QWEN36_MTP_GATE_MIN_DRAFTED")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n: &usize| n > 0)
-            .unwrap_or(16)
-    })
-}
-
 pub fn speculative_width() -> usize {
     static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *W.get_or_init(|| {
@@ -189,8 +163,6 @@ pub struct BatchScheduler<M: BatchModel> {
     slot_last_m: Vec<usize>,
     slot_last_k: Vec<usize>,
     skip_count: Vec<usize>,
-    /// Гейт окупаемости уже отчитался по этому слоту — печатаем один раз на запрос.
-    mtp_gate_logged: Vec<bool>,
     stats: SchedulerStats,
     eos: u32,
 }
@@ -217,7 +189,6 @@ impl<M: BatchModel> BatchScheduler<M> {
             slot_last_m: vec![1; num_slots],
             slot_last_k: vec![1; num_slots],
             skip_count: vec![0; num_slots],
-            mtp_gate_logged: vec![false; num_slots],
             stats: SchedulerStats::default(),
             eos,
         }
@@ -362,7 +333,6 @@ impl<M: BatchModel> BatchScheduler<M> {
             }
             if !self.model.speculative_available(slot)
                 || self.slots[slot].remaining_new_tokens() < 2
-                || self.mtp_unprofitable(slot)
             {
                 fallback.push(slot);
                 continue;
@@ -397,53 +367,6 @@ impl<M: BatchModel> BatchScheduler<M> {
         self.slot_last_m[idx] = 1;
         self.slot_last_k[idx] = 1;
         self.skip_count[idx] = 0;
-        self.mtp_gate_logged[idx] = false;
-    }
-
-    /// Гейт окупаемости: при просевшем принятии MTP выключается на остаток
-    /// запроса целиком.
-    ///
-    /// Замер (Q8_0, RTX 4090, графы, ширина 2): раунд стоит около 48 мс и даёт
-    /// в среднем 1.74 токена против 65 мс за два обычных шага — запас 26%. При
-    /// принятии около 65% запас съедается, и MTP уходит в минус: на 24K
-    /// получилось 0.90x против базовых 29.30 ток/с.
-    ///
-    /// Сужение ширины тут не помогает, и это проверено замером: адаптив даёт на
-    /// той же точке 0.90x, а ширина 1 — 0.87x, потому что раунд шириной в один
-    /// токен дороже обычного шага, а выиграть можно максимум один токен. То
-    /// есть у адаптива нет выигрышного состояния при низком принятии, и
-    /// правильный ответ — не сужаться, а перестать спекулировать.
-    ///
-    /// Порог по принятию, а не по длине контекста: замер немонотонен по длине
-    /// (32K даёт 1.04x, 24K — 0.90x), и различает эти точки именно принятие
-    /// (73% против 65%). Гейт по длине отключал бы MTP там, где он выгоден.
-    ///
-    /// Счётчики живут в SpeculativeMetrics и сбрасываются на каждый запрос в
-    /// admit_from_queue, поэтому отдельного состояния не нужно.
-    fn mtp_unprofitable(&mut self, slot: usize) -> bool {
-        let (drafted, accepted) = {
-            let m = &self.speculative[slot];
-            (m.drafted, m.accepted)
-        };
-        // Пока черновиков мало, оценка принятия недостоверна: не выключаем.
-        if drafted < mtp_gate_min_drafted() {
-            return false;
-        }
-        let threshold = mtp_gate_acceptance();
-        if (accepted as f64) >= threshold * (drafted as f64) {
-            return false;
-        }
-        if !self.mtp_gate_logged[slot] {
-            self.mtp_gate_logged[slot] = true;
-            eprintln!(
-                "[mtp] slot {slot}: спекуляция выключена на остаток запроса — принятие {}/{} ({:.0}%) ниже порога {:.0}%",
-                accepted,
-                drafted,
-                100.0 * accepted as f64 / drafted as f64,
-                100.0 * threshold,
-            );
-        }
-        true
     }
 
     fn speculative_slot(
