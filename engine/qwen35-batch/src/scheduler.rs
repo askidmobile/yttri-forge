@@ -189,6 +189,8 @@ pub struct BatchScheduler<M: BatchModel> {
     slot_last_m: Vec<usize>,
     slot_last_k: Vec<usize>,
     skip_count: Vec<usize>,
+    /// Гейт окупаемости уже отчитался по этому слоту — печатаем один раз на запрос.
+    mtp_gate_logged: Vec<bool>,
     stats: SchedulerStats,
     eos: u32,
 }
@@ -215,6 +217,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             slot_last_m: vec![1; num_slots],
             slot_last_k: vec![1; num_slots],
             skip_count: vec![0; num_slots],
+            mtp_gate_logged: vec![false; num_slots],
             stats: SchedulerStats::default(),
             eos,
         }
@@ -229,7 +232,7 @@ impl<M: BatchModel> BatchScheduler<M> {
         };
         if let Some(idx) = self.idle_slot() {
             self.slots[idx].admit(req);
-            self.speculative[idx] = SpeculativeMetrics::default();
+            self.reset_slot_speculative(idx);
             return Some(idx);
         }
         self.queue.push_back(req);
@@ -256,7 +259,7 @@ impl<M: BatchModel> BatchScheduler<M> {
         };
         if let Some(idx) = self.idle_slot() {
             self.slots[idx].admit(req);
-            self.speculative[idx] = SpeculativeMetrics::default();
+            self.reset_slot_speculative(idx);
             self.slots[idx].prefill_done = primed_prefix_len;
             self.slots[idx].index_pos = primed_prefix_len;
             return Some(idx);
@@ -381,6 +384,22 @@ impl<M: BatchModel> BatchScheduler<M> {
         Ok(StepOutcome::DidDecode(active))
     }
 
+    /// Сброс всего спекулятивного состояния слота под новый запрос.
+    ///
+    /// Раньше сбрасывались только метрики, а adaptive-состояние
+    /// (slot_last_k / slot_last_m / skip_count) переезжало с запроса на запрос
+    /// через слот: новый запрос стартовал с шириной, унаследованной от чужого.
+    /// Мест сброса три (submit при свободном слоте, submit_with_params,
+    /// admit_from_queue), поэтому собрано в один метод — иначе четвёртое место
+    /// снова разойдётся с остальными.
+    fn reset_slot_speculative(&mut self, idx: usize) {
+        self.speculative[idx] = SpeculativeMetrics::default();
+        self.slot_last_m[idx] = 1;
+        self.slot_last_k[idx] = 1;
+        self.skip_count[idx] = 0;
+        self.mtp_gate_logged[idx] = false;
+    }
+
     /// Гейт окупаемости: при просевшем принятии MTP выключается на остаток
     /// запроса целиком.
     ///
@@ -401,13 +420,30 @@ impl<M: BatchModel> BatchScheduler<M> {
     ///
     /// Счётчики живут в SpeculativeMetrics и сбрасываются на каждый запрос в
     /// admit_from_queue, поэтому отдельного состояния не нужно.
-    fn mtp_unprofitable(&self, slot: usize) -> bool {
-        let m = &self.speculative[slot];
+    fn mtp_unprofitable(&mut self, slot: usize) -> bool {
+        let (drafted, accepted) = {
+            let m = &self.speculative[slot];
+            (m.drafted, m.accepted)
+        };
         // Пока черновиков мало, оценка принятия недостоверна: не выключаем.
-        if m.drafted < mtp_gate_min_drafted() {
+        if drafted < mtp_gate_min_drafted() {
             return false;
         }
-        (m.accepted as f64) < mtp_gate_acceptance() * (m.drafted as f64)
+        let threshold = mtp_gate_acceptance();
+        if (accepted as f64) >= threshold * (drafted as f64) {
+            return false;
+        }
+        if !self.mtp_gate_logged[slot] {
+            self.mtp_gate_logged[slot] = true;
+            eprintln!(
+                "[mtp] slot {slot}: спекуляция выключена на остаток запроса — принятие {}/{} ({:.0}%) ниже порога {:.0}%",
+                accepted,
+                drafted,
+                100.0 * accepted as f64 / drafted as f64,
+                100.0 * threshold,
+            );
+        }
+        true
     }
 
     fn speculative_slot(
@@ -623,7 +659,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             let Some(idx) = self.idle_slot() else { break };
             let req = self.queue.pop_front().unwrap();
             self.slots[idx].admit(req);
-            self.speculative[idx] = SpeculativeMetrics::default();
+            self.reset_slot_speculative(idx);
         }
     }
 
