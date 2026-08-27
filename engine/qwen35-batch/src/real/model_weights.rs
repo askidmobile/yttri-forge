@@ -5567,7 +5567,12 @@ impl ModelWeights {
                     } else {
                         false
                     };
-                    if has_vram_headroom || gpu_only {
+                    // Копия token_embd на GPU больше не нужна графам: их вход —
+                    // готовый вектор эмбеддингов, деквант строк идёт на хосте из
+                    // mmap (как у llama.cpp). Копия (0.8–1.3 ГБ на 27B) остаётся
+                    // только под QWEN36_EMB_GPU=1 для A/B.
+                    let emb_gpu_requested = std::env::var("QWEN36_EMB_GPU").as_deref() == Ok("1");
+                    if emb_gpu_requested && (has_vram_headroom || gpu_only) {
                         Some(QMatMul::from_qtensor(load_heavy("token_embd.weight")?)?)
                     } else {
                         log::info!("[{}] low VRAM headroom: keeping token_embd on CPU mmap (zero GPU overhead)", tag);
@@ -7564,16 +7569,16 @@ impl ModelWeights {
     /// Требует: MTP off, vision off, cuda_ctx на DeltaNet слоях, paged pool.
     pub fn forward_prefill_graphed(
         &mut self,
-        ids_t: &Tensor,
+        emb_in: &Tensor,
         rope_pos_dev: &Tensor,
         t_len: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let emb = self.tok_embeddings_cuda.as_ref().ok_or_else(|| {
-            candle_core::Error::Msg("prefill graph: no CUDA embedding".into())
-        })?;
-        let mut layer_in = emb
-            .embedding(ids_t)?
-            .reshape((1usize, t_len, self.hidden_size()))?;
+        // Вход — готовые эмбеддинги [1, T, H] F32 (см. embed_for_graph):
+        // lookup в графе не нужен, копия token_embd на GPU — тоже.
+        if emb_in.dims() != [1, t_len, self.hidden_size()] {
+            candle_core::bail!("prefill graph: embeddings shape {:?}", emb_in.dims());
+        }
+        let mut layer_in = emb_in.clone();
 
         let ctx = self.paged_ctx.as_ref().ok_or_else(|| {
             candle_core::Error::Msg("prefill graph: paged ctx missing".into())
@@ -7613,17 +7618,15 @@ impl ModelWeights {
     #[cfg(feature = "cuda")]
     pub fn forward_verify_graphed(
         &mut self,
-        ids_t: &Tensor,
+        emb_in: &Tensor,
         rope_pos_dev: &Tensor,
         k: usize,
         slot: u32,
     ) -> Result<(Tensor, Tensor)> {
-        let emb = self.tok_embeddings_cuda.as_ref().ok_or_else(|| {
-            candle_core::Error::Msg("verify graph: no CUDA embedding".into())
-        })?;
-        let mut layer_in = emb
-            .embedding(ids_t)?
-            .reshape((k, 1usize, self.hidden_size()))?;
+        if emb_in.dims() != [k, 1, self.hidden_size()] {
+            candle_core::bail!("verify graph: embeddings shape {:?}", emb_in.dims());
+        }
+        let mut layer_in = emb_in.clone();
         let ctx = self.paged_ctx.as_ref().ok_or_else(|| {
             candle_core::Error::Msg("verify graph: paged ctx missing".into())
         })?;
@@ -7638,15 +7641,16 @@ impl ModelWeights {
 
     pub fn forward_decode_batch_graphed(
         &mut self,
-        tokens: &Tensor,
+        emb_in: &Tensor,
         slots: &[u32],
     ) -> Result<(Tensor, Tensor)> {
         let ctx = self
             .paged_ctx
             .as_ref()
             .ok_or_else(|| candle_core::Error::Msg("paged ctx not initialized".into()))?;
-        let (b_sz, seq_len) = tokens.dims2()?;
-        if seq_len != 1 || slots.len() != b_sz {
+        // Вход — готовые эмбеддинги [B, 1, H] F32 (embed_for_graph).
+        let (b_sz, seq_len, h) = emb_in.dims3()?;
+        if seq_len != 1 || slots.len() != b_sz || h != self.hidden_size() {
             candle_core::bail!("invalid graphed decode dimensions");
         }
         // seqlens_k — до attention слоёв (kv_len ещё не инкрементирован).
@@ -7658,13 +7662,7 @@ impl ModelWeights {
             let r = unsafe { cudarc::driver::result::event::record(ev[0], stream) };
             if let Err(e) = r { eprintln!("[gprof] record ev0: {e:?}"); }
         }
-        let emb = self
-            .tok_embeddings_cuda
-            .as_ref()
-            .ok_or_else(|| candle_core::Error::Msg("no CUDA embedding".into()))?;
-        let mut layer_in = emb
-            .embedding(tokens)?
-            .reshape((b_sz, 1usize, self.hidden_size()))?;
+        let mut layer_in = emb_in.clone();
         if let Some(ev) = self.gprof_events.as_ref() {
             let stream = ctx.dev.cuda_stream().cu_stream();
             let r = unsafe { cudarc::driver::result::event::record(ev[1], stream) };
@@ -8368,6 +8366,23 @@ impl ModelWeights {
     /// before entering multimodal prefill; text-only forward does not call this.
     pub fn embed_tokens(&self, tokens: &Tensor, device: &Device) -> Result<Tensor> {
         self.tok_embeddings.forward(tokens)?.to_device(device)
+    }
+
+    /// Эмбеддинги для входа графа: [1, n, H] F32 на `device`. Деквант строк на
+    /// хосте из mmap + один H2D (как get_rows у llama.cpp); при копии на GPU
+    /// (QWEN36_EMB_GPU=1, A/B) — lookup на устройстве. Вызывать ВНЕ захвата.
+    #[cfg(feature = "cuda")]
+    pub fn embed_for_graph(&self, tokens: &[u32], device: &Device) -> Result<Tensor> {
+        let n = tokens.len();
+        if let Some(emb) = self.tok_embeddings_cuda.as_ref() {
+            let ids = Tensor::from_vec(tokens.to_vec(), (1usize, n), device)?;
+            return emb.embedding(&ids)?.reshape((1usize, n, self.hidden_size()));
+        }
+        let ids = Tensor::from_vec(tokens.to_vec(), (1usize, n), &Device::Cpu)?;
+        self.tok_embeddings
+            .forward(&ids)?
+            .reshape((1usize, n, self.hidden_size()))?
+            .to_device(device)
     }
 
     /// Forward с pre-computed embeddings (skip embedding lookup).

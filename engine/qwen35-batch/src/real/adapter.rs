@@ -80,8 +80,9 @@ struct DecodeGraphState {
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
     b: usize,
     slots: Vec<u32>,
-    /// Persistent входы: [B, 1] U32 токены (htod до launch).
-    ids_t: Tensor,
+    /// Persistent вход: [B, 1, H] F32 эмбеддинги (стейджатся htod до launch;
+    /// деквант строк на хосте — копия token_embd на GPU не нужна).
+    emb_t: Tensor,
     /// Alias захваченных выходов (graph-pool память).
     logits_t: Tensor,
     /// Второй внешний буфер: hidden декодируемых позиций. Нужен MTP —
@@ -112,8 +113,9 @@ struct PrefillGraphState {
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
     t: usize,
     slot: usize,
-    /// Persistent входы (стейджатся ВНЕ графа): ids [1,T] U32, позиции [T] U32.
-    ids_t: Tensor,
+    /// Persistent входы (стейджатся ВНЕ графа): эмбеддинги [1,T,H] F32
+    /// (для проверки — [T,1,H]), позиции [T] U32.
+    emb_t: Tensor,
     rope_pos_t: Tensor,
     /// Внешний буфер выхода (D2D-нода внутри графа) — graph-pool адреса
     /// невалидны для D2H снаружи launch.
@@ -1616,11 +1618,12 @@ impl Qwen35BatchAdapter {
             ctx.set_prefill_seqlens_q(t)?;
         }
         let slot_u = slot as u32;
-        let fwd = |m: &mut ModelWeights, ids: &Tensor, rope: &Tensor| -> Result<(Tensor, Tensor)> {
+        let emb_shape = if verify { (t, 1usize, self.model.hidden_size()) } else { (1usize, t, self.model.hidden_size()) };
+        let fwd = |m: &mut ModelWeights, emb: &Tensor, rope: &Tensor| -> Result<(Tensor, Tensor)> {
             let r = if verify {
-                m.forward_verify_graphed(ids, rope, t, slot_u)
+                m.forward_verify_graphed(emb, rope, t, slot_u)
             } else {
-                m.forward_prefill_graphed(ids, rope, t)
+                m.forward_prefill_graphed(emb, rope, t)
             };
             r.map_err(|e| anyhow!("pgraph {kind} forward: {e}"))
         };
@@ -1634,10 +1637,8 @@ impl Qwen35BatchAdapter {
             Some(i) => {
                 {
                     let g = &pool[i];
-                    let ids_staging =
-                        Tensor::from_vec(tokens.to_vec(), (1usize, t), &Device::Cpu)?
-                            .to_device(&self.device)?;
-                    g.ids_t.slice_set(&ids_staging, 0, 0)?;
+                    let emb_staging = self.model.embed_for_graph(tokens, &self.device)?.reshape(emb_shape)?;
+                    g.emb_t.slice_set(&emb_staging, 0, 0)?;
                     let rope_staging =
                         Tensor::from_vec(rope_host, t, &Device::Cpu)?.to_device(&self.device)?;
                     g.rope_pos_t.slice_set(&rope_staging, 0, 0)?;
@@ -1660,12 +1661,13 @@ impl Qwen35BatchAdapter {
             None => {
                 // htod-кэш: промах параметров при захвате → явная ошибка вместо
                 // pageable memcpy внутри графа.
+                // Эмбеддинги — до guard: буфер больше порога кэша htod.
+                let emb_t = self.model.embed_for_graph(tokens, &self.device)?.reshape(emb_shape)?;
                 let _htod_guard = cuda_dev.enable_cuda_graph_htod_cache();
-                let ids_t = Tensor::from_vec(tokens.to_vec(), (1usize, t), &self.device)?;
                 let rope_pos_t = Tensor::from_vec(rope_host, t, &self.device)?;
                 // 1) Eager-прогон: это и есть результат (захват ядра не
                 //    исполняет) + прогрев ядер/htod-кэша.
-                let (logits, prime_hidden) = fwd(&mut self.model, &ids_t, &rope_pos_t)?;
+                let (logits, prime_hidden) = fwd(&mut self.model, &emb_t, &rope_pos_t)?;
                 let hid_shape = prime_hidden.shape().clone();
                 let hid_dtype = prime_hidden.dtype();
                 let flat = logits
@@ -1693,7 +1695,7 @@ impl Qwen35BatchAdapter {
                         )
                     }
                     .map_err(|e| anyhow!("pgraph begin_capture: {e}"))?;
-                    let (logits_t, hidden_t) = match fwd(&mut self.model, &ids_t, &rope_pos_t) {
+                    let (logits_t, hidden_t) = match fwd(&mut self.model, &emb_t, &rope_pos_t) {
                         Ok(v) => v,
                         Err(e) => {
                             let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
@@ -1730,7 +1732,7 @@ impl Qwen35BatchAdapter {
                         stream: stream.clone(),
                         t,
                         slot,
-                        ids_t: ids_t.clone(),
+                        emb_t: emb_t.clone(),
                         rope_pos_t: rope_pos_t.clone(),
                         logits_t: logits_out,
                         hidden_t: hidden_out,
@@ -1894,15 +1896,20 @@ impl Qwen35BatchAdapter {
             // Eager graphed-forward: реальный результат шага + prime всех ядер/кэшей.
             // Guard включает htod param cache: params_from_vec идёт в кэш (prime),
             // а при захвате промах → явная ошибка вместо pageable memcpy в графе.
+            // Эмбеддинги — ДО guard кэша htod: буфер больше его порога, а
+            // захвату он и не нужен (стейджится снаружи).
+            let emb_eager = self
+                .model
+                .embed_for_graph(tokens, &self.device)?
+                .reshape((b, 1usize, self.model.hidden_size()))?;
             let _htod_guard = cuda_dev.enable_cuda_graph_htod_cache();
-            let ids_eager = Tensor::from_vec(tokens.to_vec(), (b, 1usize), &self.device)?;
             {
                 let ctx = self.model.paged_ctx.as_mut().unwrap();
                 ctx.stage_inputs(slots, rope_positions, &block_table)?;
             }
             let (logits, hidden) = self
                 .model
-                .forward_decode_batch_graphed(&ids_eager, slots)
+                .forward_decode_batch_graphed(&emb_eager, slots)
                 .map_err(|e| anyhow!("graphed forward (eager prime): {e}"))?;
             // Форма hidden для внешнего буфера захвата: берём с прогрева, он и так
             // выполняется перед захватом. Раньше hidden прогрева использовался
@@ -1925,7 +1932,7 @@ impl Qwen35BatchAdapter {
                 }
                 let _ = self
                     .model
-                    .forward_decode_batch_graphed(&ids_eager, slots)
+                    .forward_decode_batch_graphed(&emb_eager, slots)
                     .map_err(|e| anyhow!("graphed forward (eager prime 2): {e}"))?;
                 // Компенсация: вернуть host mirror к состоянию ПОСЛЕ одного
                 // реального шага, чтобы scheduler-позиции совпали с device
@@ -1999,7 +2006,6 @@ impl Qwen35BatchAdapter {
                 // её адреса валидны только внутри graph launch. Внешний D2H по ним →
                 // illegal address. Поэтому выход копируем во ВНЕШНИЙ (default pool,
                 // выделен ДО захвата) буфер D2D-нодой внутри графа.
-                let ids_eager = Tensor::from_vec(tokens.to_vec(), (b, 1usize), &self.device)?;
                 let logits_out = Tensor::zeros((b, self.vocab), DType::F32, &self.device)?;
                 let hidden_out =
                     Tensor::zeros(hid_shape.clone(), hid_dtype, &self.device)?;
@@ -2012,7 +2018,7 @@ impl Qwen35BatchAdapter {
                 .map_err(|e| anyhow!("begin_capture: {e}"))?;
                 let forward_result = self
                     .model
-                    .forward_decode_batch_graphed(&ids_eager, slots);
+                    .forward_decode_batch_graphed(&emb_eager, slots);
                 let (logits_t, hidden_t) = match forward_result {
                     Ok(v) => v,
                     Err(e) => {
@@ -2062,7 +2068,7 @@ impl Qwen35BatchAdapter {
                     stream: stream.clone(),
                     b,
                     slots: slots.to_vec(),
-                    ids_t: ids_eager.clone(),
+                    emb_t: emb_eager.clone(),
                     logits_t: logits_out,
                     hidden_t: hidden_out,
                 })
@@ -2100,10 +2106,12 @@ impl Qwen35BatchAdapter {
             let ctx = self.model.paged_ctx.as_mut().unwrap();
             ctx.stage_inputs(slots, rope_positions, &block_table)?;
         }
-        // ids: htod через staging tensor + slice_set (вне графа).
-        let ids_staging =
-            Tensor::from_vec(tokens.to_vec(), (b, 1usize), &Device::Cpu)?.to_device(&self.device)?;
-        state.ids_t.slice_set(&ids_staging, 0, 0)?;
+        // Эмбеддинги: деквант на хосте + htod в persistent-буфер (вне графа).
+        let emb_staging = self
+            .model
+            .embed_for_graph(tokens, &self.device)?
+            .reshape((b, 1usize, self.model.hidden_size()))?;
+        state.emb_t.slice_set(&emb_staging, 0, 0)?;
         state.launch().map_err(|e| anyhow!("graph launch: {e}"))?;
         // Диагностика: sync сразу после launch, чтобы async-ошибка графа
         // привязывалась к этому шагу, а не всплывала sticky на следующем.
