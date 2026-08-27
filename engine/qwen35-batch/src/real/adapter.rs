@@ -238,6 +238,12 @@ pub struct Qwen35BatchAdapter {
     /// Per-slot: KV данные изменились (prefill/seed) и paged pool устарел.
     #[cfg(feature = "cuda")]
     paged_dirty: Vec<bool>,
+    /// Per-slot: гейт декодного графа (позиция/окно) уже отчитался, что уводит
+    /// шаги на eager. Печатаем один раз на запрос: молчаливый Ok(None) стоил
+    /// прогона и двух неверных гипотез 2026-08-27 (окно пула 32768 при
+    /// промпте 32768 — декод весь запрос eager, а замер выглядел валидным).
+    #[cfg(feature = "cuda")]
+    graph_gate_warned: Vec<bool>,
     #[cfg(feature = "cuda")]
     graphs_enabled: bool,
     /// On-demand Vision component. Phase 8 owns TTL/load barrier; adapter only
@@ -405,6 +411,8 @@ impl Qwen35BatchAdapter {
             pg_last_hidden: None,
             #[cfg(feature = "cuda")]
             paged_dirty: vec![true; num_slots],
+            #[cfg(feature = "cuda")]
+            graph_gate_warned: vec![false; num_slots],
             state_owner: None,
             #[cfg(feature = "cuda")]
             prefill_graphs: Vec::new(),
@@ -690,6 +698,7 @@ impl BatchModel for Qwen35BatchAdapter {
             {
                 self.paged_dirty[sidx] = true;
                 self.pg_paged_only[sidx] = false;
+                self.graph_gate_warned[sidx] = false;
             }
             if self.multimodal[sidx].is_none() {
                 self.rope_deltas[sidx] = 0;
@@ -1792,6 +1801,13 @@ impl Qwen35BatchAdapter {
             for (i, &s) in slots.iter().enumerate() {
                 let cur = ctx.kv_len_host[s as usize] as usize;
                 if positions[i] != cur || cur + 1 > window {
+                    if !self.graph_gate_warned[s as usize] {
+                        self.graph_gate_warned[s as usize] = true;
+                        eprintln!(
+                            "[graphs] slot {s}: декод уходит на eager — позиция {} против kv_len {cur}, окно пула {window} (QWEN36_GRAPH_WINDOW / served_ctx); дальше по этому запросу молчу",
+                            positions[i]
+                        );
+                    }
                     return Ok(None);
                 }
             }
