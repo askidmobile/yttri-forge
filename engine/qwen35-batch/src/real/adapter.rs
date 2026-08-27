@@ -1157,8 +1157,23 @@ impl BatchModel for Qwen35BatchAdapter {
         let k = inputs.len();
         let cache_positions: Vec<usize> = (pos..pos + k).collect();
         let rope_positions = self.rope_positions_for(slot, pos, k)?;
-        let ids = Tensor::from_vec(inputs.to_vec(), (k, 1usize), &self.device)?;
         let slots = vec![slot as u32; k];
+        // Сначала графовый путь: форма проверки — k строк по батчу на один слот,
+        // ровно та же, под которую захватывается декодный граф. Пул по ключу
+        // (b, slots) держит и обычную форму, и формы проверки, поэтому
+        // чередование не вызывает пересборки.
+        #[cfg(feature = "cuda")]
+        if let Some((rows, hidden)) =
+            self.decode_batch_graphed(k, inputs, &rope_positions, &slots, &cache_positions)?
+        {
+            self.verify_pending[slot] = Some(PendingVerify {
+                inputs: inputs.to_vec(),
+                pos,
+                hidden,
+            });
+            return Ok(rows);
+        }
+        let ids = Tensor::from_vec(inputs.to_vec(), (k, 1usize), &self.device)?;
         let (logits, hidden) = self
             .model
             .forward_decode_batch_with_hidden(&ids, &cache_positions, &rope_positions, &slots)
@@ -1567,11 +1582,16 @@ impl Qwen35BatchAdapter {
         let Device::Cuda(cuda_dev) = &self.device else {
             return Ok(None);
         };
-        // MTP transactions читают hidden — graph-pool буфер перезаписывается
-        // следующим launch, поэтому MTP-слоты → eager.
-        if self.target_transactions.iter().any(|t| t.is_some()) {
-            return Ok(None);
-        }
+        // Гейт транзакций снят 2026-08-27. Его причиной было то, что MTP читает
+        // hidden, а буфер графа перезаписывается следующим launch. Теперь hidden
+        // выводится во ВНЕШНИЙ буфер и возвращается ГЛУБОКОЙ копией, поэтому
+        // держать его между вызовами безопасно.
+        //
+        // Оговорка про многослотовый режим: раньше здесь стоял any() по всем
+        // слотам, то есть транзакция одного слота уводила на eager шаги всех
+        // остальных. Многослотовый режим отложен, но если вернётся — проверять
+        // надо слоты текущего вызова, а не все.
+
         self.model
             .init_paged_decode(&self.device)
             .map_err(|e| anyhow!("init paged decode: {e}"))?;
