@@ -818,6 +818,11 @@ impl BatchModel for Qwen35BatchAdapter {
                 None,
             )
         };
+        eprintln!(
+            "[mtpdbg] перед catch_up: mtp={} inputs={}",
+            self.mtp.is_some(),
+            mtp_inputs.is_some()
+        );
         if let (Some(mtp), Some((embeds, hidden))) = (self.mtp.as_mut(), mtp_inputs) {
             let rope_positions = self.multimodal[sidx]
                 .as_ref()
