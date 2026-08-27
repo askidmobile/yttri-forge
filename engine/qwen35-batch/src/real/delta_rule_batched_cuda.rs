@@ -62,6 +62,12 @@ pub struct DeltaNetCudaStateBatched {
     pub norm_weight: CudaSlice<f32>,
     /// B — capacity (slot count), фиксированная при аллокации.
     pub capacity_b: u32,
+    /// Теневые снимки состояния ОДНОГО слота между строками проверки
+    /// спекуляции: [rows * ssm_len] и [rows * conv_len]; снимок i — состояние
+    /// после строки i. Выделяются один раз (`ensure_shadow`) и не
+    /// перевыделяются: захваченные графы держат их адреса.
+    pub ssm_shadow: Option<CudaSlice<f32>>,
+    pub conv_shadow: Option<CudaSlice<f32>>,
 }
 
 /// Временные (scratch) batched буферы, переиспользуемые между слоями.
@@ -117,7 +123,67 @@ pub fn create_layer_cuda_state_batched(
         ssm_a,
         norm_weight,
         capacity_b,
+        ssm_shadow: None,
+        conv_shadow: None,
     })
+}
+
+/// Выделить теневые снимки под `rows` строк — один раз за время жизни
+/// модели. Больший `rows` после выделения — ошибка, а не перевыделение:
+/// освобождённые адреса остались бы внутри захваченных графов.
+pub fn ensure_shadow(
+    dev: &CudaDevice,
+    state: &mut DeltaNetCudaStateBatched,
+    rows: usize,
+) -> Result<()> {
+    if rows == 0 {
+        return Ok(());
+    }
+    let capacity = state.capacity_b as usize;
+    let ssm_len = state.ssm_state.len() / capacity;
+    let conv_len = state.conv_state.len() / capacity;
+    match state.ssm_shadow.as_ref() {
+        Some(shadow) if shadow.len() / ssm_len >= rows => Ok(()),
+        Some(shadow) => candle_core::bail!(
+            "DeltaNet shadow: нужно {rows} строк, выделено {} — перевыделение запрещено",
+            shadow.len() / ssm_len
+        ),
+        None => {
+            state.ssm_shadow = Some(dev.alloc_zeros::<f32>(rows * ssm_len)?);
+            state.conv_shadow = Some(dev.alloc_zeros::<f32>(rows * conv_len)?);
+            Ok(())
+        }
+    }
+}
+
+/// Вернуть слот к теневому снимку `idx` (состояние после строки idx
+/// последней проверки). D2D, вне графа.
+pub fn restore_slot_from_shadow(
+    dev: &CudaDevice,
+    state: &mut DeltaNetCudaStateBatched,
+    slot: usize,
+    idx: usize,
+) -> Result<()> {
+    let capacity = state.capacity_b as usize;
+    if slot >= capacity {
+        candle_core::bail!("shadow restore slot {slot} >= capacity {capacity}");
+    }
+    let ssm_len = state.ssm_state.len() / capacity;
+    let conv_len = state.conv_state.len() / capacity;
+    let (Some(ssm_sh), Some(conv_sh)) = (state.ssm_shadow.as_ref(), state.conv_shadow.as_ref())
+    else {
+        candle_core::bail!("DeltaNet shadow не выделен");
+    };
+    if (idx + 1) * ssm_len > ssm_sh.len() {
+        candle_core::bail!("DeltaNet shadow idx {idx} вне выделенных строк");
+    }
+    let src_ssm = ssm_sh.slice(idx * ssm_len..(idx + 1) * ssm_len);
+    let src_conv = conv_sh.slice(idx * conv_len..(idx + 1) * conv_len);
+    let mut dst_ssm = state.ssm_state.slice_mut(slot * ssm_len..(slot + 1) * ssm_len);
+    let mut dst_conv = state.conv_state.slice_mut(slot * conv_len..(slot + 1) * conv_len);
+    dev.memcpy_dtod(&src_ssm, &mut dst_ssm)?;
+    dev.memcpy_dtod(&src_conv, &mut dst_conv)?;
+    Ok(())
 }
 
 /// Создаёт batched scratch-буферы под capacity_b слотов (один комплект на модель,
@@ -393,9 +459,16 @@ pub fn dispatch_delta_rule_batched(
 /// Выход: [K,1,value_dim] (zero-copy wrap temp.gated_output — потребить до
 /// следующего DeltaNet-диспатча).
 #[allow(clippy::too_many_arguments)]
+/// `shadow_rows > 0` — построчный режим для проверки спекуляции: ядра 1 и 3
+/// запускаются на одну строку, и после каждой строки, кроме последней,
+/// состояние слота копируется в теневой снимок (`ensure_shadow` заранее).
+/// Откат к строке m тогда — `restore_slot_from_shadow(m-1)` без перепрогона.
+/// Цена: загрузка/выгрузка state в smem на строку вместо одной на проход
+/// плюс D2D снимка. Ядра 2 и 4 (стейтлесс) остаются пакетными.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_delta_rule_batched_seq(
     dev: &CudaDevice,
-    state: &DeltaNetCudaStateBatched,
+    state: &mut DeltaNetCudaStateBatched,
     temp: &DeltaNetCudaTempBatched,
     params: &DeltaParams,
     qkv_t: &Tensor,
@@ -403,6 +476,7 @@ pub fn dispatch_delta_rule_batched_seq(
     beta_t: &Tensor,
     alpha_t: &Tensor,
     slot: u32,
+    shadow_rows: usize,
 ) -> Result<Tensor> {
     let channels = params.channels as u32;
     let n_v = params.n_v_heads as u32;
@@ -438,6 +512,33 @@ pub fn dispatch_delta_rule_batched_seq(
         );
     }
     let seq_rows = k_rows as u32;
+    let per_row = shadow_rows > 0;
+    let capacity = state.capacity_b as usize;
+    let ssm_len = state.ssm_state.len() / capacity;
+    let conv_len = state.conv_state.len() / capacity;
+    let slot_u = slot as usize;
+    if per_row {
+        if shadow_rows + 1 < k_rows {
+            candle_core::bail!(
+                "dispatch_delta_rule_batched_seq: shadow_rows {shadow_rows} < rows-1 {}",
+                k_rows - 1
+            );
+        }
+        let ok = state
+            .ssm_shadow
+            .as_ref()
+            .map(|sh| sh.len() >= shadow_rows * ssm_len)
+            .unwrap_or(false);
+        if !ok {
+            candle_core::bail!("dispatch_delta_rule_batched_seq: теневые снимки не выделены");
+        }
+    }
+    // (строка, число строк) на запуск stateful-ядер 1 и 3.
+    let launches: Vec<(usize, u32)> = if per_row {
+        (0..k_rows).map(|r| (r, 1u32)).collect()
+    } else {
+        vec![(0usize, seq_rows)]
+    };
 
     let (qkv_st, qkv_lay) = qkv_f.storage_and_layout();
     let (z_st, z_lay) = z_f.storage_and_layout();
@@ -464,7 +565,7 @@ pub fn dispatch_delta_rule_batched_seq(
     let mut p = *params;
     p.batch_size = seq_rows;
 
-    // ── Kernel 1 seq: conv1d prep, внутренний цикл по K строкам ──
+    // ── Kernel 1 seq: conv1d prep, внутренний цикл по строкам ──
     {
         let func = dev.get_or_load_func(
             "delta_conv1d_prep_batched_seq",
@@ -475,21 +576,44 @@ pub fn dispatch_delta_rule_batched_seq(
             block_dim: (block_ch, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut bb = func.builder();
-        bb.arg(&qkv_v);
-        bb.arg(&beta_v);
-        bb.arg(&alpha_v);
-        bb.arg(&state.conv_weights);
-        bb.arg(&state.dt_bias);
-        bb.arg(&state.ssm_a);
-        bb.arg(&state.conv_state);
-        bb.arg(&temp.qkv_conv);
-        bb.arg(&temp.beta);
-        bb.arg(&temp.gate);
-        bb.arg(&p);
-        bb.arg(&*slot_ids_arc);
-        bb.arg(&seq_rows);
-        unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        let ch = channels as usize;
+        let nv = n_v as usize;
+        for &(row, rows) in &launches {
+            p.batch_size = rows;
+            // Входы и temp сдвинуты на строку: ядро индексирует их по bidx,
+            // при запуске на одну строку bidx = 0.
+            let qkv_row = cuda_slice_view(&qkv_st, qkv_lay.start_offset() + row * ch)?;
+            let beta_row = cuda_slice_view(&beta_st, beta_lay.start_offset() + row * nv)?;
+            let alpha_row = cuda_slice_view(&alpha_st, alpha_lay.start_offset() + row * nv)?;
+            let qkv_conv_out = temp.qkv_conv.slice(row * ch..);
+            let beta_out = temp.beta.slice(row * nv..);
+            let gate_out = temp.gate.slice(row * nv..);
+            let mut bb = func.builder();
+            bb.arg(&qkv_row);
+            bb.arg(&beta_row);
+            bb.arg(&alpha_row);
+            bb.arg(&state.conv_weights);
+            bb.arg(&state.dt_bias);
+            bb.arg(&state.ssm_a);
+            bb.arg(&state.conv_state);
+            bb.arg(&qkv_conv_out);
+            bb.arg(&beta_out);
+            bb.arg(&gate_out);
+            bb.arg(&p);
+            bb.arg(&*slot_ids_arc);
+            bb.arg(&rows);
+            unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+            if per_row && row + 1 < k_rows {
+                let src = state.conv_state.slice(slot_u * conv_len..(slot_u + 1) * conv_len);
+                let mut dst = state
+                    .conv_shadow
+                    .as_mut()
+                    .expect("проверено выше")
+                    .slice_mut(row * conv_len..(row + 1) * conv_len);
+                dev.memcpy_dtod(&src, &mut dst)?;
+            }
+        }
+        p.batch_size = seq_rows;
     }
 
     // ── Kernel 2: l2 norm (стейтлесс — batch-ось = строки) ──
@@ -556,18 +680,41 @@ pub fn dispatch_delta_rule_batched_seq(
             block_dim: (hvd, 1, 1),
             shared_mem_bytes: shared_mem,
         };
-        let mut bb = func.builder();
-        bb.arg(&temp.q);
-        bb.arg(&temp.k);
-        bb.arg(&temp.v);
-        bb.arg(&temp.beta);
-        bb.arg(&temp.gate);
-        bb.arg(&state.ssm_state);
-        bb.arg(&temp.delta_output);
-        bb.arg(&p);
-        bb.arg(&*slot_ids_arc);
-        bb.arg(&seq_rows);
-        unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        // Ядро индексирует q/k/v/output через bidx * n_v * head_v_dim, beta/gate
+        // через bidx * n_v — при запуске на одну строку сдвигаем view.
+        let nv = n_v as usize;
+        let vec_stride = nv * hvd as usize;
+        for &(row, rows) in &launches {
+            p.batch_size = rows;
+            let q_row = temp.q.slice(row * vec_stride..);
+            let k_row = temp.k.slice(row * vec_stride..);
+            let v_row = temp.v.slice(row * vec_stride..);
+            let beta_row = temp.beta.slice(row * nv..);
+            let gate_row = temp.gate.slice(row * nv..);
+            let out_row = temp.delta_output.slice(row * vec_stride..);
+            let mut bb = func.builder();
+            bb.arg(&q_row);
+            bb.arg(&k_row);
+            bb.arg(&v_row);
+            bb.arg(&beta_row);
+            bb.arg(&gate_row);
+            bb.arg(&state.ssm_state);
+            bb.arg(&out_row);
+            bb.arg(&p);
+            bb.arg(&*slot_ids_arc);
+            bb.arg(&rows);
+            unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+            if per_row && row + 1 < k_rows {
+                let src = state.ssm_state.slice(slot_u * ssm_len..(slot_u + 1) * ssm_len);
+                let mut dst = state
+                    .ssm_shadow
+                    .as_mut()
+                    .expect("проверено выше")
+                    .slice_mut(row * ssm_len..(row + 1) * ssm_len);
+                dev.memcpy_dtod(&src, &mut dst)?;
+            }
+        }
+        p.batch_size = seq_rows;
     }
 
     // ── Kernel 4: norm+gate (стейтлесс — batch-ось = строки) ──

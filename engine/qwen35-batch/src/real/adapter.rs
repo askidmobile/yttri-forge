@@ -1268,62 +1268,61 @@ impl BatchModel for Qwen35BatchAdapter {
         #[cfg(not(feature = "cuda"))]
         let paged = false;
         if consumed < k {
-            let checkpoint = self.target_transactions[slot]
-                .as_ref()
-                .ok_or_else(|| anyhow!("MTP transaction is not active for slot {slot}"))?;
-            self.model
-                .restore_slot_batched(&self.device, checkpoint)
-                .map_err(|error| anyhow!("speculative accept restore: {error}"))?;
-            if paged {
-                // Откат отвергнутых строк в пуле — сдвиг длины (FR-007): строки
-                // pos..pos+consumed там уже верны, посчитаны по верному префиксу.
-                // DeltaNet восстановлен на начало раунда, поэтому принятые строки
-                // прогоняются той же графовой проверкой с длиной пула, откаченной
-                // на pos: attention допишет те же строки поверх, DeltaNet
-                // продвинется ровно на consumed. Это оставляет цену повторного
-                // прогона (Ф3 плана), но уже на графах.
+            if paged && consumed > 0 {
+                // Ф3: без перепрогона. DeltaNet возвращается к теневому снимку
+                // после строки consumed-1 — он снят внутри графа проверки
+                // (delta_rule_batched_cuda::dispatch_delta_rule_batched_seq,
+                // shadow_rows). Строки 0..consumed первой проверки бит-в-бит
+                // равны перепрогону: их входы зависят только от префикса и самих
+                // себя. Attention: строки pos..pos+consumed в пуле верны, откат
+                // отвергнутых — сдвиг длины (FR-007). Раньше здесь был restore на
+                // начало раунда и повторный графовый прогон принятых строк по
+                // цене целой проверки в ~27% раундов.
                 #[cfg(feature = "cuda")]
                 {
-                    if consumed > 0 {
-                        let rope_host: Vec<u32> = self
-                            .rope_positions_for(slot, pending.pos, consumed)?
-                            .iter()
-                            .map(|&p| p as u32)
-                            .collect();
-                        self.paged_graph_run(
-                            true,
-                            slot,
-                            pending.pos,
-                            &pending.inputs[..consumed],
-                            rope_host,
-                        )?;
-                    } else {
+                    self.model
+                        .restore_slot_from_shadow(slot, consumed - 1)
+                        .map_err(|e| anyhow!("speculative accept shadow restore: {e}"))?;
+                    let ctx = self.model.paged_ctx.as_mut().unwrap();
+                    let mut lens = ctx.kv_len_host.clone();
+                    lens[slot] = (pending.pos + consumed) as u32;
+                    ctx.reset_kv_len(&lens)?;
+                }
+            } else {
+                let checkpoint = self.target_transactions[slot]
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("MTP transaction is not active for slot {slot}"))?;
+                self.model
+                    .restore_slot_batched(&self.device, checkpoint)
+                    .map_err(|error| anyhow!("speculative accept restore: {error}"))?;
+                if paged {
+                    // consumed == 0: длина пула на начало раунда.
+                    #[cfg(feature = "cuda")]
+                    {
                         let ctx = self.model.paged_ctx.as_mut().unwrap();
                         let mut lens = ctx.kv_len_host.clone();
                         lens[slot] = pending.pos as u32;
                         ctx.reset_kv_len(&lens)?;
                     }
-                    self.model.paged_ctx.as_mut().unwrap().kv_len_host[slot] =
-                        (pending.pos + consumed) as u32;
+                } else if consumed > 0 {
+                    #[cfg(feature = "cuda")]
+                    self.model
+                        .rehydrate_kv_from_paged(slot)
+                        .map_err(|e| anyhow!("speculative accept rehydrate: {e}"))?;
+                    let cache_positions: Vec<usize> =
+                        (pending.pos..pending.pos + consumed).collect();
+                    let rope_positions = self.rope_positions_for(slot, pending.pos, consumed)?;
+                    let ids = Tensor::from_vec(
+                        pending.inputs[..consumed].to_vec(),
+                        (consumed, 1usize),
+                        &self.device,
+                    )?;
+                    let slots = vec![slot as u32; consumed];
+                    let _ = self
+                        .model
+                        .forward_decode_batch(&ids, &cache_positions, &rope_positions, &slots)
+                        .map_err(|error| anyhow!("speculative accept re-run: {error}"))?;
                 }
-            } else if consumed > 0 {
-                #[cfg(feature = "cuda")]
-                self.model
-                    .rehydrate_kv_from_paged(slot)
-                    .map_err(|e| anyhow!("speculative accept rehydrate: {e}"))?;
-                let cache_positions: Vec<usize> =
-                    (pending.pos..pending.pos + consumed).collect();
-                let rope_positions = self.rope_positions_for(slot, pending.pos, consumed)?;
-                let ids = Tensor::from_vec(
-                    pending.inputs[..consumed].to_vec(),
-                    (consumed, 1usize),
-                    &self.device,
-                )?;
-                let slots = vec![slot as u32; consumed];
-                let _ = self
-                    .model
-                    .forward_decode_batch(&ids, &cache_positions, &rope_positions, &slots)
-                    .map_err(|error| anyhow!("speculative accept re-run: {error}"))?;
             }
         }
         #[cfg(feature = "cuda")]

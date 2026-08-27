@@ -2001,6 +2001,14 @@ impl DeltaNetLayer {
     /// state (ssm_state, conv_state) индексируется по `slots[batch_idx]`, а не по
     /// batch_idx напрямую — это корректно после сжатия батча (ранний EOS).
     fn forward_decode_batch(&mut self, x: &Tensor, slots: &[u32]) -> Result<Tensor> {
+        self.forward_decode_batch_rows(x, slots, false)
+    }
+
+    /// `shadow` — между строками одного слота снимать теневые снимки состояния
+    /// (проверка спекуляции: откат к принятой строке без перепрогона, Ф3).
+    /// Только CUDA batched-путь; остальные бэкенды флаг игнорируют — там
+    /// остаётся перепрогон принятых строк.
+    fn forward_decode_batch_rows(&mut self, x: &Tensor, slots: &[u32], shadow: bool) -> Result<Tensor> {
         let device = x.device().clone();
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         if seq_len != 1 {
@@ -2008,6 +2016,8 @@ impl DeltaNetLayer {
                 "forward_decode_batch: seq_len должен быть 1 (decode), got {seq_len}"
             );
         }
+        #[cfg(not(feature = "cuda"))]
+        let _ = shadow;
         let b = b_sz;
 
         // 1. Batched проекции (один QMatMul на B токенов; веса — shared read).
@@ -2103,9 +2113,18 @@ impl DeltaNetLayer {
                         "forward_decode_batch: смешанные дубликаты слотов не поддерживаются"
                     );
                 }
+                let shadow_rows = if shadow { b - 1 } else { 0 };
+                if shadow_rows > 0 {
+                    // Под максимальную ширину драфта, один раз: перевыделение
+                    // оставило бы захваченным графам освобождённые адреса.
+                    let rows = crate::scheduler::speculative_width()
+                        .saturating_sub(1)
+                        .max(shadow_rows);
+                    delta_rule_batched_cuda::ensure_shadow(&ctx.dev, &mut ctx.layer_state, rows)?;
+                }
                 batched_out_cuda = Some(delta_rule_batched_cuda::dispatch_delta_rule_batched_seq(
                     &ctx.dev,
-                    &ctx.layer_state,
+                    &mut ctx.layer_state,
                     &ctx.temp,
                     &ctx.params,
                     &qkv_t,
@@ -2113,6 +2132,7 @@ impl DeltaNetLayer {
                     &beta_t,
                     &alpha_t,
                     slots[0],
+                    shadow_rows,
                 )?);
             } else {
                 batched_out_cuda = Some(delta_rule_batched_cuda::dispatch_delta_rule_batched(
@@ -4729,7 +4749,7 @@ impl HybridBlock {
         let residual = x;
         let normed = self.attn_norm.forward(x)?;
         let layer_out = match &mut self.layer {
-            HybridLayerType::DeltaNet(delta) => delta.forward_decode_batch(&normed, slots)?,
+            HybridLayerType::DeltaNet(delta) => delta.forward_decode_batch_rows(&normed, slots, true)?,
             HybridLayerType::Attention(attn) => attn
                 .forward_attn_prefill_paged(&normed.reshape((1, k, n_embd))?, ctx, rope_pos_dev)?
                 .reshape((k, 1, n_embd))?,
@@ -6822,6 +6842,28 @@ impl ModelWeights {
                     attention.kv_cache_len_batched[checkpoint.slot] = *len;
                 }
                 _ => candle_core::bail!("batched checkpoint block type mismatch"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Вернуть DeltaNet-состояние слота к теневому снимку `idx` последней
+    /// проверки спекуляции (состояние после строки idx). Attention-слои не
+    /// трогает: их KV в пуле откатывается сдвигом длины.
+    #[cfg(feature = "cuda")]
+    pub fn restore_slot_from_shadow(&mut self, slot: usize, idx: usize) -> Result<()> {
+        for block in self.blocks.iter_mut() {
+            if let HybridLayerType::DeltaNet(delta) = &mut block.layer {
+                let ctx = delta.cuda_ctx_batched.as_mut().ok_or_else(|| {
+                    candle_core::Error::Msg("CUDA batched state is absent".into())
+                })?;
+                let dev = ctx.dev.clone();
+                delta_rule_batched_cuda::restore_slot_from_shadow(
+                    &dev,
+                    &mut ctx.layer_state,
+                    slot,
+                    idx,
+                )?;
             }
         }
         Ok(())
