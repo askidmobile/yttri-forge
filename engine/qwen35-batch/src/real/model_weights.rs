@@ -3954,11 +3954,18 @@ impl GatedAttentionLayer {
     /// yttri-forge: paged prefill attention (CUDA-graph friendly).
     /// x: [1, T, n_embd]; пишет T строк в paged pool; FA2 varlen q_len=T.
     /// RoPE по device-позициям (rope_pos_dev = [start_pos..start_pos+T)).
+    /// `per_row_gqa` — проверка спекуляции: внимание считается построчно
+    /// декодными вызовами (строка i видит ключи 0..kv0+i через seqlens_k =
+    /// kv0+i+1, маска не нужна), чтобы в ядре сработала GQA-свёртка и сплиты
+    /// декода. Одна причинная FA2 на k строк свёртку не получает (маска не
+    /// noop): 24 CTA читают KV шестикратно, и цена растёт с контекстом —
+    /// +9 мс над шагом декода на 32K, +30 мс на 128K (замер 2026-08-27).
     fn forward_attn_prefill_paged(
         &mut self,
         x: &Tensor,
         ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
         rope_pos_dev: &Tensor,
+        per_row_gqa: bool,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         if b_sz != 1 {
@@ -4039,40 +4046,79 @@ impl GatedAttentionLayer {
             .reshape((b_sz * seq_len, self.n_head, self.head_dim))?;
         let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
         let window = ctx.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE;
-        let seqlens_q = ctx.seqlens_q_prefill();
-        let seqlens_k = ctx.seqlens_k(b_sz)?;
         let block_table = ctx.block_table(b_sz)?;
         let total_q = q_f16.dim(0)?;
         let out = Tensor::zeros(q_f16.shape(), DType::F16, q_f16.device())?;
         let lse = Tensor::zeros((self.n_head, total_q), DType::F32, q_f16.device())?;
-        crate::real::paged_attn::PagedAttn {
-            q: &q_f16,
-            k_pool: &pool.k_pool,
-            v_pool: &pool.v_pool,
-            kv_scales: match (&pool.k_scale, &pool.v_scale) {
-                (Some(ks), Some(vs)) => Some((ks, vs)),
-                _ => None,
-            },
-            seqlens_q: &seqlens_q,
-            seqlens_k: &seqlens_k,
-            block_table: &block_table,
-            out: &out,
-            softmax_lse: &lse,
-            b: b_sz,
-            h: self.n_head,
-            h_k: self.n_kv_head,
-            d: self.head_dim,
-            max_seqlen_q: seq_len,
-            max_seqlen_k: window,
-            softmax_scale: scale,
-            window_left: -1,
-            // Правое окно 0 — причинность. При q_len<k_len FA2 выравнивает
-            // маску по правому-нижнему углу: строка i видит 0..kv0+i. Без
-            // этого токены чанка видят будущее.
-            window_right: 0,
-            page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+        if per_row_gqa {
+            // Построчно: строка i — декодный вызов (seqlen_q = 1, маска noop),
+            // ключи 0..kv0+i задаются через seqlens_k = kv0+i+1. Строки уже
+            // дописаны в пул выше, kv_len_dev ещё не инкрементирован.
+            let seqlens_q1 = ctx.seqlens_q(1)?;
+            for i in 0..seq_len {
+                let seqlens_k_i = ctx.seqlens_k_for_prefill(1, i + 1)?;
+                let q_i = q_f16.narrow(0, i, 1)?; // [1, nh, hd]
+                let out_i = out.narrow(0, i, 1)?;
+                // LSE у varlen лежит как [h, total_q]; для строки — свой [h, 1].
+                let lse_i = Tensor::zeros((self.n_head, 1), DType::F32, q_f16.device())?;
+                crate::real::paged_attn::PagedAttn {
+                    q: &q_i,
+                    k_pool: &pool.k_pool,
+                    v_pool: &pool.v_pool,
+                    kv_scales: match (&pool.k_scale, &pool.v_scale) {
+                        (Some(ks), Some(vs)) => Some((ks, vs)),
+                        _ => None,
+                    },
+                    seqlens_q: &seqlens_q1,
+                    seqlens_k: &seqlens_k_i,
+                    block_table: &block_table,
+                    out: &out_i,
+                    softmax_lse: &lse_i,
+                    b: 1,
+                    h: self.n_head,
+                    h_k: self.n_kv_head,
+                    d: self.head_dim,
+                    max_seqlen_q: 1,
+                    max_seqlen_k: window,
+                    softmax_scale: scale,
+                    window_left: -1,
+                    window_right: -1,
+                    page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+                }
+                .forward()?;
+            }
+        } else {
+            let seqlens_q = ctx.seqlens_q_prefill();
+            let seqlens_k = ctx.seqlens_k(b_sz)?;
+            crate::real::paged_attn::PagedAttn {
+                q: &q_f16,
+                k_pool: &pool.k_pool,
+                v_pool: &pool.v_pool,
+                kv_scales: match (&pool.k_scale, &pool.v_scale) {
+                    (Some(ks), Some(vs)) => Some((ks, vs)),
+                    _ => None,
+                },
+                seqlens_q: &seqlens_q,
+                seqlens_k: &seqlens_k,
+                block_table: &block_table,
+                out: &out,
+                softmax_lse: &lse,
+                b: b_sz,
+                h: self.n_head,
+                h_k: self.n_kv_head,
+                d: self.head_dim,
+                max_seqlen_q: seq_len,
+                max_seqlen_k: window,
+                softmax_scale: scale,
+                window_left: -1,
+                // Правое окно 0 — причинность. При q_len<k_len FA2 выравнивает
+                // маску по правому-нижнему углу: строка i видит 0..kv0+i. Без
+                // этого токены чанка видят будущее.
+                window_right: 0,
+                page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+            }
+            .forward()?;
         }
-        .forward()?;
 
         // 7. Gate + Wo
         let y_all = out.to_dtype(DType::F32)?.unsqueeze(2)?; // [B, T, nh, 1?] — проверка формы
@@ -4719,7 +4765,7 @@ impl HybridBlock {
                 }
             }
             HybridLayerType::Attention(attn) => {
-                attn.forward_attn_prefill_paged(&normed, ctx, rope_pos_dev)?
+                attn.forward_attn_prefill_paged(&normed, ctx, rope_pos_dev, false)?
             }
         };
         let x = (layer_out + residual)?;
@@ -4751,7 +4797,7 @@ impl HybridBlock {
         let layer_out = match &mut self.layer {
             HybridLayerType::DeltaNet(delta) => delta.forward_decode_batch_rows(&normed, slots, true)?,
             HybridLayerType::Attention(attn) => attn
-                .forward_attn_prefill_paged(&normed.reshape((1, k, n_embd))?, ctx, rope_pos_dev)?
+                .forward_attn_prefill_paged(&normed.reshape((1, k, n_embd))?, ctx, rope_pos_dev, true)?
                 .reshape((k, 1, n_embd))?,
         };
         let x = (layer_out + residual)?;
