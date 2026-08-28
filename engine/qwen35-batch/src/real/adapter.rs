@@ -818,7 +818,8 @@ impl BatchModel for Qwen35BatchAdapter {
             chunk.tokens.clone(),
             (1usize, chunk.tokens.len()),
             &self.device,
-        )?;
+        )
+        .map_err(|e| anyhow!("prefill ids from_vec T={}: {e}", chunk.tokens.len()))?;
         // yttri-forge: CUDA-graph prefill (QWEN36_PGRAPH=on|check).
         #[cfg(feature = "cuda")]
         let (pg_logits, pg_used) = self.prefill_try_graphed(chunk)?;
@@ -940,8 +941,10 @@ impl BatchModel for Qwen35BatchAdapter {
         let pf_l0 = std::time::Instant::now();
         let logits_f32 = match logits {
             Some(l) => l
-                .squeeze(0)?
-                .to_dtype(DType::F32)?
+                .squeeze(0)
+                .map_err(|e| anyhow!("prefill logits squeeze: {e}"))?
+                .to_dtype(DType::F32)
+                .map_err(|e| anyhow!("prefill logits to_dtype: {e}"))?
                 .to_vec1()
                 .map_err(|e| anyhow!("prefill logits to_vec1: {e}"))?,
             None => pg_logits
@@ -1144,7 +1147,10 @@ impl BatchModel for Qwen35BatchAdapter {
             slot_order.push(it.slot_idx);
             slots.push(it.slot_idx as u32);
         }
-        let ids = Tensor::from_vec(tokens.clone(), (b, 1usize), &self.device)?;
+        // Первая CUDA-операция шага (выделение + htod) — с контекстом: после
+        // захвата и вытеснения графа сюда приходил голый INVALID_VALUE.
+        let ids = Tensor::from_vec(tokens.clone(), (b, 1usize), &self.device)
+            .map_err(|e| anyhow!("decode ids from_vec b={b}: {e}"))?;
 
         // CUDA-graph decode: один cuGraphLaunch на весь forward. None → eager.
         #[cfg(feature = "cuda")]
@@ -1193,8 +1199,10 @@ impl BatchModel for Qwen35BatchAdapter {
         // One D2H transfer for [B, vocab], then split on host. Per-row to_vec1()
         // serialized four CUDA synchronizations/copies for B=4.
         let flat = logits
-            .to_dtype(DType::F32)?
-            .flatten_all()?
+            .to_dtype(DType::F32)
+            .map_err(|e| anyhow!("decode_batch logits to_dtype: {e}"))?
+            .flatten_all()
+            .map_err(|e| anyhow!("decode_batch logits flatten: {e}"))?
             .to_vec1()
             .map_err(|e| anyhow!("decode_batch logits to_vec1: {e}"))?;
         let vocab = self.vocab_size();
@@ -1374,7 +1382,8 @@ impl BatchModel for Qwen35BatchAdapter {
                     let ctx = self.model.paged_ctx.as_mut().unwrap();
                     let mut lens = ctx.kv_len_host.clone();
                     lens[slot] = (pending.pos + consumed) as u32;
-                    ctx.reset_kv_len(&lens)?;
+                    ctx.reset_kv_len(&lens)
+                        .map_err(|e| anyhow!("accept shadow reset_kv_len: {e}"))?;
                 }
             } else {
                 let checkpoint = self.target_transactions[slot]
@@ -1390,7 +1399,8 @@ impl BatchModel for Qwen35BatchAdapter {
                         let ctx = self.model.paged_ctx.as_mut().unwrap();
                         let mut lens = ctx.kv_len_host.clone();
                         lens[slot] = pending.pos as u32;
-                        ctx.reset_kv_len(&lens)?;
+                        ctx.reset_kv_len(&lens)
+                            .map_err(|e| anyhow!("accept reset_kv_len: {e}"))?;
                     }
                 } else if consumed > 0 {
                     #[cfg(feature = "cuda")]
@@ -1463,7 +1473,8 @@ impl BatchModel for Qwen35BatchAdapter {
                     let ctx = self.model.paged_ctx.as_mut().unwrap();
                     let mut lens = ctx.kv_len_host.clone();
                     lens[slot] = position as u32;
-                    ctx.reset_kv_len(&lens)?;
+                    ctx.reset_kv_len(&lens)
+                        .map_err(|e| anyhow!("rollback reset_kv_len: {e}"))?;
                 }
             }
         }
@@ -1928,7 +1939,8 @@ impl Qwen35BatchAdapter {
                     .paged_ctx
                     .as_mut()
                     .unwrap()
-                    .reset_kv_len(&lens)?;
+                    .reset_kv_len(&lens)
+                    .map_err(|e| anyhow!("migrate reset_kv_len slot {sidx}: {e}"))?;
             }
         }
 
