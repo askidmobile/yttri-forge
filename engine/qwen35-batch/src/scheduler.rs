@@ -162,6 +162,12 @@ pub struct BatchScheduler<M: BatchModel> {
     /// probe-раунда после серии неудач.
     slot_last_m: Vec<usize>,
     slot_last_k: Vec<usize>,
+    /// Когда закончился прошлый раунд спекуляции слота. Нужно только для
+    /// тайминга: фазы покрывают раунд от begin до commit, а между раундами
+    /// есть ещё планировщик, дренаж и хостовая часть — их видно только по
+    /// разрыву. Без этого числа неясно, что оптимизировать: замер дал раунд
+    /// 47 мс при сумме фаз 41, то есть 6 мс шли мимо разбивки.
+    slot_last_round_end: Vec<Option<Instant>>,
     skip_count: Vec<usize>,
     stats: SchedulerStats,
     eos: u32,
@@ -188,6 +194,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             speculative: vec![SpeculativeMetrics::default(); num_slots],
             slot_last_m: vec![1; num_slots],
             slot_last_k: vec![1; num_slots],
+            slot_last_round_end: vec![None; num_slots],
             skip_count: vec![0; num_slots],
             stats: SchedulerStats::default(),
             eos,
@@ -518,8 +525,16 @@ impl<M: BatchModel> BatchScheduler<M> {
         self.slot_last_m[slot] = verified.len();
         self.slot_last_k[slot] = draft.len();
         if timing {
+            let now = Instant::now();
+            // Разрыв между раундами и сумма фаз: без них не видно, что время
+            // уходит мимо разбивки. Разрыв — планировщик, дренаж, хостовая
+            // часть между раундами; сумма фаз — то, что разбивка объясняет.
+            let gap = self.slot_last_round_end[slot]
+                .map(|prev| (t_begin - prev).as_secs_f64() * 1e3)
+                .unwrap_or(0.0);
+            let phases = (now - t_begin).as_secs_f64() * 1e3;
             eprintln!(
-                "[mtp] slot={slot} K={} m={} begin={:.1}ms draft={:.1}ms verify={:.1}ms sample={:.1}ms accept={:.1}ms commit={:.1}ms",
+                "[mtp] slot={slot} K={} m={} begin={:.1}ms draft={:.1}ms verify={:.1}ms sample={:.1}ms accept={:.1}ms commit={:.1}ms | фазы={:.1}ms разрыв={:.1}ms раунд={:.1}ms",
                 draft.len(),
                 verified.len(),
                 (t_draft - t_begin).as_secs_f64() * 1e3,
@@ -528,8 +543,12 @@ impl<M: BatchModel> BatchScheduler<M> {
                 (t_accept - t_sample).as_secs_f64() * 1e3,
                 (t_commit - t_accept).as_secs_f64() * 1e3,
                 t_commit.elapsed().as_secs_f64() * 1e3,
+                phases,
+                gap,
+                phases + gap,
             );
         }
+        self.slot_last_round_end[slot] = Some(Instant::now());
         self.speculative[slot].used = true;
         self.speculative[slot].accepted += accepted;
         for token in verified {
