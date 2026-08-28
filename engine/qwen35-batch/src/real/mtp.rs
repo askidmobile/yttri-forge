@@ -52,6 +52,17 @@ struct MtpTransaction {
     checkpoint: MtpSlotCheckpoint,
 }
 
+/// Короткая проекция черновика: строки `output.weight` только для токенов из
+/// списка. Черновик гадает, а не решает (неверный токен отвергнет проверка),
+/// поэтому ему не нужен весь словарь: у Ornith-9B проекция на 248k строк —
+/// 834 МБ Q6_K, 2.8 мс из 5 мс прохода головы; шортлист на 32k — 107 МБ.
+struct ShortHead {
+    proj: QMatMul,
+    /// Обратное отображение: индекс в шортлисте → id токена (U32 [n] на устройстве).
+    ids: Tensor,
+    ids_host: Vec<u32>,
+}
+
 pub struct Qwen35Mtp {
     profile: MtpProfile,
     device: Device,
@@ -71,6 +82,7 @@ pub struct Qwen35Mtp {
     down: QMatMul,
     head_norm: RmsNorm,
     shared_head: QMatMul,
+    short_head: Option<ShortHead>,
     slots: Vec<MtpSlot>,
     transactions: Vec<Option<MtpTransaction>>,
     /// Граф прохода головы на слот (черновик): ключ — адрес и ёмкость кеша
@@ -192,6 +204,7 @@ impl Qwen35Mtp {
             down: qmat(&format!("{prefix}.ffn_down.weight"))?,
             head_norm: norm(&format!("{prefix}.nextn.shared_head_norm.weight"))?,
             shared_head,
+            short_head: None,
             slots: vec![MtpSlot::default(); slots],
             transactions: (0..slots).map(|_| None).collect(),
             #[cfg(feature = "cuda")]
@@ -206,6 +219,58 @@ impl Qwen35Mtp {
 
     pub fn profile(&self) -> &MtpProfile {
         &self.profile
+    }
+
+    /// Ограничить словарь черновика списком id: собрать проекцию из строк
+    /// общей головы (байты квантованных блоков копируются построчно, деквант не
+    /// нужен). Пустой список — полный словарь. Захваченные графы сбрасываются.
+    pub fn set_vocab_shortlist(&mut self, ids: Vec<u32>) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        for g in self.draft_graphs.iter_mut() {
+            *g = None;
+        }
+        if ids.is_empty() {
+            self.short_head = None;
+            return Ok(());
+        }
+        let QMatMul::QTensor(full) = &self.shared_head else {
+            candle_core::bail!("MTP shortlist: общая голова не квантованный тензор");
+        };
+        let dims = full.shape().dims().to_vec();
+        if dims.len() != 2 {
+            candle_core::bail!("MTP shortlist: форма головы {dims:?}, ожидалась [vocab, hidden]");
+        }
+        let (vocab, hidden) = (dims[0], dims[1]);
+        let dtype = full.dtype();
+        let row_bytes = hidden / dtype.block_size() * dtype.type_size();
+        let data = full.data()?; // D2H один раз при загрузке
+        if data.len() != vocab * row_bytes {
+            candle_core::bail!(
+                "MTP shortlist: размер данных головы {} != {vocab} × {row_bytes}",
+                data.len()
+            );
+        }
+        let mut bytes = Vec::with_capacity(ids.len() * row_bytes);
+        for &id in &ids {
+            let id = id as usize;
+            if id >= vocab {
+                candle_core::bail!("MTP shortlist: id {id} вне словаря {vocab}");
+            }
+            bytes.extend_from_slice(&data[id * row_bytes..(id + 1) * row_bytes]);
+        }
+        let short = candle_core::quantized::ggml_file::qtensor_from_ggml(
+            dtype,
+            &bytes,
+            vec![ids.len(), hidden],
+            &self.device,
+        )?;
+        let ids_t = Tensor::from_vec(ids.clone(), ids.len(), &self.device)?;
+        self.short_head = Some(ShortHead {
+            proj: QMatMul::from_qtensor(short)?,
+            ids: ids_t,
+            ids_host: ids,
+        });
+        Ok(())
     }
 
     pub fn reset_slot(&mut self, slot: usize) -> Result<()> {
@@ -364,27 +429,37 @@ impl Qwen35Mtp {
             };
             let sync = |d: &Option<candle_core::CudaDevice>| {
                 if let Some(d) = d {
+                    #[cfg(feature = "cuda")]
                     let _ = d.cuda_stream().synchronize();
+                    #[cfg(not(feature = "cuda"))]
+                    let _ = d;
                 }
                 std::time::Instant::now()
             };
             let t_proj = sync(&prof_dev);
             let normalized = self.head_norm.forward(&pre_head)?;
-            let logits = self.shared_head.forward(&normalized)?;
+            let logits = match &self.short_head {
+                Some(sh) => sh.proj.forward(&normalized)?,
+                None => self.shared_head.forward(&normalized)?,
+            };
             let t_argmax = sync(&prof_dev);
             let d_proj = t_argmax.duration_since(t_proj);
             // Аргмакс на устройстве; тай-брейк на равных максимумах может
             // отличаться от host-argmax — на драфт не влияет (верифицирует target).
             if logits.device().is_cpu() {
-                let id = argmax(&logits.to_dtype(DType::F32)?.to_vec2()?[0]);
-                tokens_gpu.push(Tensor::from_vec(vec![id as u32], (1, 1), &self.device)?);
+                let idx = argmax(&logits.to_dtype(DType::F32)?.to_vec2()?[0]) as usize;
+                let id = match &self.short_head {
+                    Some(sh) => sh.ids_host[idx],
+                    None => idx as u32,
+                };
+                tokens_gpu.push(Tensor::from_vec(vec![id], (1, 1), &self.device)?);
             } else {
-                tokens_gpu.push(
-                    logits
-                        .argmax(candle_core::D::Minus1)?
-                        .to_dtype(DType::U32)?
-                        .reshape((1, 1))?,
-                );
+                let idx = logits.argmax(candle_core::D::Minus1)?.to_dtype(DType::U32)?;
+                let id = match &self.short_head {
+                    Some(sh) => sh.ids.index_select(&idx.flatten_all()?, 0)?,
+                    None => idx.flatten_all()?,
+                };
+                tokens_gpu.push(id.reshape((1, 1))?);
             }
             if prof_dev.is_some() {
                 let d_argmax = sync(&prof_dev).duration_since(t_argmax);
@@ -742,11 +817,19 @@ impl Qwen35Mtp {
         let activated = self.gate.forward(&ffn)?.silu_mul_direct(&self.up.forward(&ffn)?)?;
         let pre = (self.down.forward(&activated)? + after_attention)?; // [1,1,H]
         let pre_head = pre.i((.., 0, ..))?; // [1,H]
-        let logits = self.shared_head.forward(&self.head_norm.forward(&pre_head)?)?; // [1,V]
-        let id = logits
+        let normalized = self.head_norm.forward(&pre_head)?;
+        let logits = match &self.short_head {
+            Some(sh) => sh.proj.forward(&normalized)?, // [1, n_short]
+            None => self.shared_head.forward(&normalized)?, // [1, V]
+        };
+        let idx = logits
             .argmax(candle_core::D::Minus1)?
             .to_dtype(DType::U32)?
             .reshape(1)?;
+        let id = match &self.short_head {
+            Some(sh) => sh.ids.index_select(&idx, 0)?,
+            None => idx,
+        };
         st.out_id.slice_set(&id, 0, 0)?;
         // hidden следующего прохода = pre_head (как в eager-цикле).
         st.hidden_in.slice_set(&pre, 0, 0)?;

@@ -645,16 +645,41 @@ impl Qwen35BatchAdapter {
         if self.target_transactions.iter().any(Option::is_some) {
             return Err(anyhow!("cannot load MTP during active transaction"));
         }
-        self.mtp = Some(
-            Qwen35Mtp::load(
-                gguf_path,
-                self.device.clone(),
-                self.slot_snaps.len(),
-                &self.profile,
-                self.model.shared_output(),
-            )
-            .map_err(|error| anyhow!("load MTP component: {error}"))?,
-        );
+        let mut mtp = Qwen35Mtp::load(
+            gguf_path,
+            self.device.clone(),
+            self.slot_snaps.len(),
+            &self.profile,
+            self.model.shared_output(),
+        )
+        .map_err(|error| anyhow!("load MTP component: {error}"))?;
+        // Шортлист словаря черновика: QWEN36_MTP_VOCAB_SHORTLIST=<файл, id по
+        // строке> либо QWEN36_MTP_VOCAB_TOP=N (первые N id — у BPE это
+        // примерно порядок частоты слияний). Не задано — полный словарь.
+        let shortlist: Vec<u32> = if let Ok(path) = std::env::var("QWEN36_MTP_VOCAB_SHORTLIST") {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow!("MTP shortlist {path}: {e}"))?;
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.parse::<u32>().map_err(|e| anyhow!("MTP shortlist {path}: «{l}»: {e}")))
+                .collect::<Result<Vec<u32>>>()?
+        } else if let Some(n) = std::env::var("QWEN36_MTP_VOCAB_TOP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| *n > 0)
+        {
+            (0..n).collect()
+        } else {
+            Vec::new()
+        };
+        if !shortlist.is_empty() {
+            let n = shortlist.len();
+            mtp.set_vocab_shortlist(shortlist)
+                .map_err(|e| anyhow!("MTP vocab shortlist: {e}"))?;
+            eprintln!("[mtp] словарь черновика ограничен шортлистом из {n} токенов");
+        }
+        self.mtp = Some(mtp);
         Ok(())
     }
 
