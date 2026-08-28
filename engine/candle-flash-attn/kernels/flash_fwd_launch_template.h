@@ -119,10 +119,9 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             // у всех девяти размерностей головы, и splitkv_hdim256 компилировался
                             // часами. Несоответствие ловится на стороне Rust до вызова ядра:
                             // молча уйти на F16 нельзя, int8-пул прочитался бы как f16.
-                            constexpr bool kQ8Allowed = Kernel_traits::kHeadDim == 256
+                            constexpr static bool kQ8Allowed = Kernel_traits::kHeadDim == 256
                                                         && !Append_KV && !Has_alibi && !Is_softcap;
-                            auto launch_splitkv = [&](auto is_q8_tag) {
-                                constexpr bool Is_kv_q8 = decltype(is_q8_tag)::value;
+                            Q8_SWITCH(kQ8Allowed, params.kv_is_q8, Is_kv_q8, [&] {
                                 // Промежуточный буфер под int8 нужен только q8-варианту;
                                 // F16 не должен терять из-за него занятость SM.
                                 constexpr size_t smem_size = Is_kv_q8 ? Kernel_traits::kSmemSizeSplitKV : Kernel_traits::kSmemSize;
@@ -136,13 +135,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 }
                                 kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
                                 C10_CUDA_KERNEL_LAUNCH_CHECK();
-                            };
-                            if constexpr (kQ8Allowed) {
-                                if (params.kv_is_q8) { launch_splitkv(std::true_type{}); }
-                                else { launch_splitkv(std::false_type{}); }
-                            } else {
-                                launch_splitkv(std::false_type{});
-                            }
+                            });
                             });
                         });
                     });

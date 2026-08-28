@@ -26,6 +26,30 @@
     }                                           \
   }()
 
+/// Как BOOL_SWITCH, но ветка true раскрывается только когда ALLOWED —
+/// иначе int8-вариант ядра инстанцируется для всех сочетаний и сборка
+/// растягивается на часы.
+///
+/// Лямбда здесь обязана быть обычной, не обобщённой: MSVC отказывается брать
+/// адрес __global__-шаблона внутри лямбды с auto-параметром — объявляет имя
+/// ядра неразрешённой перегрузкой (C3535). На gcc/clang работало и так,
+/// ломалась только сборка под Windows.
+#define Q8_SWITCH(ALLOWED, COND, CONST_NAME, ...) \
+  [&] {                                           \
+    if constexpr (ALLOWED) {                      \
+      if (COND) {                                 \
+        constexpr static bool CONST_NAME = true;  \
+        return __VA_ARGS__();                     \
+      } else {                                    \
+        constexpr static bool CONST_NAME = false; \
+        return __VA_ARGS__();                     \
+      }                                           \
+    } else {                                      \
+      constexpr static bool CONST_NAME = false;   \
+      return __VA_ARGS__();                       \
+    }                                             \
+  }()
+
 #ifdef FLASHATTENTION_DISABLE_DROPOUT
   #define DROPOUT_SWITCH(COND, CONST_NAME, ...) \
   [&] {                                         \
