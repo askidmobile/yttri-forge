@@ -230,6 +230,38 @@ fn dgraph_lru() -> usize {
     })
 }
 
+/// Потолок сбоев графового пути на процесс (OQ-8): до него графы возвращаются
+/// при следующем приёме запроса, после — выключены до перезапуска.
+/// QWEN36_GRAPH_FAIL_CAP, умолчание 3.
+fn graph_fail_cap() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("QWEN36_GRAPH_FAIL_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(3)
+    })
+}
+
+/// Диагностика OQ-8: QWEN36_GRAPH_FAIL_INJECT=K — первые K захватов декодного
+/// графа завершаются искусственным сбоем ещё до начала захвата (шаг уже
+/// посчитан прогревочным проходом, состояние консистентно). Нет/0 — выключено.
+fn graph_fail_inject() -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static LEFT: std::sync::OnceLock<AtomicU32> = std::sync::OnceLock::new();
+    let left = LEFT.get_or_init(|| {
+        AtomicU32::new(
+            std::env::var("QWEN36_GRAPH_FAIL_INJECT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        )
+    });
+    left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+        .is_ok()
+}
+
 /// Режим graph-prefill: `QWEN36_PGRAPH` = off (умолчание) | on | check.
 /// `check` — прогнать граф, откатить state и посчитать чанк ещё раз eager'ом,
 /// сравнив логиты (гейт Phase 2). Продакшн-путь — `on`.
@@ -321,6 +353,13 @@ pub struct Qwen35BatchAdapter {
     graph_gate_warned: Vec<bool>,
     #[cfg(feature = "cuda")]
     graphs_enabled: bool,
+    /// Графы разрешены конфигурацией (QWEN36_CUDA_GRAPHS=1 и запас VRAM). После
+    /// сбоя `graphs_enabled` гаснет до следующего приёма запроса и
+    /// возвращается, пока сбоев меньше потолка `graph_fail_cap()` (OQ-8).
+    #[cfg(feature = "cuda")]
+    graphs_configured: bool,
+    #[cfg(feature = "cuda")]
+    graph_failures: u32,
     /// On-demand Vision component. Phase 8 owns TTL/load barrier; adapter only
     /// consumes explicitly loaded component and per-request payloads.
     vision: Option<Qwen35Vision>,
@@ -497,6 +536,10 @@ impl Qwen35BatchAdapter {
             pg_paged_only: vec![false; num_slots],
             #[cfg(feature = "cuda")]
             graphs_enabled: graphs_on,
+            #[cfg(feature = "cuda")]
+            graphs_configured: graphs_on,
+            #[cfg(feature = "cuda")]
+            graph_failures: 0,
             vision: None,
             mtp: None,
             target_transactions: (0..num_slots).map(|_| None).collect(),
@@ -764,6 +807,8 @@ impl BatchModel for Qwen35BatchAdapter {
             return Err(anyhow!("prefill slot is out of range or chunk is empty"));
         }
         if chunk.reset_first {
+            #[cfg(feature = "cuda")]
+            self.graphs_reenable_on_admit();
             // Keep installed media for first chunk; reset only model state.
             self.state_owner = None;
             self.model.clear_state();
@@ -1160,9 +1205,8 @@ impl BatchModel for Qwen35BatchAdapter {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    eprintln!("[graphs] graphed decode failed, eager fallback: {e}");
                     self.decode_graphs.clear();
-                    self.graphs_enabled = false;
+                    self.graphs_failed("graphed decode failed, eager fallback", &e);
                 }
             }
         }
@@ -1845,6 +1889,40 @@ impl Qwen35BatchAdapter {
         }
     }
 
+    /// Сбой графового пути: графы гаснут до следующего приёма запроса, сбои
+    /// считаются; с потолка — до перезапуска процесса (OQ-8).
+    #[cfg(feature = "cuda")]
+    fn graphs_failed(&mut self, what: &str, e: &anyhow::Error) {
+        self.graph_failures += 1;
+        self.graphs_enabled = false;
+        let cap = graph_fail_cap();
+        let until = if self.graph_failures >= cap {
+            "до перезапуска процесса"
+        } else {
+            "до следующего приёма запроса"
+        };
+        eprintln!(
+            "[graphs] {what}: {e} — сбой {}/{cap}, графы выключены {until}",
+            self.graph_failures
+        );
+    }
+
+    /// Приём нового запроса: вернуть графы после сбоя, пока потолок не достигнут.
+    #[cfg(feature = "cuda")]
+    fn graphs_reenable_on_admit(&mut self) {
+        if self.graphs_enabled || !self.graphs_configured {
+            return;
+        }
+        let cap = graph_fail_cap();
+        if self.graph_failures < cap {
+            self.graphs_enabled = true;
+            eprintln!(
+                "[graphs] включены снова при приёме запроса (сбоев {}/{cap})",
+                self.graph_failures
+            );
+        }
+    }
+
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     fn decode_batch_graphed(
@@ -2098,6 +2176,9 @@ impl Qwen35BatchAdapter {
             let stream = cuda_dev.cuda_stream();
             let capture_result = (|| -> Result<DecodeGraphState> {
                 use cudarc::driver::{result as cres, sys as csys};
+                if graph_fail_inject() {
+                    return Err(anyhow!("искусственный сбой захвата (QWEN36_GRAPH_FAIL_INJECT)"));
+                }
                 // ВНИМАНИЕ: память, выделенная ВНУТРИ захвата, принадлежит graph pool —
                 // её адреса валидны только внутри graph launch. Внешний D2H по ним →
                 // illegal address. Поэтому выход копируем во ВНЕШНИЙ (default pool,
@@ -2176,9 +2257,9 @@ impl Qwen35BatchAdapter {
                     }
                 }
                 Err(e) => {
-                    // Захват не удался — продолжаем eager, логируем один раз.
-                    eprintln!("[graphs] capture failed (eager fallback): {e}");
-                    self.graphs_enabled = false;
+                    // Захват не удался — продолжаем eager (результат отдан
+                    // прогревочным проходом).
+                    self.graphs_failed("capture failed (eager fallback)", &e);
                 }
             }
             // Путь захвата: hidden получен прогревочным проходом, это обычный
