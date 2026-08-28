@@ -166,6 +166,14 @@ fn draft_graph_recapture() -> bool {
     *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_RECAPTURE").as_deref() == Ok("1"))
 }
 
+/// QWEN36_MTP_GRAPH_SYNC=1 — синхронизировать стрим сразу после replay
+/// (только ожидание, без сверки): исчезает ли недетерминизм от одного барьера.
+#[cfg(feature = "cuda")]
+fn draft_graph_sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_SYNC").as_deref() == Ok("1"))
+}
+
 /// QWEN36_MTP_GRAPH_CHECK=1 — после каждого replay повторить проход eager на
 /// тех же входах и сравнить id и hidden; печать по проходу. Состояние после
 /// проверки — от eager-прохода (строка кеша перезаписана тем же значением).
@@ -847,10 +855,22 @@ impl Qwen35Mtp {
                 if res != csys::CUresult::CUDA_SUCCESS {
                     candle_core::bail!("cuGraphLaunch (mtp draft) failed: {res:?}");
                 }
+                if draft_graph_sync() {
+                    cuda_dev
+                        .cuda_stream()
+                        .synchronize()
+                        .map_err(candle_core::Error::wrap)?;
+                }
                 if let Some((hidden_before, len_before)) = saved {
                     let id_g = st.out_id.to_vec1::<u32>()?[0];
                     let hidden_g = st.hidden_in.copy()?; // pre_head из графа
                     let len_g = st.len_dev.to_vec1::<u32>()?[0];
+                    // Строка K/V, которую записал граф (по длине до прохода).
+                    let row = len_before.to_vec1::<u32>()?[0] as usize;
+                    let (k_row_g, v_row_g) = {
+                        let cache = self.slots[slot].kv.as_ref().expect("кеш есть");
+                        (cache.k.narrow(1, row, 1)?.copy()?, cache.v.narrow(1, row, 1)?.copy()?)
+                    };
                     // Тот же проход eager на тех же входах.
                     st.hidden_in.slice_set(&hidden_before, 0, 0)?;
                     st.len_dev.slice_set(&len_before, 0, 0)?;
@@ -861,8 +881,23 @@ impl Qwen35Mtp {
                         .abs()?
                         .max_all()?
                         .to_scalar::<f32>()?;
+                    let (dk, dv) = {
+                        let cache = self.slots[slot].kv.as_ref().expect("кеш есть");
+                        let k_e = cache.k.narrow(1, row, 1)?;
+                        let v_e = cache.v.narrow(1, row, 1)?;
+                        (
+                            (k_e.to_dtype(DType::F32)? - k_row_g.to_dtype(DType::F32)?)?
+                                .abs()?
+                                .max_all()?
+                                .to_scalar::<f32>()?,
+                            (v_e.to_dtype(DType::F32)? - v_row_g.to_dtype(DType::F32)?)?
+                                .abs()?
+                                .max_all()?
+                                .to_scalar::<f32>()?,
+                        )
+                    };
                     eprintln!(
-                        "[mtp-graph-check] slot={slot} pass={offset} pos={} id graph={id_g} eager={id_e} {} len graph={len_g} eager={len_e} max|Δhidden|={dh:.3e}",
+                        "[mtp-graph-check] slot={slot} pass={offset} pos={} id graph={id_g} eager={id_e} {} len graph={len_g} eager={len_e} max|Δhidden|={dh:.3e} max|ΔK|={dk:.3e} max|ΔV|={dv:.3e}",
                         start_pos + offset,
                         if id_g == id_e { "ok" } else { "MISMATCH" }
                     );
