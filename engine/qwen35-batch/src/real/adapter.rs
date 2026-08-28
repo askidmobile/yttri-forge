@@ -185,6 +185,23 @@ fn pgraph_min_capture_t() -> usize {
 /// пул небольшой.
 const DGRAPH_LRU: usize = 6;
 
+/// Размер пула графов декода. Настраивается, потому что число различных
+/// ключей растёт как непустые подмножества слотов: на одном слоте комбинация
+/// одна, на четырёх — пятнадцать, а пул держит шесть. Постоянное вытеснение
+/// подозревается в CUDA_ERROR_ILLEGAL_ADDRESS на четырёх слотах: logits_t и
+/// hidden_t — алиасы в память пула графов, и уничтожение одного графа может
+/// освободить адрес, который ещё читает другой.
+fn dgraph_lru() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("QWEN36_DGRAPH_LRU")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DGRAPH_LRU)
+    })
+}
+
 /// Режим graph-prefill: `QWEN36_PGRAPH` = off (умолчание) | on | check.
 /// `check` — прогнать граф, откатить state и посчитать чанк ещё раз eager'ом,
 /// сравнив логиты (гейт Phase 2). Продакшн-путь — `on`.
@@ -1443,6 +1460,8 @@ impl BatchModel for Qwen35BatchAdapter {
         // ровно ноль (замер: свободно 685 → 685 МиБ, и с синхронизацией потока
         // тоже). Свободных страниц в пуле нет: удерживаемая память — это сам
         // пул, живой и занятый. Поэтому trim убран, осталось освобождение.
+        // Бисекция 28.08.2026: падение на четырёх слотах воспроизводится и
+        // без этой строки, значит виновата не она, а графы. Возвращено.
         self.model.free_slot_kv_batched(idx);
         if let Some(mtp) = self.mtp.as_mut() {
             mtp.reset_slot(idx)
@@ -2089,7 +2108,7 @@ impl Qwen35BatchAdapter {
             match capture_result {
                 Ok(state) => {
                     self.decode_graphs.push(state);
-                    while self.decode_graphs.len() > DGRAPH_LRU {
+                    while self.decode_graphs.len() > dgraph_lru() {
                         self.decode_graphs.remove(0);
                     }
                     if crate::scheduler::trace_on() {
