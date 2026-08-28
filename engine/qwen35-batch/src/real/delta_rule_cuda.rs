@@ -538,12 +538,40 @@ pub fn dispatch_delta_rule_prefill(
         eprintln!("[pfphases] T={t_len} p1={t_p1:.1} p2={t_p2:.1} p3={t_p3:.1} p4={t_p4:.1}");
     }
 
-    // Persistent conv_state ← последние (conv_k-1) СЫРЫХ входов.
-    if t_len >= conv_k - 1 {
-        let src_off = (t_len - (conv_k - 1)) * channels;
-        let src = qkv_v.slice(src_off..src_off + (conv_k - 1) * channels);
+    // Persistent conv_state ← последние (conv_k-1) СЫРЫХ входов. Ядро P1
+    // читало прежнее состояние для t < conv_k-1 раньше по стриму, копии
+    // упорядочены после него.
+    let rows = conv_k - 1;
+    if t_len >= rows {
+        let src_off = (t_len - rows) * channels;
+        let src = qkv_v.slice(src_off..src_off + rows * channels);
         dev.cuda_stream()
             .memcpy_dtod(&src, &mut state.conv_state.slice_mut(..))
+            .map_err(candle_core::Error::wrap)?;
+    } else if t_len > 0 {
+        // Короткий хвост (T < conv_k-1: один-два токена после попадания в
+        // префикс-кеш): окно сдвигается на T строк и дописывается T новыми.
+        // Раньше эта ветка отсутствовала и состояние не обновлялось вовсе —
+        // следующий токен видел окно без последних входов (2026-08-28, найдено
+        // по вопросу Metal-порта). Сдвиг через временный буфер: перекрывающийся
+        // memcpy_dtod недопустим.
+        let keep = rows - t_len;
+        let stream = dev.cuda_stream();
+        let mut tmp = dev.alloc_zeros::<f32>(keep * channels).map_err(candle_core::Error::wrap)?;
+        stream
+            .memcpy_dtod(
+                &state.conv_state.slice(t_len * channels..rows * channels),
+                &mut tmp,
+            )
+            .map_err(candle_core::Error::wrap)?;
+        stream
+            .memcpy_dtod(&tmp, &mut state.conv_state.slice_mut(0..keep * channels))
+            .map_err(candle_core::Error::wrap)?;
+        stream
+            .memcpy_dtod(
+                &qkv_v.slice(0..t_len * channels),
+                &mut state.conv_state.slice_mut(keep * channels..rows * channels),
+            )
             .map_err(candle_core::Error::wrap)?;
     }
 
