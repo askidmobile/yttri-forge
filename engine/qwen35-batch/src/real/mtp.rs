@@ -187,6 +187,14 @@ fn draft_graph_double() -> bool {
     *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_DOUBLE").as_deref() == Ok("1"))
 }
 
+/// QWEN36_MTP_GRAPH_LEAK=1 — при перезахвате старый граф не разрушать и его
+/// стейджинг не освобождать (утечка; диагностика: виновато ли разрушение).
+#[cfg(feature = "cuda")]
+fn draft_graph_leak() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_LEAK").as_deref() == Ok("1"))
+}
+
 /// QWEN36_MTP_GRAPH_SYNC=1 — синхронизировать стрим сразу после replay
 /// (только ожидание, без сверки): исчезает ли недетерминизм от одного барьера.
 #[cfg(feature = "cuda")]
@@ -364,7 +372,14 @@ impl Qwen35Mtp {
 
     pub fn reset_slot(&mut self, slot: usize) -> Result<()> {
         self.check_slot(slot)?;
-        self.slots[slot] = MtpSlot::default();
+        // Буфер K/V головы переживает сброс: его адрес запечён в граф
+        // черновика, а строки за len никогда не читаются — перевыделять и
+        // обнулять незачем. Перевыделение означало перезахват графа на каждом
+        // запросе, адрес которого зависел от аллокатора (2026-08-28).
+        if let Some(kv) = self.slots[slot].kv.as_mut() {
+            kv.len = 0;
+        }
+        self.slots[slot].pending_target_hidden = None;
         self.transactions[slot] = None;
         Ok(())
     }
@@ -819,8 +834,21 @@ impl Qwen35Mtp {
             let stale = self.draft_graphs[slot]
                 .as_ref()
                 .is_some_and(|g| g.k_ptr != k_ptr || g.cap != cap);
-            if stale || draft_graph_recapture() {
-                self.draft_graphs[slot] = None;
+            if (stale || draft_graph_recapture()) && self.draft_graphs[slot].is_some() {
+                let old = self.draft_graphs[slot].take();
+                if draft_graph_leak() {
+                    std::mem::forget(old);
+                } else {
+                    // Разрушать только на пустом стриме и не выделять ничего до
+                    // следующей синхронизации: освобождение внешних буферов графа
+                    // рядом с instantiate соседнего ломало аллокатор (OQ-7).
+                    cuda_dev.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+                    drop(old);
+                    cuda_dev.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+                }
+                if stale {
+                    eprintln!("[mtp] граф черновика слота {slot} перезахвачен: кеш K/V перевыделен");
+                }
             }
             let st = match self.draft_graphs[slot].as_ref() {
                 Some(g) => g.st.clone(),
