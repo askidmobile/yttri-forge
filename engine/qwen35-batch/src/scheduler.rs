@@ -162,6 +162,12 @@ pub struct BatchScheduler<M: BatchModel> {
     /// probe-раунда после серии неудач.
     slot_last_m: Vec<usize>,
     slot_last_k: Vec<usize>,
+    /// Разрыв между первым и вторым логитом на последней позиции прошлого
+    /// раунда. Проверяем гипотезу: раунд, начинающийся там, где модель
+    /// колеблется, чаще оказывается холостым — а значит его дешевле не
+    /// начинать вовсе (пропуск стоит 25 мс за токен против 41.6 за раунд).
+    /// Считается только при QWEN36_MTP_PREDICT=1.
+    slot_prev_gap: Vec<f32>,
     /// Когда закончился прошлый раунд спекуляции слота. Нужно только для
     /// тайминга: фазы покрывают раунд от begin до commit, а между раундами
     /// есть ещё планировщик, дренаж и хостовая часть — их видно только по
@@ -184,6 +190,27 @@ pub enum StepOutcome {
     DidDecode(usize),
 }
 
+/// Разрыв между первым и вторым логитом. Softmax не нужен: для сравнения
+/// корзин достаточно разности логитов, она монотонна по отношению вероятностей.
+fn top2_gap(logits: &[f32]) -> f32 {
+    let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for &l in logits {
+        if l > a {
+            b = a;
+            a = l;
+        } else if l > b {
+            b = l;
+        }
+    }
+    a - b
+}
+
+/// Диагностика предиктора холостых раундов (QWEN36_MTP_PREDICT=1).
+fn mtp_predict_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN36_MTP_PREDICT").as_deref() == Ok("1"))
+}
+
 impl<M: BatchModel> BatchScheduler<M> {
     pub fn new(model: M, num_slots: usize, eos: u32, _vocab: usize) -> Self {
         Self {
@@ -194,6 +221,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             speculative: vec![SpeculativeMetrics::default(); num_slots],
             slot_last_m: vec![1; num_slots],
             slot_last_k: vec![1; num_slots],
+            slot_prev_gap: vec![f32::NAN; num_slots],
             slot_last_round_end: vec![None; num_slots],
             skip_count: vec![0; num_slots],
             stats: SchedulerStats::default(),
@@ -522,6 +550,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             return Ok(Some(SpeculativeFallback::Commit));
         }
         // P0.5c: фиксируем результат раунда для adaptive width.
+        let verified_len_for_pred = verified.len();
         self.slot_last_m[slot] = verified.len();
         self.slot_last_k[slot] = draft.len();
         if timing {
@@ -547,6 +576,22 @@ impl<M: BatchModel> BatchScheduler<M> {
                 gap,
                 phases + gap,
             );
+        }
+        if mtp_predict_on() {
+            // Разрыв прошлого раунда против m этого — та самая корреляция.
+            // Печатаем до обновления, иначе сравним разрыв с самим собой.
+            if self.slot_prev_gap[slot].is_finite() {
+                eprintln!(
+                    "[mtp-pred] slot={slot} разрыв_прошлого={:.3} m={}",
+                    self.slot_prev_gap[slot],
+                    verified_len_for_pred
+                );
+            }
+            // Новый разрыв — с последней использованной строки проверки.
+            self.slot_prev_gap[slot] = rows
+                .get(verified_len_for_pred.saturating_sub(1))
+                .map(|logits| top2_gap(logits))
+                .unwrap_or(f32::NAN);
         }
         self.slot_last_round_end[slot] = Some(Instant::now());
         self.speculative[slot].used = true;
