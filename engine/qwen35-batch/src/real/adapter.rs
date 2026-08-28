@@ -89,6 +89,10 @@ struct DecodeGraphState {
     /// Второй внешний буфер: hidden декодируемых позиций, тем же способом.
     /// Читается глубокой копией — буфер перезаписывается следующим launch.
     hidden_t: Tensor,
+    /// Диагностика вытеснения (QWEN36_DGRAPH_EVICT_KEEP_HANDLES=1): при Drop
+    /// не разрушать exec/граф (утечка хэндлов), тензоры освободить как обычно —
+    /// отделяет cuGraphExecDestroy/cuGraphDestroy от cudaFreeAsync тензоров.
+    destroy_handles: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -271,6 +275,9 @@ impl Drop for DecodeGraphState {
     fn drop(&mut self) {
         if graph_drop_sync() {
             let _ = self.stream.synchronize();
+        }
+        if !self.destroy_handles {
+            return;
         }
         unsafe {
             cudarc::driver::sys::cuGraphExecDestroy(self.exec);
@@ -1503,9 +1510,6 @@ impl BatchModel for Qwen35BatchAdapter {
         // Отдать видеопамять слота сразу, а не держать до конца процесса.
         // Буфер имел размер самого длинного запроса на этом слоте; на карте
         // 12 ГБ два запроса на 30K подряд съедали её до отказа.
-        // Отдать видеопамять слота сразу, а не держать до конца процесса.
-        // Буфер имел размер самого длинного запроса на этом слоте; на карте
-        // 12 ГБ два запроса на 30K подряд съедали её до отказа.
         //
         // На страничном пути это пусто: KV живёт в пуле, batched-кэша нет.
         // Возвращать страницы драйверу через trim здесь пробовали — он отдаёт
@@ -2184,15 +2188,19 @@ impl Qwen35BatchAdapter {
                     emb_t: emb_eager.clone(),
                     logits_t: logits_out,
                     hidden_t: hidden_out,
+                    destroy_handles: true,
                 })
             })();
             match capture_result {
                 Ok(state) => {
                     self.decode_graphs.push(state);
                     while self.decode_graphs.len() > dgraph_lru() {
-                        let evicted = self.decode_graphs.remove(0);
+                        let mut evicted = self.decode_graphs.remove(0);
                         if std::env::var("QWEN36_DGRAPH_EVICT_LEAK").as_deref() == Ok("1") {
                             std::mem::forget(evicted);
+                        } else if std::env::var("QWEN36_DGRAPH_EVICT_KEEP_HANDLES").as_deref() == Ok("1") {
+                            // Хэндлы не разрушаем, тензоры уходят обычным Drop.
+                            evicted.destroy_handles = false;
                         }
                     }
                     if crate::scheduler::trace_on() {
