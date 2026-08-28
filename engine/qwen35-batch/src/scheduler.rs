@@ -270,6 +270,18 @@ impl<M: BatchModel> BatchScheduler<M> {
 
         // 1. Prefill phase: один чанк для одного Prefilling-слота.
         if let Some((sidx, chunk_size)) = self.next_prefill_chunk() {
+            // Отмена проверяется ПЕРЕД чанком, а не только после всего префила.
+            // Раньше should_stop смотрели лишь когда слот переходил в декод
+            // (ветка is_decoding ниже), поэтому отменённый запрос дочитывал
+            // промпт до конца: на 32K это около 16 секунд неостановимой работы
+            // видеокарты, на 128K — около минуты. Пользователь видел, что
+            // нагрузка не спадает после нажатия «стоп».
+            if should_stop(sidx, self.slots[sidx].generated_tokens()) {
+                self.slots[sidx].status = SlotStatus::Finished;
+                return Ok(StepOutcome::DidPrefill {
+                    first_token_emitted: false,
+                });
+            }
             let reset = self.slots[sidx].prefill_done == 0;
             let tokens = self.slots[sidx].prefill_remaining_slice()[..chunk_size].to_vec();
             let start_pos = self.slots[sidx].prefill_done;
