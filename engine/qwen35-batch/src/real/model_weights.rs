@@ -7844,8 +7844,18 @@ impl ModelWeights {
         let q8_budget = crate::real::paged_kv_cuda::kv_pool_is_q8();
         let kv_bytes_per_head = if q8_budget { hd + 2 } else { hd * 2 };
         let bytes_per_token_all_layers = num_attn_layers * capacity_b * (2 * n_kv * kv_bytes_per_head);
-        // Резервируем 512 МиБ на рабочие буферы активаций и драйвера (было 1536)
-        let reserved_headroom = 512 * 1024 * 1024;
+        // Резерв под то, что выделяется ПОСЛЕ пула: графы, активации префила,
+        // буферы драйвера. 512 МиБ не хватало: на 3060 с MTP и графами замер
+        // показал 846 МиБ в подкачке WDDM. Windows при выходе за VRAM не падает,
+        // а молча уводит память в системную, и префил замедляется втрое — то
+        // есть переполнение выглядит как «модель не отвечает», а не как ошибка.
+        // Отсюда правило: лучше окно поменьше, но гарантированно в видеопамяти.
+        let reserved_headroom = std::env::var("QWEN36_VRAM_HEADROOM_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1024)
+            * 1024
+            * 1024;
         let vram_for_paged_kv = free_vram.saturating_sub(reserved_headroom);
         let max_tokens_by_vram = if bytes_per_token_all_layers > 0 {
             vram_for_paged_kv / bytes_per_token_all_layers
