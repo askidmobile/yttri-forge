@@ -139,9 +139,25 @@ impl PrefillGraphState {
     }
 }
 
+/// Диагностика вытеснения графов: QWEN36_GRAPH_DROP_SYNC=1 — синхронизировать
+/// стрим перед разрушением exec/графа (версия «разрушаем незавершённый»);
+/// QWEN36_DGRAPH_EVICT_LEAK=1 — не разрушать вытесняемый декодный граф вовсе
+/// (версия «Drop ломает следующий шаг» против «сам захват сверх пула»).
+/// 2026-08-28: после закрытия дефекта slot_ids вытеснение декодного графа
+/// (пул 6, 9 захватов) даёт CUDA_ERROR_INVALID_VALUE на следующем шаге;
+/// с пулом 32 чисто. Корень не локализован.
+#[cfg(feature = "cuda")]
+fn graph_drop_sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN36_GRAPH_DROP_SYNC").as_deref() == Ok("1"))
+}
+
 #[cfg(feature = "cuda")]
 impl Drop for PrefillGraphState {
     fn drop(&mut self) {
+        if graph_drop_sync() {
+            let _ = self.stream.synchronize();
+        }
         unsafe {
             cudarc::driver::sys::cuGraphExecDestroy(self.exec);
             cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
@@ -253,6 +269,9 @@ fn pgraph_mode() -> PgraphMode {
 #[cfg(feature = "cuda")]
 impl Drop for DecodeGraphState {
     fn drop(&mut self) {
+        if graph_drop_sync() {
+            let _ = self.stream.synchronize();
+        }
         unsafe {
             cudarc::driver::sys::cuGraphExecDestroy(self.exec);
             cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
@@ -2135,7 +2154,10 @@ impl Qwen35BatchAdapter {
                 Ok(state) => {
                     self.decode_graphs.push(state);
                     while self.decode_graphs.len() > dgraph_lru() {
-                        self.decode_graphs.remove(0);
+                        let evicted = self.decode_graphs.remove(0);
+                        if std::env::var("QWEN36_DGRAPH_EVICT_LEAK").as_deref() == Ok("1") {
+                            std::mem::forget(evicted);
+                        }
                     }
                     if crate::scheduler::trace_on() {
                         eprintln!("[graphs] captured decode graph B={b} slots={slots:?}");
