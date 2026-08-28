@@ -6971,6 +6971,35 @@ impl ModelWeights {
         }
     }
 
+    /// Освободить batched KV одного слота: тензор выбрасывается, длина
+    /// обнуляется. Зовётся при завершении запроса (`reset_slot`).
+    ///
+    /// Без этого буфер слота жил до конца процесса и имел размер самого
+    /// длинного обслуженного запроса. Замер на 3060 12 ГБ, Ornith-9B: после
+    /// запроса на 30K токенов карта оставалась занятой на 2,5 ГБ сверх весов,
+    /// повторный такой же запрос добавлял ещё 416 МБ (буфер растёт
+    /// перевыделением, старый и новый какое-то время лежат оба), и дальше
+    /// приходил CUDA_ERROR_OUT_OF_MEMORY в decode_batch.
+    ///
+    /// Длину обнуляем обязательно: путь выделения в decode_batch падает с
+    /// «нужен rehydrate_kv_from_paged», если тензора нет, а длина ненулевая.
+    ///
+    /// Ёмкость слоя (`kv_cache_cap_batched`) не трогаем: она общая на все
+    /// слоты, а освобождаем мы один. Путь выделения смотрит на сам тензор.
+    pub fn free_slot_kv_batched(&mut self, slot: usize) -> usize {
+        let mut freed = 0usize;
+        for block in self.blocks.iter_mut() {
+            if let HybridLayerType::Attention(a) = &mut block.layer {
+                if slot < a.kv_cache_batched.len() && a.kv_cache_batched[slot].is_some() {
+                    a.kv_cache_batched[slot] = None;
+                    a.kv_cache_len_batched[slot] = 0;
+                    freed += 1;
+                }
+            }
+        }
+        freed
+    }
+
     /// Isolated capture одного Q4_K_M matmul dispatch для GPU profiling (T-274 GPU Profile follow-up).
     ///
     /// Берёт `blocks[0].mlp.feed_forward_w1` (MLP gate_proj: 2560 → 9216),
