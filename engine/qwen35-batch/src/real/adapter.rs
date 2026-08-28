@@ -659,7 +659,13 @@ impl Qwen35BatchAdapter {
         // Шортлист словаря черновика: QWEN36_MTP_VOCAB_SHORTLIST=<файл, id по
         // строке> либо QWEN36_MTP_VOCAB_TOP=N (первые N id — у BPE это
         // примерно порядок частоты слияний). Не задано — полный словарь.
-        let shortlist: Vec<u32> = if let Ok(path) = std::env::var("QWEN36_MTP_VOCAB_SHORTLIST") {
+        // Пустое значение переменной — «нет шортлиста», а не путь: иначе
+        // загрузка MTP молча падала, и контрольные замеры шли без MTP.
+        let shortlist_path = std::env::var("QWEN36_MTP_VOCAB_SHORTLIST")
+            .ok()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+        let shortlist: Vec<u32> = if let Some(path) = shortlist_path {
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow!("MTP shortlist {path}: {e}"))?;
             text.lines()
@@ -667,7 +673,10 @@ impl Qwen35BatchAdapter {
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(|l| l.parse::<u32>().map_err(|e| anyhow!("MTP shortlist {path}: «{l}»: {e}")))
                 .collect::<Result<Vec<u32>>>()?
-        } else if let Ok(v) = std::env::var("QWEN36_MTP_VOCAB_TOP") {
+        } else if let Some(v) = std::env::var("QWEN36_MTP_VOCAB_TOP")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
             // Ошибка разбора — ошибкой, не тихим полным словарём: значение с
             // пробелом или CR из батника иначе выглядело бы как «не задано».
             let n: u32 = v

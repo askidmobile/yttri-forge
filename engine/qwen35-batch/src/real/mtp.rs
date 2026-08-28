@@ -90,9 +90,6 @@ pub struct Qwen35Mtp {
     /// конца процесса.
     #[cfg(feature = "cuda")]
     draft_graphs: Vec<Option<DraftGraph>>,
-    /// Второй граф на слот для нечётных проходов (QWEN36_MTP_GRAPH_DOUBLE).
-    #[cfg(feature = "cuda")]
-    draft_graphs_odd: Vec<Option<DraftGraph>>,
     #[cfg(feature = "cuda")]
     draft_graph_failed: bool,
 }
@@ -169,38 +166,12 @@ fn draft_graph_recapture() -> bool {
     *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_RECAPTURE").as_deref() == Ok("1"))
 }
 
-/// QWEN36_MTP_GRAPH_SYNC_BEFORE=1 — синхронизировать стрим перед launch
-/// (после стейджинга входов): закрывает ли окно «стейджинг ещё в полёте».
-#[cfg(feature = "cuda")]
-fn draft_graph_sync_before() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_SYNC_BEFORE").as_deref() == Ok("1"))
-}
-
-/// QWEN36_MTP_GRAPH_DOUBLE=1 — двойная буферизация: два набора стейджинга и
-/// два графа на слот, проходы чередуют их по чётности. Если недетерминизм
-/// исчезает — входы прохода N+1 перезаписывали память, которую ещё читал
-/// replay прохода N.
-#[cfg(feature = "cuda")]
-fn draft_graph_double() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_DOUBLE").as_deref() == Ok("1"))
-}
-
 /// QWEN36_MTP_GRAPH_LEAK=1 — при перезахвате старый граф не разрушать и его
 /// стейджинг не освобождать (утечка; диагностика: виновато ли разрушение).
 #[cfg(feature = "cuda")]
 fn draft_graph_leak() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_LEAK").as_deref() == Ok("1"))
-}
-
-/// QWEN36_MTP_GRAPH_SYNC=1 — синхронизировать стрим сразу после replay
-/// (только ожидание, без сверки): исчезает ли недетерминизм от одного барьера.
-#[cfg(feature = "cuda")]
-fn draft_graph_sync() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_SYNC").as_deref() == Ok("1"))
 }
 
 /// QWEN36_MTP_DRAFT_LOG=1 — печатать id каждого чернового токена. Нужен, чтобы
@@ -274,8 +245,6 @@ impl Qwen35Mtp {
             #[cfg(feature = "cuda")]
             draft_graphs: (0..slots).map(|_| None).collect(),
             #[cfg(feature = "cuda")]
-            draft_graphs_odd: (0..slots).map(|_| None).collect(),
-            #[cfg(feature = "cuda")]
             draft_graph_failed: false,
         };
         // Keep ownership construction after loaders stopped borrowing device.
@@ -292,7 +261,7 @@ impl Qwen35Mtp {
     /// нужен). Пустой список — полный словарь. Захваченные графы сбрасываются.
     pub fn set_vocab_shortlist(&mut self, ids: Vec<u32>) -> Result<()> {
         #[cfg(feature = "cuda")]
-        for g in self.draft_graphs.iter_mut().chain(self.draft_graphs_odd.iter_mut()) {
+        for g in self.draft_graphs.iter_mut() {
             *g = None;
         }
         if ids.is_empty() {
@@ -819,18 +788,10 @@ impl Qwen35Mtp {
             .unsqueeze(1)?; // [1,H] → [1,1,H]
         let len_t = Tensor::from_vec(vec![len as u32], 1, &self.device)?;
 
-        let double = draft_graph_double();
-        let mut prev_st: Option<DraftStaging> = None;
         let mut token = first_token;
         let mut out = Vec::with_capacity(width);
         for offset in 0..width {
-            // Двойная буферизация: нечётные проходы — второй набор графа и
-            // стейджинга (на время прохода он подменяет основной).
-            let parity = if double { offset % 2 } else { 0 };
-            if parity == 1 {
-                std::mem::swap(&mut self.draft_graphs[slot], &mut self.draft_graphs_odd[slot]);
-            }
-            // Кеш перевыделен (рост/сброс слота) — граф устарел.
+            // Кеш перевыделен (рост ёмкости) — граф устарел.
             let stale = self.draft_graphs[slot]
                 .as_ref()
                 .is_some_and(|g| g.k_ptr != k_ptr || g.cap != cap);
@@ -857,11 +818,6 @@ impl Qwen35Mtp {
             if offset == 0 {
                 st.hidden_in.slice_set(&hidden0, 0, 0)?;
                 st.len_dev.slice_set(&len_t, 0, 0)?;
-            } else if double {
-                // Вход прохода — из стейджинга предыдущего (другой набор).
-                let p = prev_st.as_ref().expect("предыдущий проход был");
-                st.hidden_in.slice_set(&p.hidden_in, 0, 0)?;
-                st.len_dev.slice_set(&p.len_dev, 0, 0)?;
             }
             let emb = target.embed_for_graph(&[token], &self.device)?; // [1,1,H] F32
             st.emb_in.slice_set(&emb, 0, 0)?;
@@ -925,22 +881,10 @@ impl Qwen35Mtp {
                 } else {
                     None
                 };
-                if draft_graph_sync_before() {
-                    cuda_dev
-                        .cuda_stream()
-                        .synchronize()
-                        .map_err(candle_core::Error::wrap)?;
-                }
                 let g = self.draft_graphs[slot].as_ref().expect("проверено выше");
                 let res = unsafe { csys::cuGraphLaunch(g.exec, g.stream.cu_stream()) };
                 if res != csys::CUresult::CUDA_SUCCESS {
                     candle_core::bail!("cuGraphLaunch (mtp draft) failed: {res:?}");
-                }
-                if draft_graph_sync() {
-                    cuda_dev
-                        .cuda_stream()
-                        .synchronize()
-                        .map_err(candle_core::Error::wrap)?;
                 }
                 if let Some((hidden_before, len_before)) = saved {
                     let id_g = st.out_id.to_vec1::<u32>()?[0];
@@ -997,10 +941,6 @@ impl Qwen35Mtp {
             }
             // Зеркало длины на хосте (граф инкрементировал len_dev).
             self.slots[slot].kv.as_mut().expect("кеш есть").len += 1;
-            if parity == 1 {
-                std::mem::swap(&mut self.draft_graphs[slot], &mut self.draft_graphs_odd[slot]);
-            }
-            prev_st = Some(st);
         }
         Ok(out)
     }
