@@ -250,6 +250,16 @@ impl Qwen35Mtp {
                 data.len()
             );
         }
+        // Дополнение до кратности 256 повтором последнего id: ядра матвека и
+        // MMQ обрабатывают строки группами, хвост не кратной длины — отдельная
+        // ветка, которую проще не открывать; дубликат при равенстве логитов
+        // проигрывает оригиналу (argmax берёт меньший индекс) и на выбор не
+        // влияет.
+        let mut ids = ids;
+        while ids.len() % 256 != 0 {
+            let last = *ids.last().expect("список не пуст");
+            ids.push(last);
+        }
         let mut bytes = Vec::with_capacity(ids.len() * row_bytes);
         for &id in &ids {
             let id = id as usize;
