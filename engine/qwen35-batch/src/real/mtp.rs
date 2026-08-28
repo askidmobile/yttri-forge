@@ -157,6 +157,24 @@ fn draft_graph_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH").as_deref() != Ok("0"))
 }
 
+/// QWEN36_MTP_GRAPH_RECAPTURE=1 — перезахватывать граф на каждом вызове
+/// черновика (диагностика: исчез ли недетерминизм вместе с состоянием,
+/// живущим внутри графа между вызовами).
+#[cfg(feature = "cuda")]
+fn draft_graph_recapture() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_RECAPTURE").as_deref() == Ok("1"))
+}
+
+/// QWEN36_MTP_GRAPH_CHECK=1 — после каждого replay повторить проход eager на
+/// тех же входах и сравнить id и hidden; печать по проходу. Состояние после
+/// проверки — от eager-прохода (строка кеша перезаписана тем же значением).
+#[cfg(feature = "cuda")]
+fn draft_graph_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_CHECK").as_deref() == Ok("1"))
+}
+
 impl Qwen35Mtp {
     pub fn load(
         path: &Path,
@@ -742,7 +760,7 @@ impl Qwen35Mtp {
         let stale = self.draft_graphs[slot]
             .as_ref()
             .is_some_and(|g| g.k_ptr != k_ptr || g.cap != cap);
-        if stale {
+        if stale || draft_graph_recapture() {
             self.draft_graphs[slot] = None;
         }
         let st = match self.draft_graphs[slot].as_ref() {
@@ -817,10 +835,37 @@ impl Qwen35Mtp {
                     }
                 }
             } else {
+                // Снимки входов до replay — для проверки против eager.
+                let check = draft_graph_check();
+                let saved = if check {
+                    Some((st.hidden_in.copy()?, st.len_dev.copy()?))
+                } else {
+                    None
+                };
                 let g = self.draft_graphs[slot].as_ref().expect("проверено выше");
                 let res = unsafe { csys::cuGraphLaunch(g.exec, g.stream.cu_stream()) };
                 if res != csys::CUresult::CUDA_SUCCESS {
                     candle_core::bail!("cuGraphLaunch (mtp draft) failed: {res:?}");
+                }
+                if let Some((hidden_before, len_before)) = saved {
+                    let id_g = st.out_id.to_vec1::<u32>()?[0];
+                    let hidden_g = st.hidden_in.copy()?; // pre_head из графа
+                    let len_g = st.len_dev.to_vec1::<u32>()?[0];
+                    // Тот же проход eager на тех же входах.
+                    st.hidden_in.slice_set(&hidden_before, 0, 0)?;
+                    st.len_dev.slice_set(&len_before, 0, 0)?;
+                    self.draft_pass_body(slot, &st)?;
+                    let id_e = st.out_id.to_vec1::<u32>()?[0];
+                    let len_e = st.len_dev.to_vec1::<u32>()?[0];
+                    let dh = (st.hidden_in.clone() - &hidden_g)?
+                        .abs()?
+                        .max_all()?
+                        .to_scalar::<f32>()?;
+                    eprintln!(
+                        "[mtp-graph-check] slot={slot} pass={offset} pos={} id graph={id_g} eager={id_e} {} len graph={len_g} eager={len_e} max|Δhidden|={dh:.3e}",
+                        start_pos + offset,
+                        if id_g == id_e { "ok" } else { "MISMATCH" }
+                    );
                 }
             }
             // Единственная синхронизация прохода: id токена.
