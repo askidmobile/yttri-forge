@@ -84,7 +84,18 @@ pub struct DeltaNetCudaTempBatched {
     /// Кэш slot_ids на device (пересоздаётся только при смене состава батча).
     /// Раньше clone_htod делал H2D+alloc на КАЖДЫЙ блок на КАЖДЫЙ шаг —
     /// ~350µs × 30-48 блоков = доминирующий overhead decode-шага (A100 замер).
-    pub slot_ids_cache: std::sync::Mutex<Option<(std::sync::Arc<CudaSlice<u32>>, Vec<u32>)>>,
+    ///
+    /// Буферы НИКОГДА не освобождаются: указатель на slot_ids запекается в
+    /// аргументы ядер захваченного CUDA-графа, и граф, снятый для одного
+    /// состава батча, при повторе читает именно этот буфер. Прежний кэш на
+    /// одну запись при смене состава (ранний EOS, приём нового запроса,
+    /// проверка MTP с [slot] на многослотовом сервере) освобождал старый
+    /// буфер — и следующий повтор графа прежнего состава читал освобождённую
+    /// память: CUDA_ERROR_ILLEGAL_ADDRESS и падения nvcuda на 4 слотах
+    /// (2026-08-28, yttri-win). На одном слоте состав не меняется — потому
+    /// там не воспроизводилось. Составов немного (перестановки ≤ 8 слотов
+    /// из реально встречающихся), буфер — до 8 u32.
+    pub slot_ids_cache: std::sync::Mutex<Vec<(Vec<u32>, std::sync::Arc<CudaSlice<u32>>)>>,
     /// B — capacity (slot count), фиксированная при аллокации.
     pub capacity_b: u32,
 }
@@ -209,7 +220,7 @@ pub fn create_temp_buffers_batched(
         gate: dev.alloc_zeros::<f32>(b * n_v)?,
         delta_output: dev.alloc_zeros::<f32>(b * n_v * hvd)?,
         gated_output: dev.alloc_zeros::<f32>(b * value_dim)?,
-        slot_ids_cache: std::sync::Mutex::new(None),
+        slot_ids_cache: std::sync::Mutex::new(Vec::new()),
         capacity_b,
     })
 }
@@ -221,6 +232,22 @@ fn cuda_slice_view<'a>(storage: &'a Storage, offset: usize) -> Result<CudaView<'
         Storage::Cuda(cs) => Ok(cs.as_cuda_slice::<f32>()?.slice(offset..)),
         _ => candle_core::bail!("delta_rule_batched_cuda: тензор не на CUDA device"),
     }
+}
+
+/// Device-буфер slot_ids для состава батча — из растущего кэша (см. поле
+/// `slot_ids_cache`): один буфер на состав, живёт до конца жизни модели.
+fn slot_ids_buffer(
+    dev: &CudaDevice,
+    temp: &DeltaNetCudaTempBatched,
+    slot_ids: &[u32],
+) -> Result<std::sync::Arc<CudaSlice<u32>>> {
+    let mut cache = temp.slot_ids_cache.lock().expect("slot_ids cache");
+    if let Some((_, buf)) = cache.iter().find(|(ids, _)| ids.as_slice() == slot_ids) {
+        return Ok(buf.clone());
+    }
+    let buf = std::sync::Arc::new(dev.clone_htod(slot_ids)?);
+    cache.push((slot_ids.to_vec(), buf.clone()));
+    Ok(buf)
 }
 
 /// Выполняет полный batched delta_rule forward pass на CUDA GPU (4 ядра, ноль host-sync).
@@ -306,17 +333,7 @@ pub fn dispatch_delta_rule_batched(
         slot_ids.len(),
         b,
     };
-    let slot_ids_arc = {
-        let mut cache = temp.slot_ids_cache.lock().expect("slot_ids cache");
-        let stale = match &*cache {
-            Some((_, ids)) => ids.as_slice() != slot_ids,
-            None => true,
-        };
-        if stale {
-            *cache = Some((std::sync::Arc::new(dev.clone_htod(slot_ids)?), slot_ids.to_vec()));
-        }
-        cache.as_ref().unwrap().0.clone()
-    };
+    let slot_ids_arc = slot_ids_buffer(dev, temp, slot_ids)?;
 
     let p = *params;
 
@@ -550,17 +567,7 @@ pub fn dispatch_delta_rule_batched_seq(
     let alpha_v = cuda_slice_view(&alpha_st, alpha_lay.start_offset())?;
 
     let slot_ids = [slot];
-    let slot_ids_arc = {
-        let mut cache = temp.slot_ids_cache.lock().expect("slot_ids cache");
-        let stale = match &*cache {
-            Some((_, ids)) => ids.as_slice() != slot_ids,
-            None => true,
-        };
-        if stale {
-            *cache = Some((std::sync::Arc::new(dev.clone_htod(&slot_ids)?), slot_ids.to_vec()));
-        }
-        cache.as_ref().unwrap().0.clone()
-    };
+    let slot_ids_arc = slot_ids_buffer(dev, temp, &slot_ids)?;
 
     let mut p = *params;
     p.batch_size = seq_rows;
