@@ -364,6 +364,8 @@ pub struct Qwen35BatchAdapter {
     /// consumes explicitly loaded component and per-request payloads.
     vision: Option<Qwen35Vision>,
     mtp: Option<Qwen35Mtp>,
+    /// Диагностический буфер (QWEN36_DEBUG_ALLOC_MB), см. load_mtp.
+    debug_alloc: Option<Tensor>,
     target_transactions: Vec<Option<BatchedStateCheckpoint>>,
     verified_target_hidden: Vec<Vec<Tensor>>,
     verify_pending: Vec<Option<PendingVerify>>,
@@ -542,6 +544,7 @@ impl Qwen35BatchAdapter {
             graph_failures: 0,
             vision: None,
             mtp: None,
+            debug_alloc: None,
             target_transactions: (0..num_slots).map(|_| None).collect(),
             verified_target_hidden: (0..num_slots).map(|_| Vec::new()).collect(),
             verify_pending: (0..num_slots).map(|_| None).collect(),
@@ -678,6 +681,20 @@ impl Qwen35BatchAdapter {
             mtp.set_vocab_shortlist(shortlist)
                 .map_err(|e| anyhow!("MTP vocab shortlist: {e}"))?;
             eprintln!("[mtp] словарь черновика ограничен шортлистом из {n} токенов");
+        }
+        // Диагностика раскладки памяти: QWEN36_DEBUG_ALLOC_MB=N держит лишний
+        // буфер N МБ с момента загрузки MTP. Если один он меняет вывод при
+        // полном словаре — где-то читается неинициализированная память, и
+        // шортлист лишь сдвигал раскладку.
+        if let Some(mb) = std::env::var("QWEN36_DEBUG_ALLOC_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+        {
+            let t = Tensor::zeros(mb * 1024 * 1024, DType::U8, &self.device)
+                .map_err(|e| anyhow!("debug alloc {mb} MB: {e}"))?;
+            eprintln!("[mtp] debug: удерживаю лишний буфер {mb} МБ");
+            self.debug_alloc = Some(t);
         }
         self.mtp = Some(mtp);
         Ok(())

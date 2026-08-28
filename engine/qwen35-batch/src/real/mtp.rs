@@ -275,8 +275,29 @@ impl Qwen35Mtp {
             &self.device,
         )?;
         let ids_t = Tensor::from_vec(ids.clone(), ids.len(), &self.device)?;
+        let proj = QMatMul::from_qtensor(short)?;
+        // QWEN36_MTP_SHORTLIST_CHECK=1: логиты пересобранной головы против
+        // исходной на одном случайном входе — строки должны совпасть побитово
+        // (те же байты блоков, то же ядро). Расхождение = дефект пересборки.
+        if std::env::var("QWEN36_MTP_SHORTLIST_CHECK").as_deref() == Ok("1") {
+            let x = Tensor::randn(0f32, 1f32, (1, hidden), &self.device)?;
+            let full_logits = self.shared_head.forward(&x)?.flatten_all()?; // [vocab]
+            let short_logits = proj.forward(&x)?.flatten_all()?; // [n]
+            let picked = full_logits.index_select(&ids_t, 0)?; // [n]
+            let diff = (short_logits.clone() - &picked)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            let exact = short_logits
+                .to_vec1::<f32>()?
+                .iter()
+                .zip(picked.to_vec1::<f32>()?.iter())
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            eprintln!(
+                "[mtp] shortlist check: n={} max|Δ|={diff:.3e} строк с побитовым расхождением={exact}",
+                ids.len()
+            );
+        }
         self.short_head = Some(ShortHead {
-            proj: QMatMul::from_qtensor(short)?,
+            proj,
             ids: ids_t,
             ids_host: ids,
         });
