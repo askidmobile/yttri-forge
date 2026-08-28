@@ -667,11 +667,13 @@ impl Qwen35BatchAdapter {
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(|l| l.parse::<u32>().map_err(|e| anyhow!("MTP shortlist {path}: «{l}»: {e}")))
                 .collect::<Result<Vec<u32>>>()?
-        } else if let Some(n) = std::env::var("QWEN36_MTP_VOCAB_TOP")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|n| *n > 0)
-        {
+        } else if let Ok(v) = std::env::var("QWEN36_MTP_VOCAB_TOP") {
+            // Ошибка разбора — ошибкой, не тихим полным словарём: значение с
+            // пробелом или CR из батника иначе выглядело бы как «не задано».
+            let n: u32 = v
+                .trim()
+                .parse()
+                .map_err(|e| anyhow!("QWEN36_MTP_VOCAB_TOP=«{v}»: {e}"))?;
             (0..n).collect()
         } else {
             Vec::new()
