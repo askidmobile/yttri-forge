@@ -6986,18 +6986,15 @@ impl ModelWeights {
     ///
     /// Ёмкость слоя (`kv_cache_cap_batched`) не трогаем: она общая на все
     /// слоты, а освобождаем мы один. Путь выделения смотрит на сам тензор.
-    pub fn free_slot_kv_batched(&mut self, slot: usize) -> usize {
-        let mut freed = 0usize;
+    pub fn free_slot_kv_batched(&mut self, slot: usize) {
         for block in self.blocks.iter_mut() {
             if let HybridLayerType::Attention(a) = &mut block.layer {
-                if slot < a.kv_cache_batched.len() && a.kv_cache_batched[slot].is_some() {
+                if slot < a.kv_cache_batched.len() {
                     a.kv_cache_batched[slot] = None;
                     a.kv_cache_len_batched[slot] = 0;
-                    freed += 1;
                 }
             }
         }
-        freed
     }
 
     /// Isolated capture одного Q4_K_M matmul dispatch для GPU profiling (T-274 GPU Profile follow-up).
