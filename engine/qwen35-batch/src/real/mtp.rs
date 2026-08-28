@@ -73,6 +73,76 @@ pub struct Qwen35Mtp {
     shared_head: QMatMul,
     slots: Vec<MtpSlot>,
     transactions: Vec<Option<MtpTransaction>>,
+    /// Граф прохода головы на слот (черновик): ключ — адрес и ёмкость кеша
+    /// K/V слота, при их смене перезахват. При сбое захвата — eager до
+    /// конца процесса.
+    #[cfg(feature = "cuda")]
+    draft_graphs: Vec<Option<DraftGraph>>,
+    #[cfg(feature = "cuda")]
+    draft_graph_failed: bool,
+}
+
+/// Стейджинг прохода головы: адреса стабильны между replay, всё, что меняется
+/// от прохода к проходу, кладётся сюда ДО launch, выходы читаются ПОСЛЕ.
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+struct DraftStaging {
+    emb_in: Tensor,    // [1,1,H] F32 — эмбеддинг токена (деквант на хосте, H2D)
+    hidden_in: Tensor, // [1,1,H] F32 — вход; граф сам кладёт сюда pre_head для следующего прохода
+    cos_in: Tensor,    // [1, ROPE_DIM/2] F32
+    sin_in: Tensor,
+    len_dev: Tensor,   // U32 [1] — длина кеша головы (граф инкрементирует)
+    zero_slot: Tensor, // U32 [1] = [0] — «слот» для cumsum_seqlens
+    one_u32: Tensor,   // U32 [1] = [1]
+    seqlens_q: Tensor, // U32 [2] = [0, 1]
+    seqlens_k: Tensor, // U32 [2] — заполняется в графе: [0, len + 1]
+    out_id: Tensor,    // U32 [1] — argmax логитов головы
+}
+
+#[cfg(feature = "cuda")]
+impl DraftStaging {
+    fn new(device: &Device, hidden: usize) -> Result<Self> {
+        Ok(Self {
+            emb_in: Tensor::zeros((1, 1, hidden), DType::F32, device)?,
+            hidden_in: Tensor::zeros((1, 1, hidden), DType::F32, device)?,
+            cos_in: Tensor::zeros((1, ROPE_DIM / 2), DType::F32, device)?,
+            sin_in: Tensor::zeros((1, ROPE_DIM / 2), DType::F32, device)?,
+            len_dev: Tensor::zeros(1, DType::U32, device)?,
+            zero_slot: Tensor::zeros(1, DType::U32, device)?,
+            one_u32: Tensor::from_vec(vec![1u32], 1, device)?,
+            seqlens_q: Tensor::from_vec(vec![0u32, 1u32], 2, device)?,
+            seqlens_k: Tensor::zeros(2, DType::U32, device)?,
+            out_id: Tensor::zeros(1, DType::U32, device)?,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct DraftGraph {
+    exec: cudarc::driver::sys::CUgraphExec,
+    cu_graph: cudarc::driver::sys::CUgraph,
+    stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    /// Адрес и ёмкость кеша K/V, запечённые в граф.
+    k_ptr: u64,
+    cap: usize,
+    st: DraftStaging,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for DraftGraph {
+    fn drop(&mut self) {
+        unsafe {
+            cudarc::driver::sys::cuGraphExecDestroy(self.exec);
+            cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
+        }
+    }
+}
+
+/// QWEN36_MTP_GRAPH=0 — черновик eager (диагностика).
+#[cfg(feature = "cuda")]
+fn draft_graph_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH").as_deref() != Ok("0"))
 }
 
 impl Qwen35Mtp {
@@ -124,6 +194,10 @@ impl Qwen35Mtp {
             shared_head,
             slots: vec![MtpSlot::default(); slots],
             transactions: (0..slots).map(|_| None).collect(),
+            #[cfg(feature = "cuda")]
+            draft_graphs: (0..slots).map(|_| None).collect(),
+            #[cfg(feature = "cuda")]
+            draft_graph_failed: false,
         };
         // Keep ownership construction after loaders stopped borrowing device.
         mtp.device = device;
@@ -252,6 +326,10 @@ impl Qwen35Mtp {
         self.check_slot(slot)?;
         if self.transactions[slot].is_none() {
             candle_core::bail!("MTP draft requires active transaction");
+        }
+        #[cfg(feature = "cuda")]
+        if self.device.is_cuda() && !self.draft_graph_failed && draft_graph_enabled() {
+            return self.draft_graphed(slot, first_token, start_pos, width, target);
         }
         // P0.5b: черновой контур полностью на GPU — id предыдущего шага
         // остаётся CUDA-тензором (H2D один раз в начале, D2H один раз в конце).
@@ -406,9 +484,24 @@ impl Qwen35Mtp {
         k_new: &Tensor,
         v_new: &Tensor,
     ) -> Result<(Tensor, Tensor, usize)> {
-        let (_, seq, kv_heads, hd) = k_new.dims4()?;
-        let past = self.slots[slot].kv.as_ref().map(|cache| cache.len).unwrap_or(0);
+        let (_, seq, _kv_heads, _hd) = k_new.dims4()?;
+        self.ensure_kv_capacity(slot, seq)?;
+        let cache = self.slots[slot].kv.as_mut().expect("ensure_kv_capacity создаёт кеш");
+        let past = cache.len;
         let total = past + seq;
+        cache.k.slice_set(k_new, 1, past)?;
+        cache.v.slice_set(v_new, 1, past)?;
+        cache.len = total;
+        Ok((cache.k.narrow(1, 0, total)?, cache.v.narrow(1, 0, total)?, total))
+    }
+
+    /// Кеш K/V головы вмещает ещё `extra` строк; рост — перевыделение с копией
+    /// (адреса меняются: граф черновика слота перезахватывается по k_ptr).
+    fn ensure_kv_capacity(&mut self, slot: usize, extra: usize) -> Result<()> {
+        let kv_heads = self.profile.kv_head_count;
+        let hd = HEAD_DIM;
+        let past = self.slots[slot].kv.as_ref().map(|cache| cache.len).unwrap_or(0);
+        let total = past + extra;
         let fits = self.slots[slot]
             .kv
             .as_ref()
@@ -427,11 +520,7 @@ impl Qwen35Mtp {
             }
             self.slots[slot].kv = Some(MtpKv { k, v, len: past });
         }
-        let cache = self.slots[slot].kv.as_mut().expect("буфер только что обеспечен");
-        cache.k.slice_set(k_new, 1, past)?;
-        cache.v.slice_set(v_new, 1, past)?;
-        cache.len = total;
-        Ok((cache.k.narrow(1, 0, total)?, cache.v.narrow(1, 0, total)?, total))
+        Ok(())
     }
 
     /// Эталонное внимание (Metal/CPU и откат): F32, разворот GQA на все головы,
@@ -484,6 +573,234 @@ impl Qwen35Mtp {
             candle_core::bail!("MTP slot {slot} is out of range");
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Qwen35Mtp {
+    /// Черновик графом: проход головы захвачен один раз на слот, дальше replay.
+    /// Между проходами остаётся только зависимость по данным — id токена
+    /// (4 байта D2H) и его эмбеддинг (деквант на хосте, H2D в стейджинг);
+    /// hidden следующего прохода граф кладёт в стейджинг сам.
+    fn draft_graphed(
+        &mut self,
+        slot: usize,
+        first_token: u32,
+        start_pos: usize,
+        width: usize,
+        target: &ModelWeights,
+    ) -> Result<Vec<u32>> {
+        use cudarc::driver::{result as cres, sys as csys};
+        let cuda_dev = match &self.device {
+            Device::Cuda(d) => d.clone(),
+            _ => candle_core::bail!("draft_graphed: устройство не CUDA"),
+        };
+        // Ёмкость под все проходы — ДО захвата: рост меняет адреса кеша.
+        self.ensure_kv_capacity(slot, width)?;
+        let (k_ptr, cap, len) = {
+            let cache = self.slots[slot].kv.as_ref().expect("ensure_kv_capacity создаёт кеш");
+            (
+                crate::real::paged_kv_cuda::tensor_cuda_ptr(&cache.k)?,
+                cache.k.dim(1)?,
+                cache.len,
+            )
+        };
+        // Кеш перевыделен (рост/сброс слота) — граф устарел.
+        let stale = self.draft_graphs[slot]
+            .as_ref()
+            .is_some_and(|g| g.k_ptr != k_ptr || g.cap != cap);
+        if stale {
+            self.draft_graphs[slot] = None;
+        }
+        let st = match self.draft_graphs[slot].as_ref() {
+            Some(g) => g.st.clone(),
+            None => DraftStaging::new(&self.device, self.profile.hidden_size)?,
+        };
+        // Стейджинг состояния на начало черновика.
+        let hidden0 = self.slots[slot]
+            .pending_target_hidden
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("MTP target hidden is not initialized".into()))?
+            .unsqueeze(1)?; // [1,H] → [1,1,H]
+        st.hidden_in.slice_set(&hidden0, 0, 0)?;
+        let len_t = Tensor::from_vec(vec![len as u32], 1, &self.device)?;
+        st.len_dev.slice_set(&len_t, 0, 0)?;
+
+        let mut token = first_token;
+        let mut out = Vec::with_capacity(width);
+        for offset in 0..width {
+            let emb = target.embed_for_graph(&[token], &self.device)?; // [1,1,H] F32
+            st.emb_in.slice_set(&emb, 0, 0)?;
+            let (cos, sin) = rope_tables(start_pos + offset, 1, &self.device)?;
+            st.cos_in.slice_set(&cos, 0, 0)?;
+            st.sin_in.slice_set(&sin, 0, 0)?;
+
+            if self.draft_graphs[slot].is_none() {
+                // Прайм (исполняется, результат — этого прохода) + захват
+                // (не исполняется). Guard: параметры ядер — через htod-кэш,
+                // иначе в захват попал бы pageable memcpy.
+                let _guard = cuda_dev.enable_cuda_graph_htod_cache();
+                self.draft_pass_body(slot, &st)?;
+                let stream = cuda_dev.cuda_stream();
+                let captured = (|| -> Result<(csys::CUgraphExec, csys::CUgraph)> {
+                    unsafe {
+                        cres::stream::begin_capture(
+                            stream.cu_stream(),
+                            csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+                        )
+                    }
+                    .map_err(candle_core::Error::wrap)?;
+                    if let Err(e) = self.draft_pass_body(slot, &st) {
+                        let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
+                        return Err(e);
+                    }
+                    let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
+                        .map_err(candle_core::Error::wrap)?;
+                    if cu_graph.is_null() {
+                        candle_core::bail!("end_capture вернул пустой граф");
+                    }
+                    let mut exec: csys::CUgraphExec = std::ptr::null_mut();
+                    let res = unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
+                    if res != csys::CUresult::CUDA_SUCCESS || exec.is_null() {
+                        unsafe { csys::cuGraphDestroy(cu_graph) };
+                        candle_core::bail!("cuGraphInstantiate (mtp draft): {res:?}");
+                    }
+                    Ok((exec, cu_graph))
+                })();
+                match captured {
+                    Ok((exec, cu_graph)) => {
+                        self.draft_graphs[slot] = Some(DraftGraph {
+                            exec,
+                            cu_graph,
+                            stream: stream.clone(),
+                            k_ptr,
+                            cap,
+                            st: st.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[mtp] захват графа черновика не удался, черновик eager до перезапуска: {e}");
+                        self.draft_graph_failed = true;
+                    }
+                }
+            } else {
+                let g = self.draft_graphs[slot].as_ref().expect("проверено выше");
+                let res = unsafe { csys::cuGraphLaunch(g.exec, g.stream.cu_stream()) };
+                if res != csys::CUresult::CUDA_SUCCESS {
+                    candle_core::bail!("cuGraphLaunch (mtp draft) failed: {res:?}");
+                }
+            }
+            // Единственная синхронизация прохода: id токена.
+            token = st
+                .out_id
+                .to_vec1::<u32>()
+                .map_err(|e| candle_core::Error::Msg(format!("mtp draft out_id D2H: {e}")))?[0];
+            out.push(token);
+            // Зеркало длины на хосте (граф инкрементировал len_dev).
+            self.slots[slot].kv.as_mut().expect("кеш есть").len += 1;
+        }
+        Ok(out)
+    }
+
+    /// Тело одного прохода головы над стейджингом: то же, что forward_rows +
+    /// head_norm + shared_head + argmax, но все входы — из `st`, все выходы —
+    /// в `st`, длина кеша — на устройстве. Захватывается графом целиком.
+    fn draft_pass_body(&mut self, slot: usize, st: &DraftStaging) -> Result<()> {
+        let e = self.enorm.forward(&st.emb_in)?;
+        let h = self.hnorm.forward(&st.hidden_in)?;
+        let projected = self.eh_proj.forward(&Tensor::cat(&[&e, &h], 2)?)?;
+        let mixed = self.attention_graphed(slot, &self.attn_norm.forward(&projected)?, st)?;
+        let after_attention = (mixed + &projected)?;
+        let ffn = self.ffn_norm.forward(&after_attention)?;
+        let activated = self.gate.forward(&ffn)?.silu_mul_direct(&self.up.forward(&ffn)?)?;
+        let pre = (self.down.forward(&activated)? + after_attention)?; // [1,1,H]
+        let pre_head = pre.i((.., 0, ..))?; // [1,H]
+        let logits = self.shared_head.forward(&self.head_norm.forward(&pre_head)?)?; // [1,V]
+        let id = logits
+            .argmax(candle_core::D::Minus1)?
+            .to_dtype(DType::U32)?
+            .reshape(1)?;
+        st.out_id.slice_set(&id, 0, 0)?;
+        // hidden следующего прохода = pre_head (как в eager-цикле).
+        st.hidden_in.slice_set(&pre, 0, 0)?;
+        // len += 1 — после внимания: ядро дописи и seqlens читали прежнюю длину.
+        let next = st.len_dev.broadcast_add(&st.one_u32)?;
+        st.len_dev.slice_set(&next, 0, 0)?;
+        Ok(())
+    }
+
+    /// Внимание головы для одного токена с длиной кеша на устройстве: дописать
+    /// строку по len_dev, seqlens_k = [0, len + 1], FA2 varlen по всему буферу
+    /// ёмкости cap (реальную длину задаёт seqlens_k).
+    fn attention_graphed(&mut self, slot: usize, xs: &Tensor, st: &DraftStaging) -> Result<Tensor> {
+        let heads = self.profile.head_count;
+        let kv_heads = self.profile.kv_head_count;
+        let qg = self.q.forward(xs)?.reshape((1, 1, heads, HEAD_DIM * 2))?;
+        let q = qg.narrow(3, 0, HEAD_DIM)?.transpose(1, 2)?.contiguous()?; // [1,H,1,hd]
+        let gate = qg.narrow(3, HEAD_DIM, HEAD_DIM)?.transpose(1, 2)?.contiguous()?;
+        let k = self
+            .k
+            .forward(xs)?
+            .reshape((1, 1, kv_heads, HEAD_DIM))?
+            .transpose(1, 2)?;
+        let v = self
+            .v
+            .forward(xs)?
+            .reshape((1, 1, kv_heads, HEAD_DIM))?
+            .transpose(1, 2)?;
+        let q = self
+            .q_norm
+            .forward(&q.flatten(0, 2)?)?
+            .reshape((1, heads, 1, HEAD_DIM))?;
+        let k = self
+            .k_norm
+            .forward(&k.flatten(0, 2)?)?
+            .reshape((1, kv_heads, 1, HEAD_DIM))?;
+        let q = apply_partial_rope(&q, &st.cos_in, &st.sin_in)?;
+        let k = apply_partial_rope(&k, &st.cos_in, &st.sin_in)?;
+        let k_new = k.transpose(1, 2)?.to_dtype(DType::F16)?.contiguous()?; // [1,1,KVH,hd]
+        let v_new = v.transpose(1, 2)?.to_dtype(DType::F16)?.contiguous()?;
+        let dev = match &self.device {
+            Device::Cuda(d) => d.clone(),
+            _ => candle_core::bail!("attention_graphed: устройство не CUDA"),
+        };
+        let cache = self.slots[slot].kv.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("attention_graphed: кеш головы не создан".into())
+        })?;
+        let cap = cache.k.dim(1)?;
+        crate::real::paged_kv_cuda::launch_kv_append_flat_f16(
+            &dev, &cache.k, &cache.v, &k_new, &v_new, &st.len_dev, kv_heads, HEAD_DIM, cap,
+        )?;
+        crate::real::paged_kv_cuda::launch_seqlens_from_len(
+            &dev, &st.len_dev, &st.zero_slot, &st.seqlens_k, 1,
+        )?;
+        let scale = 1.0 / (HEAD_DIM as f64).sqrt();
+        let q_f = q
+            .to_dtype(DType::F16)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((1, heads, HEAD_DIM))?; // [total_q=1, H, hd]
+        let k_all = cache.k.reshape((cap, kv_heads, HEAD_DIM))?;
+        let v_all = cache.v.reshape((cap, kv_heads, HEAD_DIM))?;
+        let out = candle_flash_attn::flash_attn_varlen(
+            &q_f,
+            &k_all,
+            &v_all,
+            &st.seqlens_q,
+            &st.seqlens_k,
+            1,
+            cap,
+            scale as f32,
+            true,
+        )?; // [1, H, hd]
+        let mixed = out
+            .reshape((1, 1, heads, HEAD_DIM))?
+            .transpose(1, 2)?
+            .to_dtype(DType::F32)?; // [1,H,1,hd]
+        let mixed = (mixed * candle_nn::ops::sigmoid(&gate)?)?
+            .transpose(1, 2)?
+            .reshape((1, 1, heads * HEAD_DIM))?;
+        self.o.forward(&mixed)
     }
 }
 

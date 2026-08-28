@@ -7010,6 +7010,32 @@ extern "C" __global__ void kv_append_paged_f16(
     // должны видеть одну и ту же длину в пределах шага).
 }
 
+// MTP-голова: дописать одну строку K/V в плоский кеш [cap, n_kv, hd] F16 по
+// позиции kv_len[0] (на устройстве) — захватывается графом. Длину не
+// инкрементирует: это делает отдельная операция после внимания, иначе
+// блоки читали бы уже увеличенную длину.
+extern "C" __global__ void kv_append_flat_f16(
+    half* __restrict__ k_cache,
+    half* __restrict__ v_cache,
+    const half* __restrict__ k_row,   // [n_kv, hd]
+    const half* __restrict__ v_row,
+    const unsigned int* __restrict__ kv_len,  // [1]
+    const int n_kv,
+    const int hd,
+    const int cap)
+{
+    const int head = blockIdx.x;
+    if (head >= n_kv) return;
+    const unsigned int len = kv_len[0];
+    if (len >= (unsigned int)cap) return;
+    const size_t dst = ((size_t)len * n_kv + head) * hd;
+    const size_t src = (size_t)head * hd;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        k_cache[dst + i] = k_row[src + i];
+        v_cache[dst + i] = v_row[src + i];
+    }
+}
+
 // Prefill variant: append T K/V rows per (batch, kv_head) at positions
 // [kv_len .. kv_len+T). CUDA-graph capturable (all state device-side).
 extern "C" __global__ void kv_append_paged_f16_multi(

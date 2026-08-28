@@ -448,3 +448,77 @@ impl PagedKvPool {
         Ok(())
     }
 }
+
+/// MTP-голова: дописать одну строку K/V в плоский кеш `[1, cap, n_kv, hd]` F16
+/// по позиции `len_dev[0]` (на устройстве) — захватывается графом. Длину не
+/// инкрементирует (см. ядро).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_flat_f16(
+    dev: &CudaDevice,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    k_row: &Tensor,
+    v_row: &Tensor,
+    len_dev: &Tensor,
+    n_kv: usize,
+    hd: usize,
+    cap: usize,
+) -> Result<()> {
+    let k_cache_ptr = tensor_cuda_ptr(k_cache)?;
+    let v_cache_ptr = tensor_cuda_ptr(v_cache)?;
+    let k_row_ptr = tensor_cuda_ptr(k_row)?;
+    let v_row_ptr = tensor_cuda_ptr(v_row)?;
+    let len_ptr = tensor_cuda_ptr(len_dev)?;
+    let func = dev.get_or_load_func(
+        "kv_append_flat_f16",
+        &candle_core::cuda_backend::kernels::QUANTIZED,
+    )?;
+    let cfg = LaunchConfig {
+        grid_dim: (n_kv as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_kv_i = n_kv as i32;
+    let hd_i = hd as i32;
+    let cap_i = cap as i32;
+    let mut builder = func.builder();
+    builder.arg(&k_cache_ptr);
+    builder.arg(&v_cache_ptr);
+    builder.arg(&k_row_ptr);
+    builder.arg(&v_row_ptr);
+    builder.arg(&len_ptr);
+    builder.arg(&n_kv_i);
+    builder.arg(&hd_i);
+    builder.arg(&cap_i);
+    unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    Ok(())
+}
+
+/// `out = [0, len_dev[0] + t]` (U32 [2]) для varlen-вызова с длиной на
+/// устройстве: ядро `cumsum_seqlens_from_kvlen_offset` при b = 1, slots = [0].
+pub fn launch_seqlens_from_len(
+    dev: &CudaDevice,
+    len_dev: &Tensor,
+    zero_slot: &Tensor,
+    out: &Tensor,
+    t: usize,
+) -> Result<()> {
+    let len_ptr = tensor_cuda_ptr(len_dev)?;
+    let slots_ptr = tensor_cuda_ptr(zero_slot)?;
+    let out_ptr = tensor_cuda_ptr(out)?;
+    let func = dev.get_or_load_func(
+        "cumsum_seqlens_from_kvlen_offset",
+        &candle_core::cuda_backend::kernels::QUANTIZED,
+    )?;
+    let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+    let b_i = 1i32;
+    let t_i = t as i32;
+    let mut builder = func.builder();
+    builder.arg(&len_ptr);
+    builder.arg(&slots_ptr);
+    builder.arg(&out_ptr);
+    builder.arg(&b_i);
+    builder.arg(&t_i);
+    unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    Ok(())
+}
