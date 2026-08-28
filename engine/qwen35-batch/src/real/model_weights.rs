@@ -406,11 +406,21 @@ macro_rules! prefill_loop_multi_cb {
         let mut _delta_cnt: u32 = 0;
         let mut _attn_cnt: u32 = 0;
 
+        // Под трассой осушаем очередь вокруг каждого блока: иначе на ленивом
+        // Metal время блока — постановка в очередь, а блок с ожиданием вбирает
+        // соседей (ловушка 28.08). Трасса и так меняет тайминги.
+        let _pf_sync = crate::scheduler::trace_on();
         'prefill: for (i, block) in $blocks.iter_mut().enumerate() {
+            if _pf_sync {
+                let _ = $layer_in.device().synchronize();
+            }
             let t0 = std::time::Instant::now();
             match block.forward_prefill(&$layer_in, $pos) {
                 Ok(t) => {
                     $layer_in = t;
+                    if _pf_sync {
+                        let _ = $layer_in.device().synchronize();
+                    }
                     let dt = t0.elapsed().as_micros() as u64;
                     if block.is_deltanet() {
                         _delta_us += dt;
@@ -468,11 +478,21 @@ macro_rules! prefill_loop_multi_cb {
         let mut _delta_cnt: u32 = 0;
         let mut _attn_cnt: u32 = 0;
 
+        // Под трассой осушаем очередь вокруг каждого блока: иначе на ленивом
+        // Metal время блока — постановка в очередь, а блок с ожиданием вбирает
+        // соседей (ловушка 28.08). Трасса и так меняет тайминги.
+        let _pf_sync = crate::scheduler::trace_on();
         'prefill: for (i, block) in $blocks.iter_mut().enumerate() {
+            if _pf_sync {
+                let _ = $layer_in.device().synchronize();
+            }
             let t0 = std::time::Instant::now();
             match block.forward_prefill(&$layer_in, $pos) {
                 Ok(t) => {
                     $layer_in = t;
+                    if _pf_sync {
+                        let _ = $layer_in.device().synchronize();
+                    }
                     let dt = t0.elapsed().as_micros() as u64;
                     if block.is_deltanet() {
                         _delta_us += dt;
@@ -585,6 +605,15 @@ thread_local! {
 }
 
 /// Макрос для удобного добавления к аккумулятору
+/// QWEN36_PHASE_PROF=1 — синхронизировать устройство на границах фаз
+/// DeltaNet::forward, чтобы тайминги в GEN_TIMINGS были временем исполнения,
+/// а не постановки в очередь. Без флага печать `[Qwen3.5/forward]` показывает
+/// честной только сумму.
+fn phase_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN36_PHASE_PROF").as_deref() == Ok("1"))
+}
+
 macro_rules! acc_us {
     ($field:ident, $dur:expr) => {
         GEN_TIMINGS.with(|t| t.borrow_mut().$field += $dur.as_micros() as u64);
@@ -1776,6 +1805,18 @@ impl DeltaNetLayer {
     /// Иначе — fallback на CPU path (cat batch transfer + CPU delta rule).
     fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
         let device = x.device().clone();
+        // Фазовые таймеры честны только с осушенной очередью: на ленивом Metal
+        // (и на асинхронном CUDA) без синхронизации фаза до первого ожидания
+        // показывает время постановки в очередь, а фаза с ожиданием вбирает
+        // всё, что стояло перед ней (ловушка 28.08, сессия yttri-66).
+        // Синхронизируем только под QWEN36_PHASE_PROF=1 — иначе ломает конвейер.
+        let prof = phase_prof_on();
+        let tick = || {
+            if prof {
+                let _ = device.synchronize();
+            }
+            std::time::Instant::now()
+        };
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         debug_assert_eq!(b_sz, 1, "DeltaNet поддерживает только batch_size=1");
         debug_assert_eq!(
@@ -1784,7 +1825,7 @@ impl DeltaNetLayer {
         );
 
         // 1. Проекции на device — dispatch all 4 QMatMul (async GPU)
-        let t0 = std::time::Instant::now();
+        let t0 = tick();
         #[cfg(target_os = "macos")]
         let qkv_t = dispatch_q4k_matmul(&self.wqkv, self.wqkv_opt.as_ref(), x)?;
         #[cfg(target_os = "macos")]
@@ -1795,7 +1836,7 @@ impl DeltaNetLayer {
         let alpha_t = dispatch_q4k_matmul(&self.w_alpha, self.w_alpha_opt.as_ref(), x)?;
         #[cfg(not(target_os = "macos"))]
         let (qkv_t, z_t, beta_t, alpha_t) = self.project_in(x)?;
-        let t_proj = t0.elapsed();
+        let t_proj = tick().duration_since(t0);
 
         // ══════════════════════════════════════════════════════════════
         // Metal GPU path: 0 GPU↔CPU syncs — все 4 kernel'а на GPU
@@ -1804,7 +1845,7 @@ impl DeltaNetLayer {
         if let Some(ctx) = &self.metal_ctx {
             let metal_device = device.as_metal_device()?;
 
-            let t0 = std::time::Instant::now();
+            let t0 = tick();
             let output_tensor = metal::delta_rule_metal::dispatch_delta_rule(
                 metal_device,
                 &ctx.pipelines,
@@ -1816,16 +1857,16 @@ impl DeltaNetLayer {
                 &beta_t,
                 &alpha_t,
             )?;
-            let t_metal = t0.elapsed();
+            let t_metal = tick().duration_since(t0);
 
             // Output проекция (QMatMul) — прямо на GPU, без CPU transfer
-            let t0 = std::time::Instant::now();
+            let t0 = tick();
             #[cfg(target_os = "macos")]
             let result =
                 dispatch_q4k_matmul(&self.ssm_out, self.ssm_out_opt.as_ref(), &output_tensor)?;
             #[cfg(not(target_os = "macos"))]
             let result = self.ssm_out.forward(&output_tensor)?;
-            let t_out = t0.elapsed();
+            let t_out = tick().duration_since(t0);
 
             // Тайминги: proj + metal (заменяет transfer+prep+norm+delta+rms) + out
             acc_us!(delta_proj_us, t_proj);
@@ -1860,7 +1901,7 @@ impl DeltaNetLayer {
         // ══════════════════════════════════════════════════════════════
 
         // 2. Batch transfer: cat на GPU → ONE Metal sync → split на CPU
-        let t0 = std::time::Instant::now();
+        let t0 = tick();
         let key_dim = self.key_dim;
         let value_dim = self.value_dim;
         let n_v_heads = self.n_v_heads;
@@ -1888,10 +1929,10 @@ impl DeltaNetLayer {
         let beta_raw = &all_cpu[beta_offset..beta_offset + n_v_heads];
         let alpha_offset = beta_offset + n_v_heads;
         let alpha_raw = &all_cpu[alpha_offset..alpha_offset + n_v_heads];
-        let t_transfer = t0.elapsed();
+        let t_transfer = tick().duration_since(t0);
 
         // 3-5. Sigmoid, softplus, conv1d
-        let t0 = std::time::Instant::now();
+        let t0 = tick();
         let beta: Vec<f32> = beta_raw.iter().map(|&v| sigmoid_scalar(v)).collect();
         let gate: Vec<f32> = alpha_raw
             .iter()
@@ -1902,10 +1943,10 @@ impl DeltaNetLayer {
             })
             .collect();
         let qkv_conv = self.state.conv1d_step(qkv, &self.conv_kernel_weights);
-        let t_prep = t0.elapsed();
+        let t_prep = tick().duration_since(t0);
 
         // 6-9. L2 norm + expand + Q scaling
-        let t0 = std::time::Instant::now();
+        let t0 = tick();
         let q_raw = &qkv_conv[..key_dim];
         let k_raw = &qkv_conv[key_dim..key_dim * 2];
         let v_flat = &qkv_conv[key_dim * 2..key_dim * 2 + value_dim];
@@ -1941,17 +1982,17 @@ impl DeltaNetLayer {
 
         let q_scale = 1.0 / (self.head_k_dim as f32).sqrt();
         let q_scaled: Vec<f32> = q_expanded.iter().map(|&v| v * q_scale).collect();
-        let t_norm = t0.elapsed();
+        let t_norm = tick().duration_since(t0);
 
         // 10. Delta Rule: обновление SSM state и вычисление выхода
-        let t0 = std::time::Instant::now();
+        let t0 = tick();
         let output_raw = self
             .state
             .delta_rule_step(&q_scaled, &k_expanded, v_flat, &beta, &gate);
-        let t_delta = t0.elapsed();
+        let t_delta = tick().duration_since(t0);
 
         // 11. Group RMS Norm per head + gated output (SiLU(z))
-        let t0 = std::time::Instant::now();
+        let t0 = tick();
         let mut output_gated = vec![0.0f32; value_dim];
         for h in 0..self.n_v_heads {
             let o_start = h * self.head_v_dim;
@@ -1967,17 +2008,17 @@ impl DeltaNetLayer {
                 output_gated[o_start + j] = normed * silu_scalar(z[o_start + j]);
             }
         }
-        let t_rms_gate = t0.elapsed();
+        let t_rms_gate = tick().duration_since(t0);
 
         // 12. Переносим обратно на device для output projection
-        let t0 = std::time::Instant::now();
+        let t0 = tick();
         let output_tensor =
             Tensor::from_vec(output_gated, (1, 1, value_dim), &Device::Cpu)?.to_device(&device)?;
         #[cfg(target_os = "macos")]
         let result = dispatch_q4k_matmul(&self.ssm_out, self.ssm_out_opt.as_ref(), &output_tensor)?;
         #[cfg(not(target_os = "macos"))]
         let result = self.ssm_out.forward(&output_tensor)?;
-        let t_out = t0.elapsed();
+        let t_out = tick().duration_since(t0);
 
         // Аккумулируем тайминги
         acc_us!(delta_proj_us, t_proj);
