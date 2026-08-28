@@ -920,14 +920,14 @@ impl BatchModel for Qwen35BatchAdapter {
             #[cfg(feature = "cuda")]
             let mi = match self.pg_last_hidden.take() {
                 Some(hidden) if self.multimodal[sidx].is_none() => {
-                    let ids_g = Tensor::from_vec(
-                        chunk.tokens.clone(),
-                        (1usize, chunk.tokens.len()),
-                        &self.device,
-                    )?;
+                    // Именно embed_for_graph, а не embed_tokens: при GPU_ONLY=1
+                    // хостовая таблица намеренно опустошается ради освобождения
+                    // mmap на весь GGUF, и её forward обязан не вызываться. Этот
+                    // путь его вызывал и падал с «token_id N out of range
+                    // (vocab_size=0)» — на 4B с MTP при графовом префиле.
                     let embeds = self
                         .model
-                        .embed_tokens(&ids_g, &self.device)
+                        .embed_for_graph(&chunk.tokens, &self.device)
                         .map_err(|e| anyhow!("pgraph embed for MTP: {e}"))?;
                     Some((embeds, hidden))
                 }
