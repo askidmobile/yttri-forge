@@ -418,7 +418,10 @@ fn char_to_byte(ch: char) -> Option<u8> {
 /// Стандартный ByteLevel decoder декодит каждый токен отдельно — emoji/CJK,
 /// разрезанные на несколько токенов (частичные UTF-8 последовательности),
 /// превращались в U+FFFD. Спецтокены <|...|> пропускаются (skip_special).
-pub fn decode_text(tokenizer: &Tokenizer, ids: &[u32]) -> Result<String> {
+/// Сырые байты токенов (byte-mapping + символы вне него как UTF-8), без
+/// потерь: для байтовых и неполных UTF-8 токенов это единственный честный
+/// источник (`logprobs.bytes`); `decode_text` — это же с lossy-заменой.
+pub fn decode_bytes(tokenizer: &Tokenizer, ids: &[u32]) -> Result<Vec<u8>> {
     let mut bytes: Vec<u8> = Vec::with_capacity(ids.len() * 4);
     for &id in ids {
         let Some(tok) = tokenizer.id_to_token(id) else {
@@ -439,7 +442,11 @@ pub fn decode_text(tokenizer: &Tokenizer, ids: &[u32]) -> Result<String> {
             }
         }
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
+}
+
+pub fn decode_text(tokenizer: &Tokenizer, ids: &[u32]) -> Result<String> {
+    Ok(String::from_utf8_lossy(&decode_bytes(tokenizer, ids)?).into_owned())
 }
 
 /// Удалить потенциальные хвостовые пустые строки из сгенерированного текста.
