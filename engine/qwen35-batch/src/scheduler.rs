@@ -129,7 +129,7 @@ pub fn trace_on() -> bool {
 
 /// Фазовый тайминг MTP-раунда (env QWEN36_MTP_TIMING=1) — per-round eprintln.
 #[inline]
-fn mtp_timing_on() -> bool {
+pub(crate) fn mtp_timing_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("QWEN36_MTP_TIMING").map(|v| trace_value_on(&v)).unwrap_or(false)

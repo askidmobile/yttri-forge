@@ -352,8 +352,27 @@ impl Qwen35Mtp {
                 None,
             )?;
             let pre_head = mtp_hidden.i((.., 0, ..))?;
+            // Разбор стоимости прохода головы: проекция на словарь против всего
+            // остального. Синхронизация обязательна — иначе замеряем постановку
+            // в очередь, а не ядро. Только при QWEN36_MTP_TIMING=1.
+            // Device::synchronize() здесь не синхронизирует — первый замер дал
+            // проекцию 0 мс, то есть время постановки в очередь. Ждать надо
+            // именно стрим, как это делает sync_t в delta_rule_cuda.rs.
+            let prof_dev = match (&self.device, crate::scheduler::mtp_timing_on()) {
+                (Device::Cuda(d), true) => Some(d.clone()),
+                _ => None,
+            };
+            let sync = |d: &Option<candle_core::CudaDevice>| {
+                if let Some(d) = d {
+                    let _ = d.cuda_stream().synchronize();
+                }
+                std::time::Instant::now()
+            };
+            let t_proj = sync(&prof_dev);
             let normalized = self.head_norm.forward(&pre_head)?;
             let logits = self.shared_head.forward(&normalized)?;
+            let t_argmax = sync(&prof_dev);
+            let d_proj = t_argmax.duration_since(t_proj);
             // Аргмакс на устройстве; тай-брейк на равных максимумах может
             // отличаться от host-argmax — на драфт не влияет (верифицирует target).
             if logits.device().is_cpu() {
@@ -365,6 +384,14 @@ impl Qwen35Mtp {
                         .argmax(candle_core::D::Minus1)?
                         .to_dtype(DType::U32)?
                         .reshape((1, 1))?,
+                );
+            }
+            if prof_dev.is_some() {
+                let d_argmax = sync(&prof_dev).duration_since(t_argmax);
+                eprintln!(
+                    "[mtp-head] проекция={:.3}мс argmax={:.3}мс",
+                    d_proj.as_secs_f64() * 1000.0,
+                    d_argmax.as_secs_f64() * 1000.0
                 );
             }
             hidden = pre_head;
