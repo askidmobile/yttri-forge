@@ -195,6 +195,15 @@ fn draft_graph_sync() -> bool {
     *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_SYNC").as_deref() == Ok("1"))
 }
 
+/// QWEN36_MTP_DRAFT_LOG=1 — печатать id каждого чернового токена. Нужен, чтобы
+/// сравнить последовательности черновика между прогонами, не вмешиваясь в них:
+/// D2H этого id в обычном пути и так есть.
+#[cfg(feature = "cuda")]
+fn draft_id_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN36_MTP_DRAFT_LOG").as_deref() == Ok("1"))
+}
+
 /// QWEN36_MTP_GRAPH_CHECK=1 — после каждого replay повторить проход eager на
 /// тех же входах и сравнить id и hidden; печать по проходу. Состояние после
 /// проверки — от eager-прохода (строка кеша перезаписана тем же значением).
@@ -953,6 +962,11 @@ impl Qwen35Mtp {
                 .to_vec1::<u32>()
                 .map_err(|e| candle_core::Error::Msg(format!("mtp draft out_id D2H: {e}")))?[0];
             out.push(token);
+            // Лог id черновика: печатается там, где D2H уже произошёл, поэтому
+            // сам замер синхронизации не добавляет и окно гонки не сдвигает.
+            if draft_id_log() {
+                eprintln!("[mtp-draft] slot={slot} pass={offset} pos={} id={token}", start_pos + offset);
+            }
             // Зеркало длины на хосте (граф инкрементировал len_dev).
             self.slots[slot].kv.as_mut().expect("кеш есть").len += 1;
             if parity == 1 {
