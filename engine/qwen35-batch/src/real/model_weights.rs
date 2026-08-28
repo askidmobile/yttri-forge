@@ -1143,6 +1143,17 @@ enum FeedForward {
     Moe(Qwen35MoeBlock),
 }
 
+/// Настоящая копия тензора на Metal. `Tensor::copy()` там — алиас буфера
+/// (`MetalStorage::try_clone` отдаёт clone с тем же start_offset), а свой
+/// Metal-диспатч читает буфер с нулевого смещения. Нулевой тензор + slice_set
+/// = blit в свежий буфер с offset 0.
+#[cfg(target_os = "macos")]
+fn metal_owned_copy(t: &Tensor) -> Result<Tensor> {
+    let out = Tensor::zeros(t.shape(), t.dtype(), t.device())?;
+    out.slice_set(t, 0, 0)?;
+    Ok(out)
+}
+
 impl FeedForward {
     /// Standard forward — used by the attention (full-attention) block path.
     /// MoE blocks are stateless w.r.t. recurrence, so `ForwardMode::Prefill`
@@ -2049,25 +2060,28 @@ impl DeltaNetLayer {
                 ctx.params.batch_size = 1;
                 let mut rows = Vec::with_capacity(b);
                 for i in 0..b {
-                    // .copy() входов: metal dispatch читает буфер с offset 0,
-                    // narrow-view имеет ненулевой start_offset.
-                    // .copy() выхода: dispatch возвращает zero-copy view общего
-                    // scratch — следующая итерация его перезапишет.
-                    rows.push(
-                        metal::delta_rule_batched_metal::dispatch_delta_rule_batched(
+                    // Копия входов: metal dispatch читает буфер с offset 0, а
+                    // narrow-view имеет ненулевой start_offset. Копия выхода:
+                    // dispatch возвращает zero-copy view общего scratch —
+                    // следующая итерация его перезапишет. ВАЖНО: Tensor::copy()
+                    // на Metal — алиас (MetalStorage::try_clone возвращает
+                    // clone с тем же start_offset), поэтому здесь настоящая
+                    // копия через zeros + slice_set (2026-08-28, найдено при
+                    // порте этой ветки в Yttri).
+                    rows.push(metal_owned_copy(
+                        &metal::delta_rule_batched_metal::dispatch_delta_rule_batched(
                             metal_device,
                             &ctx.pipelines,
                             &ctx.layer_state,
                             &ctx.temp,
                             &ctx.params,
-                            &qkv_t.narrow(0, i, 1)?.copy()?,
-                            &z_t.narrow(0, i, 1)?.copy()?,
-                            &beta_t.narrow(0, i, 1)?.copy()?,
-                            &alpha_t.narrow(0, i, 1)?.copy()?,
+                            &metal_owned_copy(&qkv_t.narrow(0, i, 1)?)?,
+                            &metal_owned_copy(&z_t.narrow(0, i, 1)?)?,
+                            &metal_owned_copy(&beta_t.narrow(0, i, 1)?)?,
+                            &metal_owned_copy(&alpha_t.narrow(0, i, 1)?)?,
                             &slots[i..i + 1],
-                        )?
-                        .copy()?,
-                    );
+                        )?,
+                    )?);
                 }
                 batched_out_metal = Some(Tensor::cat(&rows, 0)?);
             } else {
