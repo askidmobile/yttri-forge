@@ -271,6 +271,8 @@ pub fn dispatch_delta_rule_batched(
     alpha_t: &Tensor,
     // Indirection: batch_idx → реальный slot_idx (persistent state индексация).
     slot_ids: &[u32],
+    // Тот же список уже на устройстве (стейджинг); None — кэш slot_ids_buffer.
+    slot_ids_dev: Option<&CudaSlice<u32>>,
 ) -> Result<Tensor> {
     let channels = params.channels as u32;
     let n_v = params.n_v_heads as u32;
@@ -333,7 +335,16 @@ pub fn dispatch_delta_rule_batched(
         slot_ids.len(),
         b,
     };
-    let slot_ids_arc = slot_ids_buffer(dev, temp, slot_ids)?;
+    let slot_ids_owned;
+    let slot_ids_buf: &CudaSlice<u32> = match slot_ids_dev {
+        // Стейджинг PagedModelCtx::slots_dev: состав читается из буфера, и
+        // захваченный граф не зависит от него (ключ пула — только b).
+        Some(d) => d,
+        None => {
+            slot_ids_owned = slot_ids_buffer(dev, temp, slot_ids)?;
+            &*slot_ids_owned
+        }
+    };
 
     let p = *params;
 
@@ -361,7 +372,7 @@ pub fn dispatch_delta_rule_batched(
         bb.arg(&temp.beta); // out
         bb.arg(&temp.gate); // out
         bb.arg(&p);
-        bb.arg(&*slot_ids_arc); // slot_ids (indirection)
+        bb.arg(slot_ids_buf); // slot_ids (indirection)
         unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
 
@@ -429,7 +440,7 @@ pub fn dispatch_delta_rule_batched(
         bb.arg(&state.ssm_state); // read-write persistent
         bb.arg(&temp.delta_output); // out
         bb.arg(&p);
-        bb.arg(&*slot_ids_arc); // slot_ids (indirection)
+        bb.arg(slot_ids_buf); // slot_ids (indirection)
         unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
 
@@ -494,6 +505,7 @@ pub fn dispatch_delta_rule_batched_seq(
     alpha_t: &Tensor,
     slot: u32,
     shadow_rows: usize,
+    slot_ids_dev: Option<&CudaSlice<u32>>,
 ) -> Result<Tensor> {
     let channels = params.channels as u32;
     let n_v = params.n_v_heads as u32;
@@ -566,8 +578,16 @@ pub fn dispatch_delta_rule_batched_seq(
     let beta_v = cuda_slice_view(&beta_st, beta_lay.start_offset())?;
     let alpha_v = cuda_slice_view(&alpha_st, alpha_lay.start_offset())?;
 
-    let slot_ids = [slot];
-    let slot_ids_arc = slot_ids_buffer(dev, temp, &slot_ids)?;
+    let slot_ids_owned;
+    let slot_ids_buf: &CudaSlice<u32> = match slot_ids_dev {
+        // Стейджинг PagedModelCtx::slots_dev: состав читается из буфера, и
+        // захваченный граф не зависит от него (ключ пула — только b).
+        Some(d) => d,
+        None => {
+            slot_ids_owned = slot_ids_buffer(dev, temp, &[slot])?;
+            &*slot_ids_owned
+        }
+    };
 
     let mut p = *params;
     p.batch_size = seq_rows;
@@ -607,7 +627,7 @@ pub fn dispatch_delta_rule_batched_seq(
             bb.arg(&beta_out);
             bb.arg(&gate_out);
             bb.arg(&p);
-            bb.arg(&*slot_ids_arc);
+            bb.arg(slot_ids_buf);
             bb.arg(&rows);
             unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
             if per_row && row + 1 < k_rows {
@@ -708,7 +728,7 @@ pub fn dispatch_delta_rule_batched_seq(
             bb.arg(&state.ssm_state);
             bb.arg(&out_row);
             bb.arg(&p);
-            bb.arg(&*slot_ids_arc);
+            bb.arg(slot_ids_buf);
             bb.arg(&rows);
             unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
             if per_row && row + 1 < k_rows {
@@ -1166,6 +1186,7 @@ mod tests {
         let out = dispatch_delta_rule_batched(
             dev, batched_state, batched_temp, params, &qkv_t, &z_t, &beta_t, &alpha_t,
             &(0..b).map(|i| i as u32).collect::<Vec<_>>(),
+            None,
         )?;
         let flat = out.flatten_all()?.to_vec1::<f32>()?;
         Ok(flat.chunks(value_dim).map(|c| c.to_vec()).collect())

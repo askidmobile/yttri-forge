@@ -2012,14 +2012,20 @@ impl DeltaNetLayer {
     /// state (ssm_state, conv_state) индексируется по `slots[batch_idx]`, а не по
     /// batch_idx напрямую — это корректно после сжатия батча (ранний EOS).
     fn forward_decode_batch(&mut self, x: &Tensor, slots: &[u32]) -> Result<Tensor> {
-        self.forward_decode_batch_rows(x, slots, false)
+        self.forward_decode_batch_rows(x, slots, false, None)
     }
 
     /// `shadow` — между строками одного слота снимать теневые снимки состояния
     /// (проверка спекуляции: откат к принятой строке без перепрогона, Ф3).
     /// Только CUDA batched-путь; остальные бэкенды флаг игнорируют — там
     /// остаётся перепрогон принятых строк.
-    fn forward_decode_batch_rows(&mut self, x: &Tensor, slots: &[u32], shadow: bool) -> Result<Tensor> {
+    fn forward_decode_batch_rows(
+        &mut self,
+        x: &Tensor,
+        slots: &[u32],
+        shadow: bool,
+        slot_ids_dev: SlotIdsDev<'_>,
+    ) -> Result<Tensor> {
         let device = x.device().clone();
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         if seq_len != 1 {
@@ -2147,6 +2153,7 @@ impl DeltaNetLayer {
                     &alpha_t,
                     slots[0],
                     shadow_rows,
+                    slot_ids_dev,
                 )?);
             } else {
                 batched_out_cuda = Some(delta_rule_batched_cuda::dispatch_delta_rule_batched(
@@ -2159,6 +2166,7 @@ impl DeltaNetLayer {
                     &beta_t,
                     &alpha_t,
                     slots,
+                    slot_ids_dev,
                 )?);
             }
             let dr_ms = sync().duration_since(t0).as_secs_f64() * 1000.0;
@@ -4815,7 +4823,9 @@ impl HybridBlock {
         let residual = x;
         let normed = self.attn_norm.forward(x)?;
         let layer_out = match &mut self.layer {
-            HybridLayerType::DeltaNet(delta) => delta.forward_decode_batch_rows(&normed, slots, true)?,
+            HybridLayerType::DeltaNet(delta) => {
+                delta.forward_decode_batch_rows(&normed, slots, true, Some(&ctx.slots_dev))?
+            }
             HybridLayerType::Attention(attn) => attn
                 .forward_attn_prefill_paged(&normed.reshape((1, k, n_embd))?, ctx, rope_pos_dev, true)?
                 .reshape((k, 1, n_embd))?,
@@ -4845,7 +4855,7 @@ impl HybridBlock {
                 if std::env::var("QWEN36_GRAPH_SKIP_DELTA").as_deref() == Ok("1") {
                     normed.clone()
                 } else {
-                    delta.forward_decode_batch(&normed, slots)?
+                    delta.forward_decode_batch_rows(&normed, slots, false, Some(&ctx.slots_dev))?
                 }
             }
             HybridLayerType::Attention(attn) => {
@@ -9139,3 +9149,11 @@ mod q8_kv_tests {
         assert!(diff < 3.0 * 3.0 / 60.0, "q8 roundtrip error too big: {diff}");
     }
 }
+
+/// Слоты батча на устройстве для DeltaNet-ядер (стейджинг PagedModelCtx):
+/// граф читает состав из буфера, а не из аргументов ядра — ключ пула без
+/// состава, вытеснений нет (OQ-7). None — эйджер, кэш slot_ids_buffer.
+#[cfg(feature = "cuda")]
+pub(crate) type SlotIdsDev<'a> = Option<&'a cudarc::driver::CudaSlice<u32>>;
+#[cfg(not(feature = "cuda"))]
+pub(crate) type SlotIdsDev<'a> = Option<&'a ()>;

@@ -79,7 +79,6 @@ struct DecodeGraphState {
     cu_graph: cudarc::driver::sys::CUgraph,
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
     b: usize,
-    slots: Vec<u32>,
     /// Persistent вход: [B, 1, H] F32 эмбеддинги (стейджатся htod до launch;
     /// деквант строк на хосте — копия token_embd на GPU не нужна).
     emb_t: Tensor,
@@ -89,10 +88,6 @@ struct DecodeGraphState {
     /// Второй внешний буфер: hidden декодируемых позиций, тем же способом.
     /// Читается глубокой копией — буфер перезаписывается следующим launch.
     hidden_t: Tensor,
-    /// Диагностика вытеснения (QWEN36_DGRAPH_EVICT_KEEP_HANDLES=1): при Drop
-    /// не разрушать exec/граф (утечка хэндлов), тензоры освободить как обычно —
-    /// отделяет cuGraphExecDestroy/cuGraphDestroy от cudaFreeAsync тензоров.
-    destroy_handles: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -116,7 +111,6 @@ struct PrefillGraphState {
     cu_graph: cudarc::driver::sys::CUgraph,
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
     t: usize,
-    slot: usize,
     /// Persistent входы (стейджатся ВНЕ графа): эмбеддинги [1,T,H] F32
     /// (для проверки — [T,1,H]), позиции [T] U32.
     emb_t: Tensor,
@@ -143,25 +137,15 @@ impl PrefillGraphState {
     }
 }
 
-/// Диагностика вытеснения графов: QWEN36_GRAPH_DROP_SYNC=1 — синхронизировать
-/// стрим перед разрушением exec/графа (версия «разрушаем незавершённый»);
-/// QWEN36_DGRAPH_EVICT_LEAK=1 — не разрушать вытесняемый декодный граф вовсе
-/// (версия «Drop ломает следующий шаг» против «сам захват сверх пула»).
-/// 2026-08-28: после закрытия дефекта slot_ids вытеснение декодного графа
-/// (пул 6, 9 захватов) даёт CUDA_ERROR_INVALID_VALUE на следующем шаге;
-/// с пулом 32 чисто. Корень не локализован.
-#[cfg(feature = "cuda")]
-fn graph_drop_sync() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_GRAPH_DROP_SYNC").as_deref() == Ok("1"))
-}
-
+/// Графы не вытесняются: Drop графа (cudaFreeAsync его внешних буферов сразу
+/// после instantiate следующего) ронял следующий шаг CUDA_ERROR_INVALID_VALUE
+/// (OQ-7, матрица 2026-08-28: LEAK чисто, KEEP_HANDLES падает — виноваты
+/// именно освобождения, не destroy). Ключи пулов без состава слотов держат их
+/// маленькими; при полном пуле новую форму просто не захватываем. Drop
+/// остаётся для clear() и завершения процесса.
 #[cfg(feature = "cuda")]
 impl Drop for PrefillGraphState {
     fn drop(&mut self) {
-        if graph_drop_sync() {
-            let _ = self.stream.synchronize();
-        }
         unsafe {
             cudarc::driver::sys::cuGraphExecDestroy(self.exec);
             cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
@@ -184,12 +168,13 @@ fn pgraph_lru() -> usize {
 }
 
 /// Чанки короче этого порога не захватываем в граф — считаем прогревочным
-/// проходом и всё. Ключ пула — (T, slot), а длина хвостового чанка
-/// (prompt mod chunk) у агентских сессий почти всегда новая: пул на 8
-/// вытеснялся на каждом запросе, и первое же вытеснение роняло следующий
-/// шаг CUDA_ERROR_INVALID_VALUE (2026-08-28, T=45 при lru=8). Выигрыш графа на
-/// хвосте — десятки мс один раз на запрос, терять нечего. QWEN36_PGRAPH_MIN_T,
-/// умолчание 256; 0 — захватывать всё (прежнее поведение, для диагностики).
+/// проходом и всё. Ключ пула — T, а длина хвостового чанка (prompt mod chunk)
+/// у агентских сессий почти всегда новая: пул наполнялся хвостами и вытеснял
+/// (2026-08-28, T=45 при lru=8 — первое вытеснение роняло следующий шаг).
+/// Выигрыш графа на хвосте — десятки мс один раз на запрос, терять нечего;
+/// а пул, забитый хвостами, не принял бы полный чанк. Умолчание — размер
+/// чанка (захватываются только полные чанки); QWEN36_PGRAPH_MIN_T
+/// переопределяет, 0 — захватывать всё (диагностика).
 #[cfg(feature = "cuda")]
 fn pgraph_min_capture_t() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -197,20 +182,17 @@ fn pgraph_min_capture_t() -> usize {
         std::env::var("QWEN36_PGRAPH_MIN_T")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(256)
+            .unwrap_or_else(|| match crate::scheduler::prefill_chunk_size() {
+                0 => usize::MAX,
+                n => n,
+            })
     })
 }
-/// Размер пула декодных графов: обычный декод плюс формы проверки спекуляции
-/// при ширинах 1..8. Каждый экземпляр держит свои внешние буферы, поэтому
-/// пул небольшой.
-const DGRAPH_LRU: usize = 6;
+/// Размер пула декодных графов. Ключ — только ширина батча b (состав слотов
+/// ядра читают из стейджинга PagedModelCtx::slots_dev), так что различных
+/// форм не больше числа слотов; сверх пула не захватываем (QWEN36_DGRAPH_LRU).
+const DGRAPH_LRU: usize = 8;
 
-/// Размер пула графов декода. Настраивается, потому что число различных
-/// ключей растёт как непустые подмножества слотов: на одном слоте комбинация
-/// одна, на четырёх — пятнадцать, а пул держит шесть. Постоянное вытеснение
-/// подозревается в CUDA_ERROR_ILLEGAL_ADDRESS на четырёх слотах: logits_t и
-/// hidden_t — алиасы в память пула графов, и уничтожение одного графа может
-/// освободить адрес, который ещё читает другой.
 /// Максимальный размер батча, на котором ещё используются графы декода.
 ///
 /// По умолчанию 1 — то же, что делает llama.cpp («disabling CUDA graphs due to
@@ -273,12 +255,6 @@ fn pgraph_mode() -> PgraphMode {
 #[cfg(feature = "cuda")]
 impl Drop for DecodeGraphState {
     fn drop(&mut self) {
-        if graph_drop_sync() {
-            let _ = self.stream.synchronize();
-        }
-        if !self.destroy_handles {
-            return;
-        }
         unsafe {
             cudarc::driver::sys::cuGraphExecDestroy(self.exec);
             cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
@@ -1723,7 +1699,8 @@ impl Qwen35BatchAdapter {
         } else {
             &mut self.prefill_graphs
         };
-        let hit = pool.iter().position(|g| g.t == t && g.slot == slot);
+        let hit = pool.iter().position(|g| g.t == t);
+        let pool_full = pool.len() >= pgraph_lru();
         match hit {
             Some(i) => {
                 {
@@ -1790,6 +1767,11 @@ impl Qwen35BatchAdapter {
                 if !verify && t < pgraph_min_capture_t() {
                     return Ok((flat, prime_hidden, false));
                 }
+                // Пул полон — новую форму не захватываем: вытеснение роняло
+                // следующий шаг (см. комментарий у Drop).
+                if pool_full {
+                    return Ok((flat, prime_hidden, false));
+                }
                 let stream = cuda_dev.cuda_stream();
                 let captured = (|| -> Result<PrefillGraphState> {
                     use cudarc::driver::{result as cres, sys as csys};
@@ -1838,7 +1820,6 @@ impl Qwen35BatchAdapter {
                         cu_graph,
                         stream: stream.clone(),
                         t,
-                        slot,
                         emb_t: emb_t.clone(),
                         rope_pos_t: rope_pos_t.clone(),
                         logits_t: logits_out,
@@ -1848,16 +1829,6 @@ impl Qwen35BatchAdapter {
                 match captured {
                     Ok(g) => {
                         pool.push(g);
-                        while pool.len() > pgraph_lru() {
-                            let evicted = pool.remove(0);
-                            // Диагностика вытеснения: QWEN36_PGRAPH_EVICT_LEAK=1
-                            // не разрушает граф и его буферы (утечка), чтобы
-                            // отделить «Drop ломает следующий шаг» от «сам
-                            // девятый захват». Не для прода.
-                            if std::env::var("QWEN36_PGRAPH_EVICT_LEAK").as_deref() == Ok("1") {
-                                std::mem::forget(evicted);
-                            }
-                        }
                     }
                     // Захват не удался — результат уже посчитан eager-прогоном,
                     // состояние консистентно; графы остаются включёнными.
@@ -1983,7 +1954,7 @@ impl Qwen35BatchAdapter {
         let hit = self
             .decode_graphs
             .iter()
-            .position(|g| g.b == b && g.slots == slots);
+            .position(|g| g.b == b);
         let need_capture = match hit {
             Some(_) => {
                 let why = String::new();
@@ -2115,6 +2086,10 @@ impl Qwen35BatchAdapter {
                 return Err(anyhow!("graphed logits length mismatch"));
             }
             let out: Vec<Vec<f32>> = flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect();
+            // Пул полон — не захватываем (вытеснение роняло следующий шаг).
+            if self.decode_graphs.len() >= dgraph_lru() {
+                return Ok(Some((out, hidden)));
+            }
             // Capture для следующих шагов (захват не исполняет ядра).
             let stream = cuda_dev.cuda_stream();
             let capture_result = (|| -> Result<DecodeGraphState> {
@@ -2184,25 +2159,14 @@ impl Qwen35BatchAdapter {
                     cu_graph,
                     stream: stream.clone(),
                     b,
-                    slots: slots.to_vec(),
                     emb_t: emb_eager.clone(),
                     logits_t: logits_out,
                     hidden_t: hidden_out,
-                    destroy_handles: true,
                 })
             })();
             match capture_result {
                 Ok(state) => {
                     self.decode_graphs.push(state);
-                    while self.decode_graphs.len() > dgraph_lru() {
-                        let mut evicted = self.decode_graphs.remove(0);
-                        if std::env::var("QWEN36_DGRAPH_EVICT_LEAK").as_deref() == Ok("1") {
-                            std::mem::forget(evicted);
-                        } else if std::env::var("QWEN36_DGRAPH_EVICT_KEEP_HANDLES").as_deref() == Ok("1") {
-                            // Хэндлы не разрушаем, тензоры уходят обычным Drop.
-                            evicted.destroy_handles = false;
-                        }
-                    }
                     if crate::scheduler::trace_on() {
                         eprintln!("[graphs] captured decode graph B={b} slots={slots:?}");
                     }
@@ -2222,7 +2186,7 @@ impl Qwen35BatchAdapter {
         let idx = self
             .decode_graphs
             .iter()
-            .position(|g| g.b == b && g.slots == slots)
+            .position(|g| g.b == b)
             .expect("декодный граф только что захвачен или найден");
         let state = &self.decode_graphs[idx];
         let stream = cuda_dev.cuda_stream();
