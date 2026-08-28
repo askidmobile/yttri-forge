@@ -191,6 +191,28 @@ const DGRAPH_LRU: usize = 6;
 /// подозревается в CUDA_ERROR_ILLEGAL_ADDRESS на четырёх слотах: logits_t и
 /// hidden_t — алиасы в память пула графов, и уничтожение одного графа может
 /// освободить адрес, который ещё читает другой.
+/// Максимальный размер батча, на котором ещё используются графы декода.
+///
+/// По умолчанию 1 — то же, что делает llama.cpp («disabling CUDA graphs due to
+/// batch size > 1»). Многослотовый граф-путь у нас не проектировался (см.
+/// оговорку в decode_batch_graphed) и на четырёх слотах роняет процесс:
+/// nvcuda64.dll, exception 0xc0000005, иногда с CUDA_ERROR_ILLEGAL_ADDRESS в
+/// логе, иногда молча. Замер 28.08.2026 на 3060: аномалии в четырёх прогонах
+/// из пяти, увеличение пула графов не помогло (вытеснения не было вовсе).
+///
+/// Цена гейта мала: на одном запросе графы дают 4% (39.4 против 37.9 ток/с),
+/// а выигрыш от четырёх слотов и так 2.3x. Снимается QWEN36_GRAPH_MAX_B.
+fn graph_max_b() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("QWEN36_GRAPH_MAX_B")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1)
+    })
+}
+
 fn dgraph_lru() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -1806,6 +1828,10 @@ impl Qwen35BatchAdapter {
         positions: &[usize],
     ) -> Result<Option<(Vec<Vec<f32>>, Tensor)>> {
         if !self.graphs_enabled {
+            return Ok(None);
+        }
+        // Батч больше гейта уходит на eager: многослотовый граф-путь не готов.
+        if b > graph_max_b() {
             return Ok(None);
         }
         let Device::Cuda(cuda_dev) = &self.device else {
