@@ -1684,11 +1684,14 @@ impl Qwen35BatchAdapter {
             let ctx = self.model.paged_ctx.as_mut().unwrap();
             // rope_pos_t декода здесь не используется (позиции идут своим
             // буфером [T]), но slots/block_table нужны append-ядру.
-            ctx.stage_inputs(&[slot as u32], &[start_pos], &block_table)?;
+            ctx.stage_inputs(&[slot as u32], &[start_pos], &block_table)
+                .map_err(|e| anyhow!("pgraph {kind} stage_inputs slot={slot}: {e}"))?;
             let mut lens = ctx.kv_len_host.clone();
             lens[slot] = start_pos as u32;
-            ctx.reset_kv_len(&lens)?;
-            ctx.set_prefill_seqlens_q(t)?;
+            ctx.reset_kv_len(&lens)
+                .map_err(|e| anyhow!("pgraph {kind} reset_kv_len: {e}"))?;
+            ctx.set_prefill_seqlens_q(t)
+                .map_err(|e| anyhow!("pgraph {kind} seqlens_q: {e}"))?;
         }
         let slot_u = slot as u32;
         let emb_shape = if verify { (t, 1usize, self.model.hidden_size()) } else { (1usize, t, self.model.hidden_size()) };
@@ -1710,24 +1713,40 @@ impl Qwen35BatchAdapter {
             Some(i) => {
                 {
                     let g = &pool[i];
-                    let emb_staging = self.model.embed_for_graph(tokens, &self.device)?.reshape(emb_shape)?;
-                    g.emb_t.slice_set(&emb_staging, 0, 0)?;
-                    let rope_staging =
-                        Tensor::from_vec(rope_host, t, &Device::Cpu)?.to_device(&self.device)?;
-                    g.rope_pos_t.slice_set(&rope_staging, 0, 0)?;
-                    g.launch()?;
+                    let emb_staging = self
+                        .model
+                        .embed_for_graph(tokens, &self.device)
+                        .map_err(|e| anyhow!("pgraph {kind} embed: {e}"))?
+                        .reshape(emb_shape)
+                        .map_err(|e| anyhow!("pgraph {kind} embed reshape: {e}"))?;
+                    g.emb_t
+                        .slice_set(&emb_staging, 0, 0)
+                        .map_err(|e| anyhow!("pgraph {kind} emb slice_set: {e}"))?;
+                    let rope_staging = Tensor::from_vec(rope_host, t, &Device::Cpu)
+                        .map_err(|e| anyhow!("pgraph {kind} rope from_vec: {e}"))?
+                        .to_device(&self.device)
+                        .map_err(|e| anyhow!("pgraph {kind} rope to_device: {e}"))?;
+                    g.rope_pos_t
+                        .slice_set(&rope_staging, 0, 0)
+                        .map_err(|e| anyhow!("pgraph {kind} rope slice_set: {e}"))?;
+                    g.launch().map_err(|e| anyhow!("pgraph {kind} launch T={t} slot={slot}: {e}"))?;
                 }
                 // LRU: свежий — в хвост.
                 let g = pool.remove(i);
                 let flat = g
                     .logits_t
-                    .to_dtype(DType::F32)?
-                    .flatten_all()?
+                    .to_dtype(DType::F32)
+                    .map_err(|e| anyhow!("pgraph {kind} logits to_dtype (первая синхронная точка после launch): {e}"))?
+                    .flatten_all()
+                    .map_err(|e| anyhow!("pgraph {kind} logits flatten: {e}"))?
                     .to_vec1::<f32>()
                     .map_err(|e| anyhow!("pgraph {kind} logits read: {e}"))?;
                 let hidden =
-                    Tensor::zeros(g.hidden_t.shape().clone(), g.hidden_t.dtype(), &self.device)?;
-                hidden.slice_set(&g.hidden_t, 0, 0)?;
+                    Tensor::zeros(g.hidden_t.shape().clone(), g.hidden_t.dtype(), &self.device)
+                        .map_err(|e| anyhow!("pgraph {kind} hidden zeros: {e}"))?;
+                hidden
+                    .slice_set(&g.hidden_t, 0, 0)
+                    .map_err(|e| anyhow!("pgraph {kind} hidden copy: {e}"))?;
                 pool.push(g);
                 Ok((flat, hidden, true))
             }
@@ -1977,12 +1996,15 @@ impl Qwen35BatchAdapter {
             // захвату он и не нужен (стейджится снаружи).
             let emb_eager = self
                 .model
-                .embed_for_graph(tokens, &self.device)?
-                .reshape((b, 1usize, self.model.hidden_size()))?;
+                .embed_for_graph(tokens, &self.device)
+                .map_err(|e| anyhow!("graph capture embed: {e}"))?
+                .reshape((b, 1usize, self.model.hidden_size()))
+                .map_err(|e| anyhow!("graph capture embed reshape: {e}"))?;
             let _htod_guard = cuda_dev.enable_cuda_graph_htod_cache();
             {
                 let ctx = self.model.paged_ctx.as_mut().unwrap();
-                ctx.stage_inputs(slots, rope_positions, &block_table)?;
+                ctx.stage_inputs(slots, rope_positions, &block_table)
+                    .map_err(|e| anyhow!("graph capture stage_inputs b={b} slots={slots:?}: {e}"))?;
             }
             let (logits, hidden) = self
                 .model
@@ -2066,8 +2088,10 @@ impl Qwen35BatchAdapter {
                 }
             }
             let flat = logits
-                .to_dtype(DType::F32)?
-                .flatten_all()?
+                .to_dtype(DType::F32)
+                .map_err(|e| anyhow!("graph prime logits to_dtype: {e}"))?
+                .flatten_all()
+                .map_err(|e| anyhow!("graph prime logits flatten: {e}"))?
                 .to_vec1()
                 .map_err(|e| anyhow!("graphed logits: {e}"))?;
             let vocab = self.vocab_size();
@@ -2182,17 +2206,26 @@ impl Qwen35BatchAdapter {
             .expect("декодный граф только что захвачен или найден");
         let state = &self.decode_graphs[idx];
         let stream = cuda_dev.cuda_stream();
+        // Контекст на каждой операции: редкий CUDA_ERROR_INVALID_VALUE на
+        // многослотовом сервере (2026-08-28) приходил голым DriverError, и
+        // операцию было не назвать.
         {
             let ctx = self.model.paged_ctx.as_mut().unwrap();
-            ctx.stage_inputs(slots, rope_positions, &block_table)?;
+            ctx.stage_inputs(slots, rope_positions, &block_table)
+                .map_err(|e| anyhow!("graph replay stage_inputs b={b} slots={slots:?}: {e}"))?;
         }
         // Эмбеддинги: деквант на хосте + htod в persistent-буфер (вне графа).
         let emb_staging = self
             .model
-            .embed_for_graph(tokens, &self.device)?
-            .reshape((b, 1usize, self.model.hidden_size()))?;
-        state.emb_t.slice_set(&emb_staging, 0, 0)?;
-        state.launch().map_err(|e| anyhow!("graph launch: {e}"))?;
+            .embed_for_graph(tokens, &self.device)
+            .map_err(|e| anyhow!("graph replay embed: {e}"))?
+            .reshape((b, 1usize, self.model.hidden_size()))
+            .map_err(|e| anyhow!("graph replay embed reshape: {e}"))?;
+        state
+            .emb_t
+            .slice_set(&emb_staging, 0, 0)
+            .map_err(|e| anyhow!("graph replay emb slice_set: {e}"))?;
+        state.launch().map_err(|e| anyhow!("graph launch b={b} slots={slots:?}: {e}"))?;
         // Диагностика: sync сразу после launch, чтобы async-ошибка графа
         // привязывалась к этому шагу, а не всплывала sticky на следующем.
         if crate::scheduler::trace_on() || self.model.gprof_events.is_some() {
@@ -2228,8 +2261,10 @@ impl Qwen35BatchAdapter {
         let _ = stream;
         let flat = state
             .logits_t
-            .to_dtype(DType::F32)?
-            .flatten_all()?
+            .to_dtype(DType::F32)
+            .map_err(|e| anyhow!("graph logits to_dtype (первая синхронная точка после launch): {e}"))?
+            .flatten_all()
+            .map_err(|e| anyhow!("graph logits flatten: {e}"))?
             .to_vec1()
             .map_err(|e| anyhow!("graph logits read: {e}"))?;
         let vocab = self.vocab_size();
@@ -2242,8 +2277,10 @@ impl Qwen35BatchAdapter {
         // килобайт — цена пренебрежимая.
         let hidden_copy = {
             let src = &self.decode_graphs[idx].hidden_t;
-            let dst = Tensor::zeros(src.shape().clone(), src.dtype(), &self.device)?;
-            dst.slice_set(src, 0, 0)?;
+            let dst = Tensor::zeros(src.shape().clone(), src.dtype(), &self.device)
+                .map_err(|e| anyhow!("graph hidden zeros: {e}"))?;
+            dst.slice_set(src, 0, 0)
+                .map_err(|e| anyhow!("graph hidden copy: {e}"))?;
             dst
         };
         Ok(Some((
