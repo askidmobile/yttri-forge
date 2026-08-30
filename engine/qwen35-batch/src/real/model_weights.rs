@@ -5232,6 +5232,20 @@ impl StateSnapshot {
         })
     }
 
+    /// Удалить объёмные K/V payload'ы внимания, оставив recurrent-state и
+    /// позицию. На paged-пути K/V уже восстановлен в постоянный пул, а
+    /// `slot_snaps` после seed нужен только как носитель позиции и DeltaNet
+    /// state. Одна копия K/V на Ornith стоит ~679 МиБ при 40K токенов, а две
+    /// пересекавшиеся копии давали измеренный пик ~1.28 ГиБ и переводили
+    /// RTX 3060 в WDDM shared memory.
+    pub fn clear_attention_payloads(&mut self) {
+        for block in &mut self.blocks {
+            if let BlockStateSnap::Attention(kv) = block {
+                *kv = None;
+            }
+        }
+    }
+
     /// Приблизительный размер snapshot в байтах (T-328, FR-004).
     ///
     /// Используется PromptCacheStore для LRU-вытеснения по бюджету памяти.
@@ -7334,6 +7348,30 @@ impl ModelWeights {
                     };
                     BlockStateSnap::Attention(kv)
                 }
+            });
+        }
+        Ok(StateSnapshot {
+            model_nonce: self.instance_nonce,
+            position,
+            blocks,
+        })
+    }
+
+    /// Снимок только recurrent-state для декода по paged KV.
+    ///
+    /// Attention K/V уже лежит в постоянном paged pool, поэтому копировать его
+    /// в отдельные тензоры лишь ради `seed_slot_batched` не нужно. Длины K/V
+    /// caller синхронизирует через `set_kv_len_batched`.
+    pub fn snapshot_slot_recurrent_state(
+        &self,
+        device: &Device,
+        position: usize,
+    ) -> Result<StateSnapshot> {
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            blocks.push(match &block.layer {
+                HybridLayerType::DeltaNet(d) => BlockStateSnap::DeltaNet(d.snapshot_state(device)?),
+                HybridLayerType::Attention(_) => BlockStateSnap::Attention(None),
             });
         }
         Ok(StateSnapshot {

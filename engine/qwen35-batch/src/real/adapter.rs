@@ -188,6 +188,21 @@ fn pgraph_min_capture_t() -> usize {
             })
     })
 }
+
+/// Верхняя граница снимка prefix cache. На Ornith один Q8-снимок 64K занимает
+/// около 1.1 ГиБ; более длинная временная копия вместе с рабочими буферами уже
+/// может вытолкнуть рабочий набор 12-ГБ карты в WDDM shared memory.
+/// `usize::MAX` сохраняет прежнее поведение на больших GPU.
+fn prefix_cache_max_tokens() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("QWEN36_PREFIX_CACHE_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(usize::MAX)
+    })
+}
 /// Размер пула декодных графов. Ключ — только ширина батча b (состав слотов
 /// ядра читают из стейджинга PagedModelCtx::slots_dev), так что различных
 /// форм не больше числа слотов; сверх пула не захватываем (QWEN36_DGRAPH_LRU).
@@ -951,6 +966,18 @@ impl BatchModel for Qwen35BatchAdapter {
             // append с kv_len_host = cache_len снимка. Если пул недоступен
             // (не CUDA / int8) — авторитет остаётся за single-slot/batched.
             self.paged_dirty[sidx] = !pool_ok;
+            if pool_ok {
+                // K/V уже скопирован в постоянный paged pool. Не держим вторую
+                // копию длиной со весь префикс во время suffix-prefill/decode.
+                if let Some(snap) = self.slot_snaps[sidx].as_mut() {
+                    snap.clear_attention_payloads();
+                }
+                #[cfg(feature = "cuda")]
+                if let Device::Cuda(c) = &self.device {
+                    let _ = c.cuda_stream().synchronize();
+                    let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+                }
+            }
         } else {
             return Err(anyhow!(
                 "prefill_chunk: slot {sidx} без snapshot и не reset"
@@ -959,12 +986,31 @@ impl BatchModel for Qwen35BatchAdapter {
 
         // Снимок границы для prefix cache: состояние слота здесь отвечает
         // ровно chunk.start_pos, и эта позиция кратна размеру чанка.
-        if self.capture_prefix && chunk.is_final && chunk.start_pos > 0 {
-            let snap = self
+        let prefix_limit = prefix_cache_max_tokens();
+        let capture_at_limit = chunk.start_pos == prefix_limit;
+        let capture_final_below_limit = chunk.is_final && chunk.start_pos <= prefix_limit;
+        if self.capture_prefix
+            && self.slot_prefix_snaps[sidx].is_none()
+            && chunk.start_pos > 0
+            && (capture_at_limit || capture_final_below_limit)
+        {
+            let device_snap = self
                 .model
                 .snapshot_slot_state(&self.device, sidx, chunk.start_pos)
                 .map_err(|e| anyhow!("prefix snapshot: {e}"))?;
-            self.slot_prefix_snaps[sidx] = Some((chunk.start_pos, snap));
+            // Переносим в RAM сразу, до forward финального чанка. Раньше
+            // device-снимок границы пересекался по времени с финальным
+            // slot-snapshot той же длины, удваивая пик VRAM.
+            let host_snap = device_snap
+                .to_host()
+                .map_err(|e| anyhow!("prefix snapshot to host: {e}"))?;
+            drop(device_snap);
+            #[cfg(feature = "cuda")]
+            if let Device::Cuda(c) = &self.device {
+                let _ = c.cuda_stream().synchronize();
+                let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+            }
+            self.slot_prefix_snaps[sidx] = Some((chunk.start_pos, host_snap));
         }
 
         let pf_restore = pf_t0.elapsed();
@@ -1180,10 +1226,18 @@ impl BatchModel for Qwen35BatchAdapter {
         self.state_owner = Some((sidx, new_pos));
         let pf_s0 = std::time::Instant::now();
         if chunk.is_final {
-            let snap = self
-                .model
-                .snapshot_slot_state(&self.device, sidx, new_pos)
-                .map_err(|e| anyhow!("prefill snapshot: {e}"))?;
+            // При graph-prefill attention K/V уже находится в paged pool.
+            // Полный снимок создавал ещё одну копию, линейную по контексту,
+            // хотя seed использовал из неё только recurrent-state и длину.
+            let snap = if pg_used {
+                self.model
+                    .snapshot_slot_recurrent_state(&self.device, new_pos)
+                    .map_err(|e| anyhow!("prefill recurrent snapshot: {e}"))?
+            } else {
+                self.model
+                    .snapshot_slot_state(&self.device, sidx, new_pos)
+                    .map_err(|e| anyhow!("prefill snapshot: {e}"))?
+            };
             self.slot_snaps[sidx] = Some(snap);
             self.model
                 .seed_slot_batched(
@@ -1194,6 +1248,12 @@ impl BatchModel for Qwen35BatchAdapter {
                         .ok_or_else(|| anyhow!("prefill snapshot disappeared"))?,
                 )
                 .map_err(|error| anyhow!("prefill seed slot {sidx}: {error}"))?;
+            #[cfg(feature = "cuda")]
+            if pg_used {
+                // Attention payload намеренно отсутствует: пул уже содержит
+                // строки, но host-зеркало длины нужно eager fallback/checkpoint.
+                self.model.set_kv_len_batched(sidx, new_pos);
+            }
             self.slot_seeded[sidx] = true;
             // Владение снимается: ниже KV single-slot пути очищается, и
             // пропускать restore для следующего чанка этого слота нельзя.
@@ -1209,6 +1269,7 @@ impl BatchModel for Qwen35BatchAdapter {
             // страницы сверх текущего usage → VRAM освобождается для decode.
             #[cfg(feature = "cuda")]
             if let Device::Cuda(c) = &self.device {
+                let _ = c.cuda_stream().synchronize();
                 let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
             }
         } else {
