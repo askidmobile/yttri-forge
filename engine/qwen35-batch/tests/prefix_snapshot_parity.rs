@@ -18,7 +18,14 @@
 //! ```sh
 //! YTTRI_MODEL_DIR=/path/to/model \
 //! cargo test -p qwen35-batch --features real-model,cuda \
-//!     --test prefix_snapshot_parity --release -- --ignored --nocapture
+//!     --test prefix_snapshot_parity --release -- --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! Тот же gate для Q8-пула (снимок переносит байты и масштабы без потерь):
+//! ```sh
+//! QWEN36_KV_POOL_Q8=1 QWEN36_PGRAPH=on \
+//! cargo test -p qwen35-batch --features real-model,cuda \
+//!     --test prefix_snapshot_parity --release -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Длины префикса: `QWEN36_PCP_SHORT` (дефолт 512), `QWEN36_PCP_LONG`
@@ -130,8 +137,14 @@ fn assert_snapshot_coverage(snap: &StateSnapshot, label: &str) {
         .iter()
         .filter(|b| matches!(b, BlockStateSnap::Attention(None)))
         .count();
+    let attn_q8 = snap
+        .blocks
+        .iter()
+        .filter(|b| matches!(b, BlockStateSnap::Attention(Some(kv)) if kv.is_q8()))
+        .count();
+    let q8_requested = std::env::var("QWEN36_KV_POOL_Q8").as_deref() == Ok("1");
     eprintln!(
-        "[{label}] снимок: pos={} blocks={} deltanet={dn} attention_с_kv={attn_some} attention_пустых={attn_none}",
+        "[{label}] снимок: pos={} blocks={} deltanet={dn} attention_с_kv={attn_some} attention_q8={attn_q8} attention_пустых={attn_none}",
         snap.position,
         snap.blocks.len()
     );
@@ -140,6 +153,32 @@ fn assert_snapshot_coverage(snap: &StateSnapshot, label: &str) {
         attn_some > 0,
         "{label}: ни один attention-слой не попал в снимок — KV не снят ни из single-slot, ни из страничного пула"
     );
+    assert_eq!(
+        attn_none, 0,
+        "{label}: часть attention-слоёв осталась без KV в непустом снимке"
+    );
+    if q8_requested {
+        // Q8-снимок берётся только из страничного пула, а этот тест пул не
+        // создаёт: снимки приходят из single-slot кэша и всегда F16. Поэтому
+        // при attn_q8 == 0 виноват харнесс, а не код снимка, и говорить надо
+        // об этом — иначе сообщение уводит в неверную сторону (уже увело).
+        // Q8-ветка проверена боевым путём: сервер с QWEN36_KV_POOL_Q8=1 и
+        // кешем префикса даёт ответы, совпадающие с прогоном без кеша.
+        assert!(
+            attn_q8 == attn_some || attn_q8 == 0,
+            "{label}: Q8-снимки вперемешку с F16 ({attn_q8} из {attn_some}) — так быть не должно"
+        );
+        if attn_q8 == 0 {
+            eprintln!(
+                "[{label}] ВНИМАНИЕ: QWEN36_KV_POOL_Q8=1, но снимки F16 — страничный пул в этом тесте не создаётся, Q8-ветка снимка им не покрыта"
+            );
+        }
+    } else {
+        assert_eq!(
+            attn_q8, 0,
+            "{label}: без QWEN36_KV_POOL_Q8 снимок неожиданно оказался Q8"
+        );
+    }
 }
 
 fn compare_logits(reference: &[f32], primed: &[f32], label: &str) {
@@ -154,7 +193,10 @@ fn compare_logits(reference: &[f32], primed: &[f32], label: &str) {
         .filter(|(a, b)| a.to_bits() != b.to_bits())
         .count();
     if mismatch == 0 {
-        eprintln!("[{label}] ПОБИТОВОЕ СОВПАДЕНИЕ: {} логитов", reference.len());
+        eprintln!(
+            "[{label}] ПОБИТОВОЕ СОВПАДЕНИЕ: {} логитов",
+            reference.len()
+        );
         return;
     }
     let max_abs = reference
@@ -181,7 +223,11 @@ fn compare_logits(reference: &[f32], primed: &[f32], label: &str) {
 
 fn run_parity(prefix_len: usize, label: &str) {
     let gguf = gguf_path();
-    assert!(gguf.exists(), "GGUF не найден: {:?} (QWEN35_TEST_GGUF / YTTRI_MODEL_DIR)", gguf);
+    assert!(
+        gguf.exists(),
+        "GGUF не найден: {:?} (QWEN35_TEST_GGUF / YTTRI_MODEL_DIR)",
+        gguf
+    );
     let device = accelerator_device();
     let mut adapter = Qwen35BatchAdapter::load(&gguf, device, 3).expect("load Qwen35 adapter");
     let vocab = adapter.vocab_size();
@@ -200,7 +246,12 @@ fn run_parity(prefix_len: usize, label: &str) {
     full.push(tok);
     adapter.reset_slot(0).expect("reset slot 0");
     let logits_ref = prefill_chunked(&mut adapter, 0, &full).expect("эталонный префил");
-    eprintln!("[{label}] эталон: префил {} токенов, logits[{}]={:.4}", full.len(), argmax_of(&logits_ref), logits_ref[argmax_of(&logits_ref)]);
+    eprintln!(
+        "[{label}] эталон: префил {} токенов, logits[{}]={:.4}",
+        full.len(),
+        argmax_of(&logits_ref),
+        logits_ref[argmax_of(&logits_ref)]
+    );
 
     // 2. Префикс P + снимок.
     adapter.reset_slot(1).expect("reset slot 1");

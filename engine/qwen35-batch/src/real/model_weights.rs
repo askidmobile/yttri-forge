@@ -2903,12 +2903,54 @@ fn tensor_deep_clone(t: &Tensor) -> Result<Tensor> {
 pub struct KvCacheSnap {
     pub k: Tensor,
     pub v: Tensor,
+    /// Масштабы Q8 [1, n_kv_head, cache_len] F16, по одному на пару
+    /// (токен, голова). Оба `None` означают обычный F16/F32-снимок.
+    /// Q8-байты без этих тензоров не имеют самостоятельного численного смысла.
+    pub(crate) k_scale: Option<Tensor>,
+    pub(crate) v_scale: Option<Tensor>,
     pub cache_len: usize,
     /// Снимок взят из страничного пула (graph-префилл), а не из single-slot
     /// кэша. `seed_slot_batched` использует это, чтобы НЕ материализовать
     /// batched q8-кэш слота: при авторитетном пуле он дублировал бы данные
     /// (~512 МБ на слот @32K) — класс регрессии WDDM 2026-08-23.
     pub(crate) from_pool: bool,
+}
+
+impl KvCacheSnap {
+    /// Снимок хранит исходное Q8-представление пула без деквантования.
+    pub fn is_q8(&self) -> bool {
+        self.k.dtype() == DType::U8
+            && self.v.dtype() == DType::U8
+            && matches!(&self.k_scale, Some(scale) if scale.dtype() == DType::F16)
+            && matches!(&self.v_scale, Some(scale) if scale.dtype() == DType::F16)
+    }
+
+    /// Проверить согласованность Q8-частей и вернуть масштабы.
+    fn q8_scales(&self) -> Result<Option<(&Tensor, &Tensor)>> {
+        match (&self.k_scale, &self.v_scale) {
+            (None, None) => Ok(None),
+            (Some(k_scale), Some(v_scale)) => {
+                if self.k.dtype() != DType::U8 || self.v.dtype() != DType::U8 {
+                    candle_core::bail!(
+                        "Q8 KV snapshot: K/V должны быть U8, получено {:?}/{:?}",
+                        self.k.dtype(),
+                        self.v.dtype()
+                    );
+                }
+                if k_scale.dtype() != DType::F16 || v_scale.dtype() != DType::F16 {
+                    candle_core::bail!(
+                        "Q8 KV snapshot: масштабы должны быть F16, получено {:?}/{:?}",
+                        k_scale.dtype(),
+                        v_scale.dtype()
+                    );
+                }
+                Ok(Some((k_scale, v_scale)))
+            }
+            _ => {
+                candle_core::bail!("Q8 KV snapshot: k_scale и v_scale должны присутствовать вместе")
+            }
+        }
+    }
 }
 
 /// Веса и логика Gated Attention слоя (каждый 4-й слой в Qwen3.5).
@@ -4763,6 +4805,8 @@ impl GatedAttentionLayer {
         Ok(Some(KvCacheSnap {
             k: k.clone(),
             v: v.clone(),
+            k_scale: None,
+            v_scale: None,
             cache_len: self.kv_cache_len,
             from_pool: false,
         }))
@@ -4776,6 +4820,12 @@ impl GatedAttentionLayer {
     pub(crate) fn restore_kv(&mut self, snap: Option<&KvCacheSnap>) -> Result<()> {
         match snap {
             Some(snap) => {
+                if snap.q8_scales()?.is_some() {
+                    candle_core::bail!(
+                        "Q8 KV snapshot можно восстановить только в paged-пул \
+                         через restore_slot_state"
+                    );
+                }
                 // Используем narrow + clone вместо tensor_deep_clone всей матрицы:
                 // выделяем только нужный размер, не весь capacity буфера.
                 let k = snap.k.narrow(2, 0, snap.cache_len)?.contiguous()?;
@@ -4797,8 +4847,9 @@ impl GatedAttentionLayer {
     /// и `snapshot_kv()` вернул бы None — restore молча потерял бы историю
     /// внимания. Страницы слота в block_table — всегда непрерывный диапазон
     /// `[slot*max_blocks .. slot*max_blocks+pages)` (см. rehydrate_kv_from_paged),
-    /// поэтому копия — серия D2D-memcpy постранично. Возвращает
-    /// [1, n_kv, len, hd] F16 — тот же layout, что single-slot kv_cache.
+    /// поэтому копия — серия D2D-memcpy постранично. Возвращает K/V в layout
+    /// [1, n_kv, len, hd]. Для F16-пула это F16-тензоры; для Q8-пула — исходные
+    /// U8-байты плюс F16-масштабы [1, n_kv, len], без деквантования.
     #[cfg(feature = "cuda")]
     pub(crate) fn snapshot_kv_from_pool(
         &self,
@@ -4812,64 +4863,126 @@ impl GatedAttentionLayer {
         let Some(pool) = &self.paged_pool else {
             return Ok(None);
         };
-        if pool.k_scale.is_some() {
+        let ps = crate::real::paged_kv_cuda::PAGE_SIZE;
+        if max_blocks == 0 || len > max_blocks.saturating_mul(ps) {
             candle_core::bail!(
-                "snapshot_kv_from_pool: int8-пул не поддержан — снимок attention невозможен"
+                "snapshot_kv_from_pool: len={len} не помещается в {max_blocks} страниц"
+            );
+        }
+        let pages = len.div_ceil(ps);
+        let num_blocks = pool.k_pool.dim(0)?;
+        let first_page = slot.checked_mul(max_blocks).ok_or_else(|| {
+            candle_core::Error::Msg("snapshot_kv_from_pool: slot overflow".into())
+        })?;
+        if first_page.saturating_add(pages) > num_blocks {
+            candle_core::bail!(
+                "snapshot_kv_from_pool: страницы слота вне пула: \
+                 slot={slot} first={first_page} pages={pages} num_blocks={num_blocks}"
             );
         }
         let n_kv = self.n_kv_head;
         let hd = self.head_dim;
         let elem_per_token = n_kv * hd;
-        let ps = crate::real::paged_kv_cuda::PAGE_SIZE;
         let device = pool.k_pool.device().clone();
-        let mut copy_pool_rows = |pool_t: &Tensor| -> Result<Tensor> {
-            let rows = Tensor::zeros((1, len, n_kv, hd), DType::F16, &device)?;
-            // Заимствования storage_and_layout должны умереть до возврата rows.
-            {
-                let (src_st, _) = pool_t.storage_and_layout();
-                let (dst_st, dst_l) = rows.storage_and_layout();
-                if let (
-                    candle_core::Storage::Cuda(sp),
-                    candle_core::Storage::Cuda(dp),
-                ) = (&*src_st, &*dst_st)
-                {
-                    let src = sp.as_cuda_slice::<half::f16>()?;
-                    let dst = dp.as_cuda_slice::<half::f16>()?;
-                    let stream = pool_t.device().as_cuda_device()?.cuda_stream();
-                    let (src_ptr, _) = cudarc::driver::DevicePtr::device_ptr(src, &stream);
-                    let (dst_ptr, _) = cudarc::driver::DevicePtr::device_ptr(dst, &stream);
-                    let pages = len.div_ceil(ps);
-                    for page in 0..pages {
-                        let start = page * ps;
-                        let n = (len - start).min(ps);
-                        let phys = slot * max_blocks + page;
-                        let src_start = (phys * ps) * elem_per_token;
-                        let dst_start = dst_l.start_offset() + start * elem_per_token;
-                        let count_bytes = n * elem_per_token * 2; // f16 = 2 байта
-                        unsafe {
-                            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-                                dst_ptr + (dst_start * 2) as u64,
-                                src_ptr + (src_start * 2) as u64,
-                                count_bytes,
-                                stream.cu_stream(),
-                            );
-                        }
-                    }
-                } else {
-                    candle_core::bail!("snapshot_kv_from_pool: ожидались CUDA-тензоры");
+        let pool_scales = match (&pool.k_scale, &pool.v_scale) {
+            (None, None) => None,
+            (Some(k_scale), Some(v_scale)) => Some((k_scale, v_scale)),
+            _ => candle_core::bail!("snapshot_kv_from_pool: k_scale/v_scale пула рассогласованы"),
+        };
+        let value_dtype = if pool_scales.is_some() {
+            DType::U8
+        } else {
+            DType::F16
+        };
+        if pool.k_pool.dtype() != value_dtype || pool.v_pool.dtype() != value_dtype {
+            candle_core::bail!(
+                "snapshot_kv_from_pool: dtype пула {:?}/{:?}, ожидался {value_dtype:?}",
+                pool.k_pool.dtype(),
+                pool.v_pool.dtype()
+            );
+        }
+        let value_bytes = value_dtype.size_in_bytes();
+        let copy_pool_values = |pool_t: &Tensor| -> Result<Tensor> {
+            let rows = Tensor::zeros((1, len, n_kv, hd), value_dtype, &device)?;
+            let src_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(pool_t)?;
+            let dst_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&rows)?;
+            let stream = pool_t.device().as_cuda_device()?.cuda_stream();
+            for page in 0..pages {
+                let start = page * ps;
+                let n = (len - start).min(ps);
+                let phys = first_page + page;
+                let src_start = (phys * ps) * elem_per_token;
+                let dst_start = start * elem_per_token;
+                let count_bytes = n * elem_per_token * value_bytes;
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                        dst_ptr + (dst_start * value_bytes) as u64,
+                        src_ptr + (src_start * value_bytes) as u64,
+                        count_bytes,
+                        stream.cu_stream(),
+                    );
                 }
             }
             Ok(rows)
         };
-        let k_rows = copy_pool_rows(&pool.k_pool)?;
-        let v_rows = copy_pool_rows(&pool.v_pool)?;
+
+        let copy_pool_scales = |scale_t: &Tensor| -> Result<Tensor> {
+            if scale_t.dtype() != DType::F16 {
+                candle_core::bail!(
+                    "snapshot_kv_from_pool: dtype масштаба {:?}, ожидался F16",
+                    scale_t.dtype()
+                );
+            }
+            let rows = Tensor::zeros((1, len, n_kv), DType::F16, &device)?;
+            let src_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(scale_t)?;
+            let dst_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&rows)?;
+            let stream = scale_t.device().as_cuda_device()?.cuda_stream();
+            let scale_bytes = std::mem::size_of::<half::f16>();
+            for page in 0..pages {
+                let start = page * ps;
+                let n = (len - start).min(ps);
+                let phys = first_page + page;
+                let src_start = (phys * ps) * n_kv;
+                let dst_start = start * n_kv;
+                let count_bytes = n * n_kv * scale_bytes;
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                        dst_ptr + (dst_start * scale_bytes) as u64,
+                        src_ptr + (src_start * scale_bytes) as u64,
+                        count_bytes,
+                        stream.cu_stream(),
+                    );
+                }
+            }
+            Ok(rows)
+        };
+
+        let k_rows = copy_pool_values(&pool.k_pool)?;
+        let v_rows = copy_pool_values(&pool.v_pool)?;
         // Пул хранит [page, page_size, n_kv, hd] → строки [1, len, n_kv, hd];
         // приводим к layout single-slot кэша [1, n_kv, len, hd].
         let k = k_rows.transpose(1, 2)?.contiguous()?;
         let v = v_rows.transpose(1, 2)?.contiguous()?;
+        let (k_scale, v_scale) = match pool_scales {
+            Some((pool_k_scale, pool_v_scale)) => (
+                Some(
+                    copy_pool_scales(pool_k_scale)?
+                        .transpose(1, 2)?
+                        .contiguous()?,
+                ),
+                Some(
+                    copy_pool_scales(pool_v_scale)?
+                        .transpose(1, 2)?
+                        .contiguous()?,
+                ),
+            ),
+            None => (None, None),
+        };
         Ok(Some(KvCacheSnap {
             k,
             v,
+            k_scale,
+            v_scale,
             cache_len: len,
             from_pool: true,
         }))
@@ -4892,55 +5005,127 @@ impl GatedAttentionLayer {
         let Some(pool) = &self.paged_pool else {
             return Ok(false);
         };
-        if pool.k_scale.is_some() {
-            // int8-пул: записывающее ядро квантует, сырой memcpy F16 невозможен.
-            // Отдать пулу нечего — caller оставляет авторитет за single-slot.
-            return Ok(false);
-        }
         let n_kv = self.n_kv_head;
         let hd = self.head_dim;
         let elem_per_token = n_kv * hd;
         let ps = crate::real::paged_kv_cuda::PAGE_SIZE;
-        // [1, n_kv, len, hd] → [1, len, n_kv, hd] — row-major строк пула.
-        let k_rows = snap.k.narrow(2, 0, len)?.transpose(1, 2)?.contiguous()?;
-        let v_rows = snap.v.narrow(2, 0, len)?.transpose(1, 2)?.contiguous()?;
-        let mut put_pool_rows = |rows: &Tensor, pool_t: &Tensor| -> Result<()> {
-            let (rows_st, rows_l) = rows.storage_and_layout();
-            let (pool_st, _) = pool_t.storage_and_layout();
-            if let (
-                candle_core::Storage::Cuda(rp),
-                candle_core::Storage::Cuda(pp),
-            ) = (&*rows_st, &*pool_st)
-            {
-                let src = rp.as_cuda_slice::<half::f16>()?;
-                let dst = pp.as_cuda_slice::<half::f16>()?;
-                let stream = pool_t.device().as_cuda_device()?.cuda_stream();
-                let (src_ptr, _) = cudarc::driver::DevicePtr::device_ptr(src, &stream);
-                let (dst_ptr, _) = cudarc::driver::DevicePtr::device_ptr(dst, &stream);
-                let pages = len.div_ceil(ps);
-                for page in 0..pages {
-                    let start = page * ps;
-                    let n = (len - start).min(ps);
-                    let phys = slot * max_blocks + page;
-                    let src_start = rows_l.start_offset() + start * elem_per_token;
-                    let dst_start = (phys * ps) * elem_per_token;
-                    let count_bytes = n * elem_per_token * 2;
-                    unsafe {
-                        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-                            dst_ptr + (dst_start * 2) as u64,
-                            src_ptr + (src_start * 2) as u64,
-                            count_bytes,
-                            stream.cu_stream(),
-                        );
-                    }
+        if max_blocks == 0 || len > max_blocks.saturating_mul(ps) {
+            candle_core::bail!(
+                "restore_kv_to_pool: len={len} не помещается в {max_blocks} страниц"
+            );
+        }
+        let pages = len.div_ceil(ps);
+        let num_blocks = pool.k_pool.dim(0)?;
+        let first_page = slot
+            .checked_mul(max_blocks)
+            .ok_or_else(|| candle_core::Error::Msg("restore_kv_to_pool: slot overflow".into()))?;
+        if first_page.saturating_add(pages) > num_blocks {
+            candle_core::bail!(
+                "restore_kv_to_pool: страницы слота вне пула: \
+                 slot={slot} first={first_page} pages={pages} num_blocks={num_blocks}"
+            );
+        }
+
+        let pool_scales = match (&pool.k_scale, &pool.v_scale) {
+            (None, None) => None,
+            (Some(k_scale), Some(v_scale)) => Some((k_scale, v_scale)),
+            _ => candle_core::bail!("restore_kv_to_pool: k_scale/v_scale пула рассогласованы"),
+        };
+        let snap_scales = snap.q8_scales()?;
+        if pool_scales.is_some() != snap_scales.is_some() {
+            candle_core::bail!(
+                "restore_kv_to_pool: формат снимка и пула различается (snapshot_q8={}, pool_q8={})",
+                snap_scales.is_some(),
+                pool_scales.is_some()
+            );
+        }
+        let value_dtype = if pool_scales.is_some() {
+            DType::U8
+        } else {
+            DType::F16
+        };
+        if pool.k_pool.dtype() != value_dtype
+            || pool.v_pool.dtype() != value_dtype
+            || snap.k.dtype() != value_dtype
+            || snap.v.dtype() != value_dtype
+        {
+            candle_core::bail!(
+                "restore_kv_to_pool: dtype K/V несовместим с форматом {value_dtype:?}"
+            );
+        }
+        let (k_b, k_h, k_t, k_d) = snap.k.dims4()?;
+        let (v_b, v_h, v_t, v_d) = snap.v.dims4()?;
+        if (k_b, k_h, k_d) != (1, n_kv, hd)
+            || (v_b, v_h, v_d) != (1, n_kv, hd)
+            || k_t < len
+            || v_t < len
+        {
+            candle_core::bail!(
+                "restore_kv_to_pool: shape K/V {:?}/{:?}, ожидалось \
+                 [1, {n_kv}, >= {len}, {hd}]",
+                snap.k.dims(),
+                snap.v.dims()
+            );
+        }
+        if let Some((k_scale, v_scale)) = snap_scales {
+            let expected = (1, n_kv, len);
+            if k_scale.dims3()? != expected || v_scale.dims3()? != expected {
+                candle_core::bail!(
+                    "restore_kv_to_pool: shape масштабов {:?}/{:?}, ожидалось {:?}",
+                    k_scale.dims(),
+                    v_scale.dims(),
+                    expected
+                );
+            }
+        }
+        let value_bytes = value_dtype.size_in_bytes();
+        let put_pool_rows = |rows: &Tensor,
+                             pool_t: &Tensor,
+                             elems_per_token: usize,
+                             elem_bytes: usize|
+         -> Result<()> {
+            let src_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(rows)?;
+            let dst_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(pool_t)?;
+            let stream = pool_t.device().as_cuda_device()?.cuda_stream();
+            for page in 0..pages {
+                let start = page * ps;
+                let n = (len - start).min(ps);
+                let phys = first_page + page;
+                let src_start = start * elems_per_token;
+                let dst_start = (phys * ps) * elems_per_token;
+                let count_bytes = n * elems_per_token * elem_bytes;
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                        dst_ptr + (dst_start * elem_bytes) as u64,
+                        src_ptr + (src_start * elem_bytes) as u64,
+                        count_bytes,
+                        stream.cu_stream(),
+                    );
                 }
-            } else {
-                candle_core::bail!("restore_kv_to_pool: ожидались CUDA-тензоры");
             }
             Ok(())
         };
-        put_pool_rows(&k_rows, &pool.k_pool)?;
-        put_pool_rows(&v_rows, &pool.v_pool)?;
+
+        // [1, n_kv, len, hd] → [1, len, n_kv, hd] — row-major строк пула.
+        let k_rows = snap.k.narrow(2, 0, len)?.transpose(1, 2)?.contiguous()?;
+        let v_rows = snap.v.narrow(2, 0, len)?.transpose(1, 2)?.contiguous()?;
+        put_pool_rows(&k_rows, &pool.k_pool, elem_per_token, value_bytes)?;
+        put_pool_rows(&v_rows, &pool.v_pool, elem_per_token, value_bytes)?;
+        if let (Some((snap_k_scale, snap_v_scale)), Some((pool_k_scale, pool_v_scale))) =
+            (snap_scales, pool_scales)
+        {
+            let k_scale_rows = snap_k_scale
+                .narrow(2, 0, len)?
+                .transpose(1, 2)?
+                .contiguous()?;
+            let v_scale_rows = snap_v_scale
+                .narrow(2, 0, len)?
+                .transpose(1, 2)?
+                .contiguous()?;
+            let scale_bytes = std::mem::size_of::<half::f16>();
+            put_pool_rows(&k_scale_rows, pool_k_scale, n_kv, scale_bytes)?;
+            put_pool_rows(&v_scale_rows, pool_v_scale, n_kv, scale_bytes)?;
+        }
         Ok(true)
     }
 }
@@ -5007,7 +5192,7 @@ impl StateSnapshot {
     ///
     /// Используется PromptCacheStore для LRU-вытеснения по бюджету памяти.
     /// DeltaNet: conv_buf + ssm_state (Vec<f32> → 4 байта/элемент).
-    /// Attention: 2 тензора K + V * element_size (f16/f32).
+    /// Attention: K + V; для Q8 дополнительно два F16-тензора масштабов.
     ///
     /// На Qwen3.5-4B Q4_K_M: 24 DeltaNet слоя (~50 МБ) + 8 Attention слоёв (~64 МБ) ≈ 114 МБ.
     pub fn size_bytes(&self) -> usize {
@@ -5021,10 +5206,16 @@ impl StateSnapshot {
                 }
                 BlockStateSnap::Attention(kv_opt) => {
                     if let Some(kv) = kv_opt {
-                        // K tensor + V tensor
+                        // K/V плюс отдельные масштабы Q8, если снимок байтовый.
                         let k_bytes = kv.k.elem_count() * kv.k.dtype().size_in_bytes();
                         let v_bytes = kv.v.elem_count() * kv.v.dtype().size_in_bytes();
                         total += k_bytes + v_bytes;
+                        if let Some(scale) = &kv.k_scale {
+                            total += scale.elem_count() * scale.dtype().size_in_bytes();
+                        }
+                        if let Some(scale) = &kv.v_scale {
+                            total += scale.elem_count() * scale.dtype().size_in_bytes();
+                        }
                     }
                 }
             }
@@ -7081,9 +7272,7 @@ impl ModelWeights {
         let mut blocks = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
             blocks.push(match &block.layer {
-                HybridLayerType::DeltaNet(d) => {
-                    BlockStateSnap::DeltaNet(d.snapshot_state(device)?)
-                }
+                HybridLayerType::DeltaNet(d) => BlockStateSnap::DeltaNet(d.snapshot_state(device)?),
                 HybridLayerType::Attention(a) => {
                     let kv = if a.kv_cache_len > 0 {
                         // Eager-путь: авторитет — single-slot кэш.
@@ -7142,8 +7331,9 @@ impl ModelWeights {
     /// KV из снимка в страницы страничного пула слота и двигает `kv_len_host`.
     ///
     /// Возвращает true, если пул обновлён и снова авторитетен для слота
-    /// (caller может сбросить `paged_dirty`). Single-slot кэш заполняется
-    /// всегда — остаётся рабочим eager-откат префилла.
+    /// (caller может сбросить `paged_dirty`). Для обычного F16-снимка также
+    /// заполняется single-slot кэш. Q8-снимок остаётся только в paged-пуле:
+    /// его деквантование создало бы лишнюю копию и потеряло бы побитовый паритет.
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     pub fn restore_slot_state(
         &mut self,
@@ -7175,12 +7365,36 @@ impl ModelWeights {
                 }
                 (HybridLayerType::Attention(a), BlockStateSnap::Attention(s)) => match s {
                     Some(s) => {
-                        a.restore_kv(Some(s))?;
+                        let q8_snapshot = s.q8_scales()?.is_some();
+                        if q8_snapshot && !s.from_pool {
+                            candle_core::bail!(
+                                "restore_slot_state: Q8 attention snapshot должен быть взят из paged-пула"
+                            );
+                        }
                         #[cfg(feature = "cuda")]
-                        if let Some(ctx) = &self.paged_ctx {
-                            if a.restore_kv_to_pool(slot, s, ctx.max_blocks)? {
-                                pool_restored_len = Some(s.cache_len);
+                        let restored_to_pool = if let Some(ctx) = &self.paged_ctx {
+                            a.restore_kv_to_pool(slot, s, ctx.max_blocks)?
+                        } else {
+                            false
+                        };
+                        #[cfg(not(feature = "cuda"))]
+                        let restored_to_pool = false;
+
+                        if q8_snapshot {
+                            if !restored_to_pool {
+                                candle_core::bail!(
+                                    "restore_slot_state: Q8 snapshot невозможно восстановить без Q8 paged-пула"
+                                );
                             }
+                            // Авторитет — точная копия Q8+scale в пуле. Не создаём
+                            // F16 single-slot cache через dequant/requant.
+                            a.restore_kv(None)?;
+                        } else {
+                            a.restore_kv(Some(s))?;
+                        }
+                        #[cfg(feature = "cuda")]
+                        if restored_to_pool {
+                            pool_restored_len = Some(s.cache_len);
                         }
                     }
                     None => a.restore_kv(None)?,
@@ -9587,6 +9801,8 @@ mod tests {
         let snap = KvCacheSnap {
             k: tensor_deep_clone(&k)?,
             v: tensor_deep_clone(&v)?,
+            k_scale: None,
+            v_scale: None,
             cache_len: 4,
             from_pool: false,
         };
@@ -9736,6 +9952,33 @@ mod tests {
         );
         assert!(err.is_err(), "expected size mismatch error");
 
+        Ok(())
+    }
+
+    /// Q8 snapshot учитывает не только байты K/V, но и F16-масштабы строк.
+    #[test]
+    fn test_q8_kv_snapshot_size_includes_scales() -> Result<()> {
+        let device = Device::Cpu;
+        let value_shape = (1usize, 2usize, 4usize, 8usize);
+        let scale_shape = (1usize, 2usize, 4usize);
+        let values = value_shape.0 * value_shape.1 * value_shape.2 * value_shape.3;
+        let scales = scale_shape.0 * scale_shape.1 * scale_shape.2;
+        let kv = KvCacheSnap {
+            k: Tensor::from_vec(vec![0u8; values], value_shape, &device)?,
+            v: Tensor::from_vec(vec![0u8; values], value_shape, &device)?,
+            k_scale: Some(Tensor::zeros(scale_shape, DType::F16, &device)?),
+            v_scale: Some(Tensor::zeros(scale_shape, DType::F16, &device)?),
+            cache_len: 4,
+            from_pool: true,
+        };
+        assert!(kv.is_q8());
+
+        let snapshot = StateSnapshot {
+            model_nonce: 1,
+            position: 4,
+            blocks: vec![BlockStateSnap::Attention(Some(kv))],
+        };
+        assert_eq!(snapshot.size_bytes(), 2 * values + 2 * scales * 2);
         Ok(())
     }
 
