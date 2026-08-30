@@ -48,7 +48,10 @@ static Q81_SCRATCH: std::sync::OnceLock<
     std::sync::Mutex<
         std::collections::HashMap<
             crate::cuda_backend::DeviceId,
-            std::collections::HashMap<usize, (CudaSlice<u8>, CudaSlice<u8>, std::sync::atomic::AtomicBool)>,
+            std::collections::HashMap<
+                usize,
+                (CudaSlice<u8>, CudaSlice<u8>, std::sync::atomic::AtomicBool),
+            >,
         >,
     >,
 > = std::sync::OnceLock::new();
@@ -95,8 +98,7 @@ impl std::ops::DerefMut for Q81ScratchRef {
 }
 
 fn q8_1_scratch(dev: &CudaDevice, bytes: usize) -> Q81ScratchRef {
-    let map = Q81_SCRATCH
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let map = Q81_SCRATCH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let bytes = bytes.max(1);
     let mut guard = map.lock().unwrap();
     let per_size = guard.entry(dev.id()).or_default();
@@ -368,9 +370,7 @@ fn dequantize_f16(
         // GGUF падали "unsupported dtype", а через F32 — 2x VRAM/OOM).
         GgmlDType::BF16 => {
             let view = unsafe { data.inner.transmute::<half::bf16>(elem_count) }
-                .ok_or_else(|| {
-                    crate::Error::Msg("bf16 view: size mismatch".into()).bt()
-                })?;
+                .ok_or_else(|| crate::Error::Msg("bf16 view: size mismatch".into()).bt())?;
             let dst = unsafe { dev.alloc::<f16>(elem_count)? };
             let func = dev.get_or_load_func("cast_bf16_f16", &candle_kernels::CAST)?;
             let cfg = cudarc::driver::LaunchConfig::for_num_elems(elem_count as u32);
@@ -533,9 +533,8 @@ fn dequantize_mul_mat_vec_via_cublas(
     let data_f32 = storage.dequantize(nrows * ncols)?;
     // cuBLAS: result[b, m, nrows] = rhs[b, m, ncols] @ data_f32[nrows, ncols]^T
     // Weights [nrows, ncols] row-major => transposed view [ncols, nrows] (swap strides).
-    let weight_l =
-        crate::Layout::new((ncols, nrows).into(), vec![1, ncols], 0)
-            .broadcast_as((b, ncols, nrows))?;
+    let weight_l = crate::Layout::new((ncols, nrows).into(), vec![1, ncols], 0)
+        .broadcast_as((b, ncols, nrows))?;
     rhs.matmul(&data_f32, (b, m, nrows, ncols), rhs_l, &weight_l)
 }
 
@@ -728,7 +727,19 @@ fn mul_mat_vec_via_q8_1(
         GgmlDType::IQ1M => "mul_mat_vec_iq1_m_q8_1_cuda",
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
-    let kernel_name = format!("{kernel_name}{b_size}");
+    let hoisted_mode = std::env::var("QWEN36_MMVQ_HOISTED");
+    let use_hoisted = (2..=8).contains(&b_size)
+        && match dtype {
+            GgmlDType::Q2K => hoisted_mode.as_deref() == Ok("all"),
+            GgmlDType::Q4K => hoisted_mode.as_deref() != Ok("0"),
+            GgmlDType::Q6K => hoisted_mode.as_deref() == Ok("all"),
+            _ => false,
+        };
+    let kernel_name = if use_hoisted {
+        format!("{kernel_name}{b_size}_hoisted")
+    } else {
+        format!("{kernel_name}{b_size}")
+    };
     let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
     let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
     // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98
@@ -975,7 +986,14 @@ fn indexed_moe_forward_dispatch(
         eprintln!(
             "[moe] {} dtype={:?} grid=({},{},{}) n={} k={} batch={} topk={} gpu={:.1}ms",
             if use_grouped { "GROUPED" } else { "BASIC" },
-            w_dtype, n, batch, topk, n, k, batch, topk,
+            w_dtype,
+            n,
+            batch,
+            topk,
+            n,
+            k,
+            batch,
+            topk,
             t0.elapsed().as_secs_f64() * 1e3,
         );
     }
@@ -1006,7 +1024,11 @@ impl QCudaStorage {
     ) -> Result<(CudaStorage, CudaStorage, crate::Shape)> {
         let dtype = self.dtype();
         if dtype != other.dtype() {
-            crate::bail!("dual moe: dtype mismatch {:?} vs {:?}", dtype, other.dtype());
+            crate::bail!(
+                "dual moe: dtype mismatch {:?} vs {:?}",
+                dtype,
+                other.dtype()
+            );
         }
         let input_storage = input.as_cuda_slice::<f32>()?;
         let input_view = contiguous_view(input_storage, input_l, "input")?;
@@ -1072,7 +1094,14 @@ impl QCudaStorage {
             let _ = dev.cuda_stream().synchronize();
             eprintln!(
                 "[moe2] dtype={:?} grid=({},{},{}) n={} k={} batch={} topk={} gpu={:.1}ms",
-                dtype, n, batch, topk, n, k, batch, topk,
+                dtype,
+                n,
+                batch,
+                topk,
+                n,
+                k,
+                batch,
+                topk,
                 t0.elapsed().as_secs_f64() * 1e3,
             );
         }
@@ -1766,10 +1795,12 @@ impl QCudaStorage {
         );
         // Кэшированная полная деквантизация (A100 80GB): один matmul по кэшу
         // вместо tiled dequant каждый вызов.
-        if is_iq && dequant_cache_enabled() && !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+        if is_iq
+            && dequant_cache_enabled()
+            && !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
+        {
             let w = self.cached_dequant_f32(n * k)?;
-            let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0)
-                .broadcast_as((b, k, n))?;
+            let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
             let out = storage.matmul(w.as_ref(), (b, m, n, k), layout, &rhs_l)?;
             let mut out_shape = layout.shape().dims().to_vec();
             out_shape.pop();
@@ -1777,9 +1808,7 @@ impl QCudaStorage {
             return Ok((out, out_shape.into()));
         }
 
-        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
-            || is_iq
-            {
+        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || is_iq {
             // Tiled dequantize matmul: dequantize weight in row-chunks to avoid
             // allocating the full f32 weight (n*k*4 bytes) which can exceed VRAM
             // headroom during prefill and trigger CUDA unified-memory paging.
@@ -1805,8 +1834,7 @@ impl QCudaStorage {
                 )?;
                 let rhs_l = crate::Layout::new((k, chunk_rows).into(), vec![1, k], 0)
                     .broadcast_as((b, k, chunk_rows))?;
-                let chunk_out =
-                    storage.matmul(&data_f32, (b, m, chunk_rows, k), layout, &rhs_l)?;
+                let chunk_out = storage.matmul(&data_f32, (b, m, chunk_rows, k), layout, &rhs_l)?;
                 chunk_out.copy2d(
                     &mut out_storage,
                     /* d1 */ b * m,
