@@ -133,6 +133,12 @@ impl EntryState {
 pub struct Commands {
     state: Mutex<EntryState>,
     compute_count: AtomicUsize,
+    /// Монотонный счётчик диспатчей за всё время жизни устройства.
+    /// В отличие от `compute_count`, не сбрасывается при смене буфера.
+    /// Нужен, чтобы считать диспатчи на шаг декода: на Metal каждый пуск
+    /// стоит зазор между ядрами, и при сотнях пусков на токен это
+    /// сопоставимо с разрывом по скорости.
+    dispatch_total: AtomicUsize,
     command_queue: CommandQueue,
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
     /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
@@ -168,6 +174,7 @@ impl Commands {
         Ok(Self {
             state: Mutex::new(EntryState::new(cb)),
             compute_count: AtomicUsize::new(0),
+            dispatch_total: AtomicUsize::new(0),
             command_queue,
             compute_per_buffer,
             device,
@@ -175,8 +182,14 @@ impl Commands {
         })
     }
 
+    /// Сколько диспатчей прошло через устройство с момента запуска.
+    pub fn dispatch_total(&self) -> usize {
+        self.dispatch_total.load(Ordering::Relaxed)
+    }
+
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock().unwrap();
+        self.dispatch_total.fetch_add(1, Ordering::Relaxed);
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = count >= self.compute_per_buffer;
 
