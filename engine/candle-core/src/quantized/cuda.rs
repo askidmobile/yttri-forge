@@ -731,7 +731,10 @@ fn mul_mat_vec_via_q8_1(
     let use_hoisted = (2..=8).contains(&b_size)
         && match dtype {
             GgmlDType::Q2K => hoisted_mode.as_deref() == Ok("all"),
-            GgmlDType::Q4K => hoisted_mode.as_deref() != Ok("0"),
+            // По умолчанию ВЫКЛЮЧЕНО: на модели опыт дал 0.2%, а у Q6_K и Q2_K
+            // (кванты рабочей Ornith и целевой 27B) — регресс. Хранится ради
+            // истории замеров, включается явно.
+            GgmlDType::Q4K => hoisted_mode.as_deref() == Ok("1"),
             GgmlDType::Q6K => hoisted_mode.as_deref() == Ok("all"),
             _ => false,
         };
