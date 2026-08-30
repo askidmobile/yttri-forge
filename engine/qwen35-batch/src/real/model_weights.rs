@@ -4835,7 +4835,7 @@ impl GatedAttentionLayer {
                 {
                     let src = sp.as_cuda_slice::<half::f16>()?;
                     let dst = dp.as_cuda_slice::<half::f16>()?;
-                    let stream = dst.device.cuda_stream();
+                    let stream = pool_t.device().as_cuda_device()?.cuda_stream();
                     let (src_ptr, _) = cudarc::driver::DevicePtr::device_ptr(src, &stream);
                     let (dst_ptr, _) = cudarc::driver::DevicePtr::device_ptr(dst, &stream);
                     let pages = len.div_ceil(ps);
@@ -4914,7 +4914,7 @@ impl GatedAttentionLayer {
             {
                 let src = rp.as_cuda_slice::<half::f16>()?;
                 let dst = pp.as_cuda_slice::<half::f16>()?;
-                let stream = dst.device.cuda_stream();
+                let stream = pool_t.device().as_cuda_device()?.cuda_stream();
                 let (src_ptr, _) = cudarc::driver::DevicePtr::device_ptr(src, &stream);
                 let (dst_ptr, _) = cudarc::driver::DevicePtr::device_ptr(dst, &stream);
                 let pages = len.div_ceil(ps);
