@@ -5188,6 +5188,50 @@ pub struct BatchedStateCheckpoint {
 }
 
 impl StateSnapshot {
+    /// Копия снимка с тензорами внимания в системной памяти (host).
+    /// DeltaNet-состояние уже `Vec<f32>` — переносится как есть (clone).
+    /// Нужен префикс-кешу: хранить снимки в VRAM нельзя (выселение KV-пула WDDM).
+    pub fn to_host(&self) -> Result<StateSnapshot> {
+        self.to_device(&Device::Cpu)
+    }
+
+    /// Копия снимка с тензорами внимания на `device`.
+    pub fn to_device(&self, device: &Device) -> Result<StateSnapshot> {
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|b| match b {
+                BlockStateSnap::DeltaNet(dn) => Ok(BlockStateSnap::DeltaNet(dn.clone())),
+                BlockStateSnap::Attention(kv_opt) => Ok(BlockStateSnap::Attention(match kv_opt {
+                    None => None,
+                    Some(kv) => Some(KvCacheSnap {
+                        k: kv.k.to_device(device)?,
+                        v: kv.v.to_device(device)?,
+                        // Масштабы обязаны ехать вместе с байтами: Q8-снимок
+                        // без них численного смысла не имеет.
+                        k_scale: kv
+                            .k_scale
+                            .as_ref()
+                            .map(|t| t.to_device(device))
+                            .transpose()?,
+                        v_scale: kv
+                            .v_scale
+                            .as_ref()
+                            .map(|t| t.to_device(device))
+                            .transpose()?,
+                        cache_len: kv.cache_len,
+                        from_pool: kv.from_pool,
+                    }),
+                })),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(StateSnapshot {
+            model_nonce: self.model_nonce,
+            position: self.position,
+            blocks,
+        })
+    }
+
     /// Приблизительный размер snapshot в байтах (T-328, FR-004).
     ///
     /// Используется PromptCacheStore для LRU-вытеснения по бюджету памяти.
@@ -10070,3 +10114,91 @@ mod q8_kv_tests {
 pub(crate) type SlotIdsDev<'a> = Option<&'a cudarc::driver::CudaSlice<u32>>;
 #[cfg(not(feature = "cuda"))]
 pub(crate) type SlotIdsDev<'a> = Option<&'a ()>;
+
+/// to_host/to_device: K/V-тензоры снимка переносятся между устройством и host.
+#[cfg(test)]
+mod snapshot_host_device_tests {
+    use super::*;
+
+    fn snap_with_kv(device: &Device) -> StateSnapshot {
+        StateSnapshot {
+            model_nonce: 7,
+            position: 5,
+            blocks: vec![
+                BlockStateSnap::DeltaNet(DeltaNetStateSnap {
+                    conv_buf: vec![1.0; 8],
+                    ssm_state: vec![2.0; 8],
+                }),
+                BlockStateSnap::Attention(Some(KvCacheSnap {
+                    k: Tensor::zeros((1, 2, 4, 8), DType::F32, device).unwrap(),
+                    v: Tensor::zeros((1, 2, 4, 8), DType::F32, device).unwrap(),
+                    k_scale: None,
+                    v_scale: None,
+                    cache_len: 4,
+                    from_pool: false,
+                })),
+            ],
+        }
+    }
+
+    #[test]
+    fn to_host_then_to_device_roundtrip() -> Result<()> {
+        let snap = snap_with_kv(&Device::Cpu);
+        let host = snap.to_host()?;
+        match &host.blocks[1] {
+            BlockStateSnap::Attention(Some(kv)) => {
+                assert!(kv.k.device().is_cpu() && kv.v.device().is_cpu());
+                assert_eq!(kv.cache_len, 4);
+            }
+            _ => panic!("attention snap потерян"),
+        }
+        match (&snap.blocks[0], &host.blocks[0]) {
+            (BlockStateSnap::DeltaNet(a), BlockStateSnap::DeltaNet(b)) => {
+                assert_eq!(a.conv_buf, b.conv_buf);
+            }
+            _ => panic!("deltanet snap потерян"),
+        }
+        let back = host.to_device(&Device::Cpu)?;
+        match &back.blocks[1] {
+            BlockStateSnap::Attention(Some(kv)) => {
+                assert!(kv.k.device().is_cpu() && kv.v.device().is_cpu());
+                assert_eq!(kv.k.dims4()?, (1, 2, 4, 8));
+            }
+            _ => panic!("attention snap потерян"),
+        }
+        assert_eq!(back.model_nonce, 7);
+        assert_eq!(back.position, 5);
+        Ok(())
+    }
+
+    /// Масштабы Q8 обязаны ехать вместе с байтами: снимок int8-пула без них
+    /// численного смысла не имеет. Первая версия переноса их теряла молча —
+    /// компилятор поймал только потому, что поля обязательные.
+    #[test]
+    fn q8_scales_survive_transfer() -> Result<()> {
+        let dev = Device::Cpu;
+        let snap = StateSnapshot {
+            model_nonce: 1,
+            position: 4,
+            blocks: vec![BlockStateSnap::Attention(Some(KvCacheSnap {
+                k: Tensor::zeros((1, 2, 4, 8), DType::U8, &dev)?,
+                v: Tensor::zeros((1, 2, 4, 8), DType::U8, &dev)?,
+                k_scale: Some(Tensor::zeros((1, 2, 4), DType::F16, &dev)?),
+                v_scale: Some(Tensor::zeros((1, 2, 4), DType::F16, &dev)?),
+                cache_len: 4,
+                from_pool: true,
+            }))],
+        };
+        assert!(matches!(&snap.blocks[0], BlockStateSnap::Attention(Some(kv)) if kv.is_q8()));
+        let back = snap.to_host()?.to_device(&dev)?;
+        match &back.blocks[0] {
+            BlockStateSnap::Attention(Some(kv)) => {
+                assert!(kv.is_q8(), "после переноса снимок перестал быть Q8: масштабы потеряны");
+                assert_eq!(kv.k_scale.as_ref().expect("k_scale").dims3()?, (1, 2, 4));
+                assert!(kv.from_pool, "признак страничного пула потерян");
+            }
+            _ => panic!("attention snap потерян"),
+        }
+        Ok(())
+    }
+}

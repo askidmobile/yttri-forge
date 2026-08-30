@@ -633,6 +633,11 @@ impl Qwen35BatchAdapter {
     }
 
     /// Делегированный доступ к модели (для profiling / debug_capture).
+    /// Устройство, на котором загружена модель (перенос снимков префикс-кеша).
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     pub fn model(&self) -> &ModelWeights {
         &self.model
     }
