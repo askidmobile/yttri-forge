@@ -374,6 +374,12 @@ pub struct Qwen35BatchAdapter {
     /// consumes explicitly loaded component and per-request payloads.
     vision: Option<Qwen35Vision>,
     mtp: Option<Qwen35Mtp>,
+    /// Per-slot MTP state matches the target state. Prefix-cache snapshots
+    /// currently contain only the target model; after injecting one, the MTP
+    /// head has neither its attention KV nor the previous target hidden row.
+    /// Speculation must stay disabled for that request until MTP snapshots are
+    /// added to the cache format.
+    mtp_slot_aligned: Vec<bool>,
     /// Диагностический буфер (QWEN36_DEBUG_ALLOC_MB), см. load_mtp.
     debug_alloc: Option<Tensor>,
     target_transactions: Vec<Option<BatchedStateCheckpoint>>,
@@ -556,6 +562,7 @@ impl Qwen35BatchAdapter {
             graph_failures: 0,
             vision: None,
             mtp: None,
+            mtp_slot_aligned: vec![true; num_slots],
             debug_alloc: None,
             target_transactions: (0..num_slots).map(|_| None).collect(),
             verified_target_hidden: (0..num_slots).map(|_| Vec::new()).collect(),
@@ -630,6 +637,15 @@ impl Qwen35BatchAdapter {
     pub fn inject_slot_snapshot(&mut self, slot: usize, snap: StateSnapshot) {
         self.slot_snaps[slot] = Some(snap);
         self.slot_seeded[slot] = false;
+        self.mtp_slot_aligned[slot] = false;
+        if self.state_owner.map(|(owner, _)| owner) == Some(slot) {
+            self.state_owner = None;
+        }
+        if self.mtp.is_some() {
+            eprintln!(
+                "[mtp] slot {slot}: prefix-cache snapshot has no MTP state; speculation disabled for this request"
+            );
+        }
     }
 
     /// Делегированный доступ к модели (для profiling / debug_capture).
@@ -735,6 +751,9 @@ impl Qwen35BatchAdapter {
             self.debug_alloc = Some(t);
         }
         self.mtp = Some(mtp);
+        for (slot, aligned) in self.mtp_slot_aligned.iter_mut().enumerate() {
+            *aligned = self.slot_snaps[slot].is_none() && !self.slot_seeded[slot];
+        }
         Ok(())
     }
 
@@ -743,6 +762,7 @@ impl Qwen35BatchAdapter {
             return Err(anyhow!("cannot unload MTP during active transaction"));
         }
         self.mtp = None;
+        self.mtp_slot_aligned.fill(true);
         Ok(())
     }
 
@@ -758,6 +778,7 @@ impl Qwen35BatchAdapter {
         for f in self.slot_seeded.iter_mut() {
             *f = false;
         }
+        self.mtp_slot_aligned.fill(true);
         for delta in &mut self.rope_deltas {
             *delta = 0;
         }
@@ -895,6 +916,11 @@ impl BatchModel for Qwen35BatchAdapter {
             self.slot_snaps[sidx] = None;
             self.slot_prefix_snaps[sidx] = None;
             self.slot_seeded[sidx] = false;
+            if let Some(mtp) = self.mtp.as_mut() {
+                mtp.reset_slot(sidx)
+                    .map_err(|error| anyhow!("reset MTP slot {sidx} before prefill: {error}"))?;
+            }
+            self.mtp_slot_aligned[sidx] = true;
             #[cfg(feature = "cuda")]
             {
                 self.paged_dirty[sidx] = true;
@@ -962,7 +988,9 @@ impl BatchModel for Qwen35BatchAdapter {
             // адаптивная ширина молча выключает спекуляцию (drafted=2 accepted=0).
             #[cfg(feature = "cuda")]
             let mi = match self.pg_last_hidden.take() {
-                Some(hidden) if self.multimodal[sidx].is_none() => {
+                Some(hidden)
+                    if self.multimodal[sidx].is_none() && self.mtp_slot_aligned[sidx] =>
+                {
                     // Именно embed_for_graph, а не embed_tokens: при GPU_ONLY=1
                     // хостовая таблица намеренно опустошается ради освобождения
                     // mmap на весь GGUF, и её forward обязан не вызываться. Этот
@@ -1033,7 +1061,7 @@ impl BatchModel for Qwen35BatchAdapter {
                 .forward_embeds_mrope_with_hidden(&embeds, &plan, chunk.start_pos)
                 .map_err(|error| anyhow!("multimodal prefill forward: {error}"))?;
             (Some(logits), Some((embeds, hidden)))
-        } else if self.mtp.is_some() {
+        } else if self.mtp.is_some() && self.mtp_slot_aligned[sidx] {
             let embeds = self.model.embed_tokens(&ids, &self.device)?;
             let (logits, hidden) = self
                 .model
@@ -1050,20 +1078,24 @@ impl BatchModel for Qwen35BatchAdapter {
                 None,
             )
         };
-        if let (Some(mtp), Some((embeds, hidden))) = (self.mtp.as_mut(), mtp_inputs) {
-            let rope_positions = self.multimodal[sidx]
-                .as_ref()
-                .map(|media| slice_position_plan(&media.plan, chunk.start_pos, chunk.tokens.len()))
-                .transpose()?
-                .map(|plan| plan.rope_positions);
-            mtp.catch_up(
-                sidx,
-                &embeds,
-                &hidden,
-                chunk.start_pos,
-                rope_positions.as_ref(),
-            )
-            .map_err(|error| anyhow!("MTP prefill catch-up: {error}"))?;
+        if self.mtp_slot_aligned[sidx] {
+            if let (Some(mtp), Some((embeds, hidden))) = (self.mtp.as_mut(), mtp_inputs) {
+                let rope_positions = self.multimodal[sidx]
+                    .as_ref()
+                    .map(|media| {
+                        slice_position_plan(&media.plan, chunk.start_pos, chunk.tokens.len())
+                    })
+                    .transpose()?
+                    .map(|plan| plan.rope_positions);
+                mtp.catch_up(
+                    sidx,
+                    &embeds,
+                    &hidden,
+                    chunk.start_pos,
+                    rope_positions.as_ref(),
+                )
+                .map_err(|error| anyhow!("MTP prefill catch-up: {error}"))?;
+            }
         }
         let pf_fwd = pf_fwd0.elapsed();
         let pf_l0 = std::time::Instant::now();
@@ -1378,6 +1410,7 @@ impl BatchModel for Qwen35BatchAdapter {
     fn speculative_available(&self, slot: usize) -> bool {
         slot < self.slot_seeded.len()
             && self.mtp.is_some()
+            && self.mtp_slot_aligned[slot]
             && self.slot_seeded[slot]
             && self.target_transactions[slot].is_none()
     }
@@ -1634,6 +1667,9 @@ impl BatchModel for Qwen35BatchAdapter {
         }
         self.slot_snaps[idx] = None;
         self.slot_seeded[idx] = false;
+        if self.state_owner.map(|(owner, _)| owner) == Some(idx) {
+            self.state_owner = None;
+        }
         self.multimodal[idx] = None;
         self.rope_deltas[idx] = 0;
         self.target_transactions[idx] = None;
@@ -1656,6 +1692,7 @@ impl BatchModel for Qwen35BatchAdapter {
             mtp.reset_slot(idx)
                 .map_err(|error| anyhow!("reset MTP slot {idx}: {error}"))?;
         }
+        self.mtp_slot_aligned[idx] = true;
         Ok(())
     }
 }
