@@ -23,7 +23,7 @@ use std::path::Path;
 use crate::model::{BatchModel, DecodeBatch, MultimodalPrefill, PrefillChunk};
 use crate::real::model_profile::ModelProfile;
 use crate::real::model_weights::{
-    BatchedStateCheckpoint, ModelWeights, StateSnapshot, DECODE_BATCH_CAPACITY,
+    BatchedStateCheckpoint, BlockStateSnap, ModelWeights, StateSnapshot, DECODE_BATCH_CAPACITY,
 };
 #[cfg(feature = "cuda")]
 use crate::real::model_weights::GRAPH_MIN_FREE_BYTES;
@@ -884,14 +884,19 @@ impl BatchModel for Qwen35BatchAdapter {
             if let Some((prev, prev_pos)) = self.state_owner {
                 let snap = self
                     .model
-                    .snapshot_state(&self.device, prev_pos)
+                    .snapshot_slot_state(&self.device, prev, prev_pos)
                     .map_err(|e| anyhow!("prefill snapshot (передача владения слоту {sidx}): {e}"))?;
                 self.slot_snaps[prev] = Some(snap);
             }
             let snap = self.slot_snaps[sidx].as_ref().unwrap();
-            self.model
-                .restore_state(&self.device, snap)
+            let pool_ok = self
+                .model
+                .restore_slot_state(&self.device, sidx, snap)
                 .map_err(|e| anyhow!("prefill restore: {e}"))?;
+            // Перезалитый пул снова авторитетен: graph-префилл продолжит
+            // append с kv_len_host = cache_len снимка. Если пул недоступен
+            // (не CUDA / int8) — авторитет остаётся за single-slot/batched.
+            self.paged_dirty[sidx] = !pool_ok;
         } else {
             return Err(anyhow!(
                 "prefill_chunk: slot {sidx} без snapshot и не reset"
@@ -1107,7 +1112,7 @@ impl BatchModel for Qwen35BatchAdapter {
         if chunk.is_final {
             let snap = self
                 .model
-                .snapshot_state(&self.device, new_pos)
+                .snapshot_slot_state(&self.device, sidx, new_pos)
                 .map_err(|e| anyhow!("prefill snapshot: {e}"))?;
             self.slot_snaps[sidx] = Some(snap);
             self.model
@@ -1151,8 +1156,12 @@ impl BatchModel for Qwen35BatchAdapter {
             // eager-путь.
             self.model
                 .set_kv_len_batched(sidx, chunk.start_pos + chunk.tokens.len());
-        } else if pg_logits.is_some() {
-            // check-режим: авторитет — batched KV eager-пути, пул пересоберётся.
+        } else if pg_logits.is_none() {
+            // Paged-проход не исполнялся (гейты/ошибка): чанк ушёл в обычный
+            // eager single-slot forward, строк этого чанка в пуле нет —
+            // авторитет single-slot/batched. Случай pg_logits.is_some() без
+            // pg_used — paged-прогрев без захвата (t < порога): пул УЖЕ
+            // содержит строки чанка, трогать dirty нельзя.
             self.paged_dirty[sidx] = true;
         }
 
@@ -1195,7 +1204,16 @@ impl BatchModel for Qwen35BatchAdapter {
                 self.slot_seeded[sidx] = true;
                 #[cfg(feature = "cuda")]
                 {
-                    self.paged_dirty[sidx] = true;
+                    // Seed из pool-снимка (from_pool) НЕ меняет содержимое пула:
+                    // attention не материализуется в batched-кэш, пул остаётся
+                    // авторитетным. Seed из single-slot-снимка кладёт строки в
+                    // batched-кэш, а в пуле их нет → пул устарел (dirty).
+                    let pool_authoritative = self.model.paged_ctx.is_some()
+                        && snap.blocks.iter().all(|b| match b {
+                            BlockStateSnap::Attention(Some(s)) => s.from_pool,
+                            _ => true,
+                        });
+                    self.paged_dirty[sidx] = !pool_authoritative;
                     // Seed меняет состав state — graph состав-зависим, инвалидируем.
                     if !self.decode_graphs.is_empty() {
                         self.decode_graphs.clear();
