@@ -42,6 +42,13 @@ pub struct PagedAttn<'a> {
     pub window_left: i32,
     pub window_right: i32,
     pub page_block_size: usize,
+    /// Все элементы batch читают одну строку block_table. Нужен слитой
+    /// MTP-проверке: позиции одного слота имеют разные длины K, но общий KV-пул.
+    pub shared_block_table: bool,
+    /// Строк запроса на одну позицию (свёртка GQA, one-pass verify): строка r
+    /// запроса [k*ngroups, h_k, d] — это (позиция r/ngroups, группа r%ngroups),
+    /// и причинная граница маски считается по позиции. 0 — обычная раскладка.
+    pub rows_per_position: usize,
 }
 
 fn round_multiple(x: usize, m: usize) -> usize {
@@ -83,6 +90,29 @@ impl PagedAttn<'_> {
                 self.d
             );
         }
+        let (q_rows, q_heads, q_dim) = self.q.dims3()?;
+        if (q_heads, q_dim) != (self.h, self.d) {
+            candle_core::bail!(
+                "paged_attn: q shape {:?}, ожидалось [total_q, {}, {}]",
+                self.q.dims(),
+                self.h,
+                self.d
+            );
+        }
+        if self.out.dims3()? != (q_rows, self.h, self.d) {
+            candle_core::bail!(
+                "paged_attn: out shape {:?} не совпадает с q {:?}",
+                self.out.dims(),
+                self.q.dims()
+            );
+        }
+        let (table_rows, _) = self.block_table.dims2()?;
+        let required_rows = if self.shared_block_table { 1 } else { self.b };
+        if table_rows < required_rows {
+            candle_core::bail!(
+                "paged_attn: block_table имеет {table_rows} строк, нужно {required_rows}"
+            );
+        }
         Ok(())
     }
 
@@ -104,12 +134,7 @@ impl PagedAttn<'_> {
                 h_k as u32,
                 1,
             ),
-            None => (
-                std::ptr::null(),
-                std::ptr::null(),
-                0u32,
-                0,
-            ),
+            None => (std::ptr::null(), std::ptr::null(), 0u32, 0),
         };
         // Шаг по блоку у масштабов — как у пула, но без измерения head_dim.
         let scale_batch_stride = (self.page_block_size * h_k) as u32;
@@ -152,7 +177,11 @@ impl PagedAttn<'_> {
                 round_multiple(self.max_seqlen_k, 128) as u32,
                 self.q.dim(0)? as u32,
                 0, // is_bf16
-                if self.window_left < 0 && self.window_right == 0 { 1 } else { 0 },
+                if self.window_left < 0 && self.window_right == 0 {
+                    1
+                } else {
+                    0
+                },
                 1, // unpadded_lse: varlen
                 if self.window_left < 0 && self.window_right >= 0 {
                     self.max_seqlen_k as i32
@@ -162,7 +191,11 @@ impl PagedAttn<'_> {
                 self.window_right,
                 0.0, // softcap
                 tensor_cuda_ptr(self.block_table)? as *const i32,
-                self.block_table.dim(1)? as u32,
+                if self.shared_block_table {
+                    0
+                } else {
+                    self.block_table.dim(1)? as u32
+                },
                 self.page_block_size as i32,
                 std::ptr::null(),
                 0,
@@ -174,6 +207,7 @@ impl PagedAttn<'_> {
                 scale_batch_stride,
                 scale_row_stride,
                 kv_is_q8,
+                self.rows_per_position as i32,
                 stream.cu_stream() as *mut std::ffi::c_void,
             );
         }

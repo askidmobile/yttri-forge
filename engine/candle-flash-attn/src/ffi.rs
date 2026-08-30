@@ -68,6 +68,9 @@ extern "C" {
         v_scale_row_stride: u32,
         kv_is_q8: c_int,
 
+        // Строк запроса на позицию (свёртка GQA, one-pass verify). 0/1 — выкл.
+        rows_per_position: c_int,
+
         stream_ptr: *mut c_void,
     );
 

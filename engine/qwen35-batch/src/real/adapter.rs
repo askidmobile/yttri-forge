@@ -1790,6 +1790,13 @@ impl Qwen35BatchAdapter {
             let mb = ctx.max_blocks as u32;
             (0..mb).map(|j| slot as u32 * mb + j).collect::<Vec<u32>>()
         };
+        let slot_u = slot as u32;
+        // Однопроходная проверка (QWEN36_VERIFY_ONEPASS) читает seqlens_q
+        // как [0, k*ngroups] (строки запроса свёрнуты по GQA-группам);
+        // построчный и слитый пути этот буфер не читают, префилльный —
+        // читает, но у него verify=false и стейджится обычное t.
+        // (Считается до блока с ctx: там paged_ctx занят mut-заёмом.)
+        let q_rows = if verify { t * self.model.attn_kv_groups() } else { t };
         {
             let ctx = self.model.paged_ctx.as_mut().unwrap();
             // rope_pos_t декода здесь не используется (позиции идут своим
@@ -1800,10 +1807,9 @@ impl Qwen35BatchAdapter {
             lens[slot] = start_pos as u32;
             ctx.reset_kv_len(&lens)
                 .map_err(|e| anyhow!("pgraph {kind} reset_kv_len: {e}"))?;
-            ctx.set_prefill_seqlens_q(t)
+            ctx.set_prefill_seqlens_q(q_rows)
                 .map_err(|e| anyhow!("pgraph {kind} seqlens_q: {e}"))?;
         }
-        let slot_u = slot as u32;
         let emb_shape = if verify { (t, 1usize, self.model.hidden_size()) } else { (1usize, t, self.model.hidden_size()) };
         let fwd = |m: &mut ModelWeights, emb: &Tensor, rope: &Tensor| -> Result<(Tensor, Tensor)> {
             let r = if verify {

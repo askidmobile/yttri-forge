@@ -51,6 +51,11 @@ path = "tests/fa2_paged.rs"
 required-features = ["cuda"]
 
 [[test]]
+name = "fused_verify_attn"
+path = "tests/fused_verify_attn.rs"
+required-features = ["real-model", "cuda"]
+
+[[test]]
 name = "scheduler_parity"
 path = "tests/scheduler_parity.rs"
 

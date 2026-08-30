@@ -23,19 +23,19 @@ use candle_core::{
     DType, Device, IndexOp, Result, Tensor, D,
 };
 use candle_nn::{Module, RmsNorm};
-#[cfg(feature = "cuda")]
-use std::io::Write;
 #[cfg(target_os = "macos")]
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+#[cfg(feature = "cuda")]
+use std::io::Write;
 
 #[cfg(feature = "cuda")]
 use super::delta_rule_batched_cuda;
 #[cfg(feature = "cuda")]
 use super::delta_rule_cuda;
-use super::moe::{ForwardMode, Qwen35MoeBlock};
-use super::multimodal::{PositionPlan, MROPE_DIMENSION_SOURCES};
 #[cfg(target_os = "macos")]
 use super::metal;
+use super::moe::{ForwardMode, Qwen35MoeBlock};
+use super::multimodal::{PositionPlan, MROPE_DIMENSION_SOURCES};
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -1089,9 +1089,7 @@ struct DenseMlp {
 impl DenseMlp {
     /// Префилл-путь: если подключён сайдкар, считаем по нему (dual-read).
     fn forward_prefill(&self, xs: &Tensor) -> Result<Tensor> {
-        let (Some(w1t), Some(w3t), Some(w2t)) =
-            (&self.f16_w1, &self.f16_w3, &self.f16_w2)
-        else {
+        let (Some(w1t), Some(w3t), Some(w2t)) = (&self.f16_w1, &self.f16_w3, &self.f16_w2) else {
             return self.forward(xs);
         };
         let w1 = w1t.forward(xs)?;
@@ -1105,8 +1103,10 @@ impl Module for DenseMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         #[cfg(target_os = "macos")]
         {
-            let w1 = dispatch_q4k_matmul(&self.feed_forward_w1, self.feed_forward_w1_opt.as_ref(), xs)?;
-            let w3 = dispatch_q4k_matmul(&self.feed_forward_w3, self.feed_forward_w3_opt.as_ref(), xs)?;
+            let w1 =
+                dispatch_q4k_matmul(&self.feed_forward_w1, self.feed_forward_w1_opt.as_ref(), xs)?;
+            let w3 =
+                dispatch_q4k_matmul(&self.feed_forward_w3, self.feed_forward_w3_opt.as_ref(), xs)?;
             let silu_mul = w1.silu_mul_direct(&w3)?;
             return dispatch_q4k_matmul(
                 &self.feed_forward_w2,
@@ -1116,9 +1116,10 @@ impl Module for DenseMlp {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(xs).ok().flatten();
-            let g2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2")
-                && xs.device().is_cuda();
+            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(xs)
+                .ok()
+                .flatten();
+            let g2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2") && xs.device().is_cuda();
             let sync = || {
                 if g2 {
                     if let Ok(c) = xs.device().as_cuda_device() {
@@ -1128,8 +1129,12 @@ impl Module for DenseMlp {
                 std::time::Instant::now()
             };
             let t0 = sync();
-            let w1 = self.feed_forward_w1.forward_with_prequant(xs, prequant.as_ref())?;
-            let w3 = self.feed_forward_w3.forward_with_prequant(xs, prequant.as_ref())?;
+            let w1 = self
+                .feed_forward_w1
+                .forward_with_prequant(xs, prequant.as_ref())?;
+            let w3 = self
+                .feed_forward_w3
+                .forward_with_prequant(xs, prequant.as_ref())?;
             let t13 = sync();
             let silu_mul = w1.silu_mul_direct(&w3)?;
             let ts = sync();
@@ -1672,13 +1677,13 @@ struct DeltaNetCudaContextBatched {
 /// - Gated output через SiLU
 struct DeltaNetLayer {
     /// Joint QKV проекция: [n_embd] → [key_dim*2 + value_dim]
-/// yttri-forge stage1: F16-проекции prefill (dual-read).
+    /// yttri-forge stage1: F16-проекции prefill (dual-read).
     pub(crate) f16_wqkv: Option<QMatMul>,
     pub(crate) f16_wgate: Option<QMatMul>,
     pub(crate) f16_w_beta: Option<QMatMul>,
     pub(crate) f16_w_alpha: Option<QMatMul>,
     pub(crate) f16_ssm_out: Option<QMatMul>,
-        wqkv: QMatMul,
+    wqkv: QMatMul,
     /// Gate (z) проекция: [n_embd] → [value_dim]
     wgate: QMatMul,
     /// Beta проекция: [n_embd] → [n_v_heads]
@@ -2095,7 +2100,11 @@ impl DeltaNetLayer {
         // batched-ядро по оси B дало бы гонку на slot-регионе. Строки прогоняются
         // тем же ядром с batch_size=1 по порядку — бит-эксактно K одиночным шагам.
         // Проекции выше уже сделаны батчем (веса читаются один раз на K строк).
-        let serial_rows = b > 1 && slots.iter().enumerate().any(|(i, s)| slots[..i].contains(s));
+        let serial_rows = b > 1
+            && slots
+                .iter()
+                .enumerate()
+                .any(|(i, s)| slots[..i].contains(s));
 
         // ── Metal batched path: 4 batched kernel'а на GPU (slot ось B) ──
         #[cfg(target_os = "macos")]
@@ -2133,18 +2142,20 @@ impl DeltaNetLayer {
                 batched_out_metal = Some(Tensor::cat(&rows, 0)?);
             } else {
                 ctx.params.batch_size = b as u32;
-                batched_out_metal = Some(metal::delta_rule_batched_metal::dispatch_delta_rule_batched(
-                    metal_device,
-                    &ctx.pipelines,
-                    &ctx.layer_state,
-                    &ctx.temp,
-                    &ctx.params,
-                    &qkv_t,
-                    &z_t,
-                    &beta_t,
-                    &alpha_t,
-                    slots,
-                )?);
+                batched_out_metal = Some(
+                    metal::delta_rule_batched_metal::dispatch_delta_rule_batched(
+                        metal_device,
+                        &ctx.pipelines,
+                        &ctx.layer_state,
+                        &ctx.temp,
+                        &ctx.params,
+                        &qkv_t,
+                        &z_t,
+                        &beta_t,
+                        &alpha_t,
+                        slots,
+                    )?,
+                );
             }
         }
         #[cfg(target_os = "macos")]
@@ -2223,8 +2234,10 @@ impl DeltaNetLayer {
         // ── CPU fallback: per-slot loop через cpu_state_batched (без batched GPU ctx) ──
         #[cfg(feature = "cuda")]
         if crate::scheduler::trace_on() {
-            eprintln!("[fdb] DeltaNet decode: CPU fallback (cuda_ctx_batched={})",
-                self.cuda_ctx_batched.is_some());
+            eprintln!(
+                "[fdb] DeltaNet decode: CPU fallback (cuda_ctx_batched={})",
+                self.cuda_ctx_batched.is_some()
+            );
         }
         //
         // Math per slot идентичен single-token `forward` CPU path (lines ~1593-1727):
@@ -2343,12 +2356,10 @@ impl DeltaNetLayer {
                     (q_norm, k_norm)
                 };
 
-                let q_scaled: Vec<f32> =
-                    q_expanded.iter().map(|&v| v * q_scale).collect();
+                let q_scaled: Vec<f32> = q_expanded.iter().map(|&v| v * q_scale).collect();
 
                 // delta_rule_step — allocating variant (мутирует st.ssm_state).
-                let output_raw =
-                    st.delta_rule_step(&q_scaled, &k_expanded, v_flat, &beta, &gate);
+                let output_raw = st.delta_rule_step(&q_scaled, &k_expanded, v_flat, &beta, &gate);
 
                 // Group RMS Norm per head + gated output (SiLU(z)).
                 for h in 0..n_v_heads {
@@ -2433,7 +2444,9 @@ impl DeltaNetLayer {
         #[cfg(not(target_os = "macos"))]
         let dn_proj_ms = {
             if dn_gpf3 {
-                if let Device::Cuda(c) = &device { let _ = c.cuda_stream().synchronize(); }
+                if let Device::Cuda(c) = &device {
+                    let _ = c.cuda_stream().synchronize();
+                }
             }
             dn_tp.elapsed().as_secs_f64() * 1e3
         };
@@ -2506,7 +2519,9 @@ impl DeltaNetLayer {
             if !disable_fused {
                 let gprof2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2");
                 let t0 = std::time::Instant::now();
-                if gprof2 { let _ = ctx.dev.cuda_stream().synchronize(); }
+                if gprof2 {
+                    let _ = ctx.dev.cuda_stream().synchronize();
+                }
                 let gated_all = delta_rule_cuda::dispatch_delta_rule_prefill(
                     &ctx.dev,
                     &mut ctx.layer_state,
@@ -2518,7 +2533,10 @@ impl DeltaNetLayer {
                 )?;
                 if gprof2 {
                     let _ = ctx.dev.cuda_stream().synchronize();
-                    eprintln!("[pfstep] delta seq={:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
+                    eprintln!(
+                        "[pfstep] delta seq={:.2}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
                 }
                 let dn_th = std::time::Instant::now();
                 let r = match &self.f16_ssm_out {
@@ -2526,7 +2544,9 @@ impl DeltaNetLayer {
                     None => self.ssm_out.forward(&gated_all),
                 };
                 if dn_gpf3 {
-                    if let Device::Cuda(c) = &device { let _ = c.cuda_stream().synchronize(); }
+                    if let Device::Cuda(c) = &device {
+                        let _ = c.cuda_stream().synchronize();
+                    }
                     eprintln!(
                         "[pfp-delta] proj={:.1} fused={:.1} head={:.1}",
                         dn_proj_ms,
@@ -3031,10 +3051,7 @@ impl BatchedKvCache {
                 let ks = c.k_s.narrow(1, 0, len)?.contiguous()?;
                 let vq = c.v_q.narrow(1, 0, len)?.contiguous()?;
                 let vs = c.v_s.narrow(1, 0, len)?.contiguous()?;
-                Ok((
-                    q8_dequantize_rows(&kq, &ks)?,
-                    q8_dequantize_rows(&vq, &vs)?,
-                ))
+                Ok((q8_dequantize_rows(&kq, &ks)?, q8_dequantize_rows(&vq, &vs)?))
             }
             Self::F16(c) => Ok((
                 c.k.narrow(1, 0, len)?.contiguous()?,
@@ -3181,7 +3198,11 @@ fn ytf16_rel_error(gguf: &QMatMul, sidecar: &QMatMul) -> Result<f32> {
     }
     let scale = g.abs()?.mean_all()?.to_scalar::<f32>()?;
     let diff = (&g - &f)?.abs()?.mean_all()?.to_scalar::<f32>()?;
-    Ok(if scale > 0.0 { diff / scale } else { f32::INFINITY })
+    Ok(if scale > 0.0 {
+        diff / scale
+    } else {
+        f32::INFINITY
+    })
 }
 
 /// Сверка F16-сайдкара с деквантованным GGUF-весом: форма + max/mean |diff|.
@@ -3191,7 +3212,11 @@ fn audit_ytf16(name: &str, gguf: &QMatMul, sidecar: &QMatMul) {
         let g = gguf.dequantize_f16()?.to_dtype(DType::F32)?;
         let f = sidecar.dequantize_f16()?.to_dtype(DType::F32)?;
         if g.dims() != f.dims() {
-            return Ok(format!("shape MISMATCH gguf={:?} sidecar={:?}", g.dims(), f.dims()));
+            return Ok(format!(
+                "shape MISMATCH gguf={:?} sidecar={:?}",
+                g.dims(),
+                f.dims()
+            ));
         }
         let d = (&g - &f)?.abs()?;
         let max = d.max_all()?.to_scalar::<f32>()?;
@@ -3292,9 +3317,7 @@ impl GatedAttentionLayer {
                 valid_tokens: 0,
             });
         }
-        let Some(mm) = m.as_mut() else {
-            unreachable!()
-        };
+        let Some(mm) = m.as_mut() else { unreachable!() };
         // Рост кэша за ёмкость зеркала: удвоение в рамках бюджета.
         let mut cap_tok = mm.k.elem_count() / row;
         if kv_len > cap_tok {
@@ -3335,20 +3358,16 @@ impl GatedAttentionLayer {
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::Msg("mirror fill: no cache".into()))?;
             let (kt, vt) = cache.prefix_chunk_f16(mm.valid_tokens, cs)?;
-            mm.k
-                .slice_set(&kt.flatten_all()?, 0, mm.valid_tokens * row)?;
-            mm.v
-                .slice_set(&vt.flatten_all()?, 0, mm.valid_tokens * row)?;
+            mm.k.slice_set(&kt.flatten_all()?, 0, mm.valid_tokens * row)?;
+            mm.v.slice_set(&vt.flatten_all()?, 0, mm.valid_tokens * row)?;
             mm.valid_tokens += cs;
         }
-        let k_view = mm
-            .k
-            .narrow(0, 0, kv_len * row)?
-            .reshape((1, kv_len, self.n_kv_head, self.head_dim))?;
-        let v_view = mm
-            .v
-            .narrow(0, 0, kv_len * row)?
-            .reshape((1, kv_len, self.n_kv_head, self.head_dim))?;
+        let k_view =
+            mm.k.narrow(0, 0, kv_len * row)?
+                .reshape((1, kv_len, self.n_kv_head, self.head_dim))?;
+        let v_view =
+            mm.v.narrow(0, 0, kv_len * row)?
+                .reshape((1, kv_len, self.n_kv_head, self.head_dim))?;
         self.kv_mirror[slot] = m;
         Ok(Some((k_view, v_view)))
     }
@@ -3447,11 +3466,7 @@ impl GatedAttentionLayer {
         // если подключён. Decode-пути продолжают использовать GGUF-квант.
         #[cfg(not(target_os = "macos"))]
         let (qg, k, v) = match (&self.f16_q, &self.f16_k, &self.f16_v) {
-            (Some(fq), Some(fk), Some(fv)) => (
-                fq.forward(x)?,
-                fk.forward(x)?,
-                fv.forward(x)?,
-            ),
+            (Some(fq), Some(fk), Some(fv)) => (fq.forward(x)?, fk.forward(x)?, fv.forward(x)?),
             _ => (
                 self.attention_wq.forward(x)?,
                 self.attention_wk.forward(x)?,
@@ -3645,9 +3660,7 @@ impl GatedAttentionLayer {
             // Маска на CPU (Vec<f32> seq×kv на чанк на блок) и F32 matmul
             // уходят — это была основная цена prefill attention.
             #[cfg(feature = "cuda")]
-            if q.device().is_cuda()
-                && std::env::var("QWEN36_DISABLE_FLASH_PREFILL").is_err()
-            {
+            if q.device().is_cuda() && std::env::var("QWEN36_DISABLE_FLASH_PREFILL").is_err() {
                 let at_gpf3 = std::env::var("QWEN36_GPROF").as_deref() == Ok("3");
                 let t_fa = std::time::Instant::now();
                 let q_f = q.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
@@ -3656,16 +3669,18 @@ impl GatedAttentionLayer {
                 let out = candle_flash_attn::flash_attn(&q_f, &k_f, &v_f, scale as f32, true)?;
                 let y = out.transpose(1, 2)?.to_dtype(DType::F32)?;
                 if at_gpf3 {
-                    if let Ok(cd) = q.device().as_cuda_device() { let _ = cd.cuda_stream().synchronize(); }
+                    if let Ok(cd) = q.device().as_cuda_device() {
+                        let _ = cd.cuda_stream().synchronize();
+                    }
                 }
                 let fa_ms = t_fa.elapsed().as_secs_f64() * 1e3;
                 // дальше gate+output projection — как в основном пути
                 let t_wo = std::time::Instant::now();
                 let gate_sigmoid = candle_nn::ops::sigmoid(&gate)?;
                 let y = (y * gate_sigmoid)?;
-                let y = y
-                    .transpose(1, 2)?
-                    .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+                let y =
+                    y.transpose(1, 2)?
+                        .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
                 #[cfg(target_os = "macos")]
                 unreachable!();
                 #[cfg(not(target_os = "macos"))]
@@ -3882,18 +3897,33 @@ impl GatedAttentionLayer {
             candle_core::bail!("paged decode: seq_len must be 1, got {seq_len}");
         }
         // 1. Batched projections (общий prequant Q8_1).
-        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 1. proj"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[attn-paged] 1. proj");
+            let _ = std::io::stderr().flush();
+        }
         let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x)
             .ok()
             .flatten();
-        let qg = self.attention_wq.forward_with_prequant(x, prequant.as_ref())?;
-        let k = self.attention_wk.forward_with_prequant(x, prequant.as_ref())?;
-        let v = self.attention_wv.forward_with_prequant(x, prequant.as_ref())?;
+        let qg = self
+            .attention_wq
+            .forward_with_prequant(x, prequant.as_ref())?;
+        let k = self
+            .attention_wk
+            .forward_with_prequant(x, prequant.as_ref())?;
+        let v = self
+            .attention_wv
+            .forward_with_prequant(x, prequant.as_ref())?;
 
         // 2. Reshape + norms (как eager path).
-        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 2. norms"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[attn-paged] 2. norms");
+            let _ = std::io::stderr().flush();
+        }
         let qg = qg.reshape((b_sz, 1, self.n_head, self.head_dim * 2))?;
-        let q_all = qg.narrow(3, 0, self.head_dim)?.contiguous()?.transpose(1, 2)?;
+        let q_all = qg
+            .narrow(3, 0, self.head_dim)?
+            .contiguous()?
+            .transpose(1, 2)?;
         let gate_all = qg
             .narrow(3, self.head_dim, self.head_dim)?
             .contiguous()?
@@ -3919,14 +3949,20 @@ impl GatedAttentionLayer {
         ))?;
 
         // 3. RoPE по device-позициям (один gather на весь batch).
-        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 3. rope"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[attn-paged] 3. rope");
+            let _ = std::io::stderr().flush();
+        }
         let rope_pos = ctx.rope_pos(b_sz)?;
         let q_rope = self.apply_partial_rotary_emb_devpos(&q_all, &rope_pos)?;
         let k_rope = self.apply_partial_rotary_emb_devpos(&k_all, &rope_pos)?;
 
         // 4. head-last строки. Пул хранит f16, поэтому круговой q8 здесь только
         //    терял точность (оставлен под QWEN36_KV_Q8_ROUNDTRIP=1).
-        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 4. rows"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[attn-paged] 4. rows");
+            let _ = std::io::stderr().flush();
+        }
         let k_hl = k_rope.transpose(1, 2)?.contiguous()?;
         let v_hl = v_all.transpose(1, 2)?.contiguous()?;
         let (k_rows, v_rows) = if kv_exact_f16() {
@@ -3952,7 +3988,10 @@ impl GatedAttentionLayer {
         };
 
         // 5. Append в paged pool (device kv_len).
-        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 5. append"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[attn-paged] 5. append");
+            let _ = std::io::stderr().flush();
+        }
         let pool = self
             .paged_pool
             .as_ref()
@@ -3968,7 +4007,10 @@ impl GatedAttentionLayer {
         )?;
 
         // 6. FA2 varlen paged.
-        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 6. fa2"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[attn-paged] 6. fa2");
+            let _ = std::io::stderr().flush();
+        }
         let q_f16 = q_rope.to_dtype(DType::F16)?.squeeze(2)?.contiguous()?; // [B, n_head, hd]
         let seqlens_q = ctx.seqlens_q(b_sz)?;
         let seqlens_k = ctx.seqlens_k(b_sz)?;
@@ -4003,11 +4045,16 @@ impl GatedAttentionLayer {
             window_left: -1,
             window_right: -1,
             page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+            shared_block_table: false,
+            rows_per_position: 0,
         }
         .forward()?;
 
         // 7. Gate + Wo (как eager path).
-        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 7. out"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[attn-paged] 7. out");
+            let _ = std::io::stderr().flush();
+        }
         let y_all = out.to_dtype(DType::F32)?.unsqueeze(2)?; // [B, n_head, 1, hd]
         let gate_sigmoid = candle_nn::ops::sigmoid(&gate_all)?;
         let y_all = (y_all * gate_sigmoid)?;
@@ -4015,7 +4062,10 @@ impl GatedAttentionLayer {
             .transpose(1, 2)?
             .reshape(&[b_sz, 1, self.n_head * self.head_dim])?;
         let res = self.attention_wo.forward(&y_all);
-        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 8. done"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[attn-paged] 8. done");
+            let _ = std::io::stderr().flush();
+        }
         res
     }
 
@@ -4051,15 +4101,32 @@ impl GatedAttentionLayer {
 
         // 2. Reshape + norms
         let qg = qg.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
-        let q_all = qg.narrow(3, 0, self.head_dim)?.contiguous()?.transpose(1, 2)?;
-        let gate_all = qg.narrow(3, self.head_dim, self.head_dim)?.contiguous()?.transpose(1, 2)?;
-        let k_all = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
-        let v_all = v.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let q_all = qg
+            .narrow(3, 0, self.head_dim)?
+            .contiguous()?
+            .transpose(1, 2)?;
+        let gate_all = qg
+            .narrow(3, self.head_dim, self.head_dim)?
+            .contiguous()?
+            .transpose(1, 2)?;
+        let k_all = k
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?;
+        let v_all = v
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
         let q_all = self.q_norm.forward(&q_all.flatten(0, 2)?)?.reshape((
-            b_sz, self.n_head, seq_len, self.head_dim,
+            b_sz,
+            self.n_head,
+            seq_len,
+            self.head_dim,
         ))?;
         let k_all = self.k_norm.forward(&k_all.flatten(0, 2)?)?.reshape((
-            b_sz, self.n_kv_head, seq_len, self.head_dim,
+            b_sz,
+            self.n_kv_head,
+            seq_len,
+            self.head_dim,
         ))?;
 
         // 3. RoPE по device-позициям [T]. index_select — device-gather (capture-safe),
@@ -4099,10 +4166,20 @@ impl GatedAttentionLayer {
         };
 
         // 5. Append T строк в paged pool
-        let pool = self.paged_pool.as_ref().ok_or_else(|| {
-            candle_core::Error::Msg("paged pool not initialized".into())
-        })?;
-        pool.launch_append_multi(ctx, &k_rows, &v_rows, b_sz, seq_len, self.n_kv_head, self.head_dim, self.attn_window)?;
+        let pool = self
+            .paged_pool
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("paged pool not initialized".into()))?;
+        pool.launch_append_multi(
+            ctx,
+            &k_rows,
+            &v_rows,
+            b_sz,
+            seq_len,
+            self.n_kv_head,
+            self.head_dim,
+            self.attn_window,
+        )?;
 
         // 6. FA2 varlen: q [T, nh, hd], seqlens_q=[0,T], seqlens_k=[0, kv0+T].
         //    seqlens_k заполняется один раз на проход (forward_prefill_graphed),
@@ -4117,7 +4194,18 @@ impl GatedAttentionLayer {
         let block_table = ctx.block_table(b_sz)?;
         let total_q = q_f16.dim(0)?;
         let out = Tensor::zeros(q_f16.shape(), DType::F16, q_f16.device())?;
-        if per_row_gqa {
+        // Выход однопроходного пути живёт в своём буфере (раскладка другая);
+        // после ветвления он переукладывается в общий [k, nh, hd].
+        let mut out_onepass: Option<Tensor> = None;
+        let verify_fused = per_row_gqa
+            && seq_len > 1
+            && std::env::var("QWEN36_VERIFY_FUSED").ok().as_deref() == Some("1");
+        // Однопроходный путь приоритетнее слитого: при обоих переменных
+        // работает ONEPASS (KV читается один раз, а не k раз).
+        let verify_onepass = per_row_gqa
+            && seq_len > 1
+            && std::env::var("QWEN36_VERIFY_ONEPASS").ok().as_deref() == Some("1");
+        if per_row_gqa && !verify_fused && !verify_onepass {
             // Построчно: строка i — декодный вызов (seqlen_q = 1, маска noop),
             // ключи 0..kv0+i задаются через seqlens_k = kv0+i+1. Строки уже
             // дописаны в пул выше, kv_len_dev ещё не инкрементирован.
@@ -4157,9 +4245,105 @@ impl GatedAttentionLayer {
                     window_left: -1,
                     window_right: -1,
                     page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+                    shared_block_table: false,
+                    rows_per_position: 0,
                 }
                 .forward()?;
             }
+        } else if verify_fused && !verify_onepass {
+            // Один FA2-вызов, но каждая проверяемая позиция остаётся отдельным
+            // элементом batch с seqlen_q=1. Так исходный layout [position, head]
+            // сохраняется, а длины K в точности повторяют построчный эталон:
+            // kv0+1, kv0+2, ... Общая page table указывает на тот же слот.
+            let seqlens_q = ctx.seqlens_q_verify(seq_len)?;
+            let seqlens_k = ctx.seqlens_k_for_verify(seq_len)?;
+            let lse = Tensor::zeros((self.n_head, total_q), DType::F32, q_f16.device())?;
+            crate::real::paged_attn::PagedAttn {
+                q: &q_f16,
+                k_pool: &pool.k_pool,
+                v_pool: &pool.v_pool,
+                kv_scales: match (&pool.k_scale, &pool.v_scale) {
+                    (Some(ks), Some(vs)) => Some((ks, vs)),
+                    _ => None,
+                },
+                seqlens_q: &seqlens_q,
+                seqlens_k: &seqlens_k,
+                block_table: &block_table,
+                out: &out,
+                softmax_lse: &lse,
+                b: seq_len,
+                h: self.n_head,
+                h_k: self.n_kv_head,
+                d: self.head_dim,
+                max_seqlen_q: 1,
+                max_seqlen_k: window,
+                softmax_scale: scale,
+                window_left: -1,
+                window_right: -1,
+                page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+                shared_block_table: true,
+                rows_per_position: 0,
+            }
+            .forward()?;
+        } else if verify_onepass {
+            // Однопроходная проверка: KV читается ОДИН раз на весь раунд.
+            // Q [k, nh, hd] переукладывается в [k*ngroups, h_k, hd]: строка r —
+            // это (позиция r/ngroups, группа r%ngroups); все строки одного
+            // kv_head идут через один CTA (голов стало h_k вместо nh). Раскладка
+            // адреса строки — ((p*h_k + hk)*ngroups + g)*d, ровно как требует
+            // свёртка; шаги для [row, hk, d] поверх исходного тензора дают
+            // гонку записей (см. TASK.md), поэтому переукладка явная.
+            // Причинная граница — по позиции (rows_per_position): строка r видит
+            // ключи до kv0 + r/ngroups включительно; seqlens_q = [0, k*ngroups]
+            // (стейджит paged_graph_run в буфер префилла), seqlens_k = [0, kv0+k]
+            // — device-cumsum. Спильная сетка — декодная (flash_api.cu), чтобы
+            // редукция совпадала с построчным эталоном побитово.
+            let ngroups = self.n_head / self.n_kv_head.max(1);
+            let rows = seq_len * ngroups;
+            let q_op = q_f16
+                .reshape((seq_len, self.n_kv_head, ngroups, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((rows, self.n_kv_head, self.head_dim))?;
+            let out_op = Tensor::zeros(q_op.shape(), DType::F16, q_op.device())?;
+            let seqlens_q = ctx.seqlens_q_prefill(); // [0, k*ngroups]
+            let seqlens_k = ctx.seqlens_k_onepass(seq_len)?; // [0, kv0+k]
+            let lse = Tensor::zeros((self.n_kv_head, rows), DType::F32, q_op.device())?;
+            crate::real::paged_attn::PagedAttn {
+                q: &q_op,
+                k_pool: &pool.k_pool,
+                v_pool: &pool.v_pool,
+                kv_scales: match (&pool.k_scale, &pool.v_scale) {
+                    (Some(ks), Some(vs)) => Some((ks, vs)),
+                    _ => None,
+                },
+                seqlens_q: &seqlens_q,
+                seqlens_k: &seqlens_k,
+                block_table: &block_table,
+                out: &out_op,
+                softmax_lse: &lse,
+                b: 1,
+                h: self.n_kv_head,
+                h_k: self.n_kv_head,
+                d: self.head_dim,
+                max_seqlen_q: rows,
+                max_seqlen_k: window,
+                softmax_scale: scale,
+                window_left: -1,
+                // Правое окно 0 — причинность (граница по позиции в mask.h).
+                window_right: 0,
+                page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+                shared_block_table: false,
+                rows_per_position: ngroups,
+            }
+            .forward()?;
+            // Обратная переукладка выхода в [k, nh, hd] для общего gate+wo.
+            let out_permuted = out_op
+                .reshape((seq_len, ngroups, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((b_sz * seq_len, self.n_head, self.head_dim))?;
+            out_onepass = Some(out_permuted);
         } else {
             let seqlens_q = ctx.seqlens_q_prefill();
             let seqlens_k = ctx.seqlens_k(b_sz)?;
@@ -4190,18 +4374,25 @@ impl GatedAttentionLayer {
                 // этого токены чанка видят будущее.
                 window_right: 0,
                 page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+                shared_block_table: false,
+                rows_per_position: 0,
             }
             .forward()?;
         }
+        let out = match out_onepass {
+            Some(t) => t,
+            None => out,
+        };
 
         // 7. Gate + Wo
         let y_all = out.to_dtype(DType::F32)?.unsqueeze(2)?; // [B, T, nh, 1?] — проверка формы
         let y_all = y_all.reshape((b_sz, seq_len, self.n_head, self.head_dim))?;
         let gate_sigmoid = candle_nn::ops::sigmoid(&gate_all)?;
         let y_all = (y_all.transpose(1, 2) * gate_sigmoid)?;
-        let y_all = y_all
-            .transpose(1, 2)?
-            .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+        let y_all =
+            y_all
+                .transpose(1, 2)?
+                .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
         match &self.f16_o {
             Some(fo) => fo.forward(&y_all),
             None => self.attention_wo.forward(&y_all),
@@ -4235,26 +4426,51 @@ impl GatedAttentionLayer {
         let v = dispatch_q4k_matmul(&self.attention_wv, self.attention_wv_opt.as_ref(), x)?;
         #[cfg(not(target_os = "macos"))]
         let (qg, k, v) = {
-            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x).ok().flatten();
-            let qg = self.attention_wq.forward_with_prequant(x, prequant.as_ref())?;
-            let k = self.attention_wk.forward_with_prequant(x, prequant.as_ref())?;
-            let v = self.attention_wv.forward_with_prequant(x, prequant.as_ref())?;
+            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x)
+                .ok()
+                .flatten();
+            let qg = self
+                .attention_wq
+                .forward_with_prequant(x, prequant.as_ref())?;
+            let k = self
+                .attention_wk
+                .forward_with_prequant(x, prequant.as_ref())?;
+            let v = self
+                .attention_wv
+                .forward_with_prequant(x, prequant.as_ref())?;
             (qg, k, v)
         };
 
         // 2. Reshape [B,1,n_head,head_dim*2] -> q [B,n_head,1,hd], gate [B,n_head,1,hd]
         let qg = qg.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
-        let q_all = qg.narrow(3, 0, self.head_dim)?.contiguous()?.transpose(1, 2)?;
-        let gate_all = qg.narrow(3, self.head_dim, self.head_dim)?.contiguous()?.transpose(1, 2)?;
-        let k_all = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
-        let v_all = v.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let q_all = qg
+            .narrow(3, 0, self.head_dim)?
+            .contiguous()?
+            .transpose(1, 2)?;
+        let gate_all = qg
+            .narrow(3, self.head_dim, self.head_dim)?
+            .contiguous()?
+            .transpose(1, 2)?;
+        let k_all = k
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?;
+        let v_all = v
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
 
         // Q-Norm / K-Norm (batched — flatten(0,2) по B*n_head корректно).
         let q_all = self.q_norm.forward(&q_all.flatten(0, 2)?)?.reshape((
-            b_sz, self.n_head, seq_len, self.head_dim,
+            b_sz,
+            self.n_head,
+            seq_len,
+            self.head_dim,
         ))?;
         let k_all = self.k_norm.forward(&k_all.flatten(0, 2)?)?.reshape((
-            b_sz, self.n_kv_head, seq_len, self.head_dim,
+            b_sz,
+            self.n_kv_head,
+            seq_len,
+            self.head_dim,
         ))?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
@@ -4346,12 +4562,8 @@ impl GatedAttentionLayer {
                     );
                 }
                 let init_cap = 512.min(self.attn_window); // Revert: pre-alloc 40960*5B*10attn*2slots = 8.4 GB — catastrophically too much for 12GB VRAM
-                self.kv_cache_batched[slot] = Some(row.empty_like(
-                    init_cap,
-                    self.n_kv_head,
-                    self.head_dim,
-                    &device,
-                )?);
+                self.kv_cache_batched[slot] =
+                    Some(row.empty_like(init_cap, self.n_kv_head, self.head_dim, &device)?);
                 self.kv_cache_len_batched[slot] = 0;
                 self.kv_cache_cap_batched = init_cap;
             }
@@ -4379,14 +4591,11 @@ impl GatedAttentionLayer {
                 self.kv_cache_len_batched[slot] = self.attn_window;
             } else if new_len > current_cap {
                 // Рост буфера. Копируем старое + пишем новое.
-                let new_cap = (new_len + 512).min(self.max_cache_len).min(self.attn_window);
+                let new_cap = (new_len + 512)
+                    .min(self.max_cache_len)
+                    .min(self.attn_window);
                 let old = self.kv_cache_batched[slot].as_ref().unwrap();
-                let new_cache = old.empty_like(
-                    new_cap,
-                    self.n_kv_head,
-                    self.head_dim,
-                    &device,
-                )?;
+                let new_cache = old.empty_like(new_cap, self.n_kv_head, self.head_dim, &device)?;
                 if cache_len > 0 {
                     old.copy_prefix_to(&new_cache, cache_len)?;
                 }
@@ -4418,9 +4627,7 @@ impl GatedAttentionLayer {
             let mut v_opt: Option<Tensor> = None;
             #[cfg(feature = "cuda")]
             if device.is_cuda() && kv_len > 0 {
-                if let Some((mk, mv)) =
-                    self.mirror_prefix(slot, kv_len, &device, budget)?
-                {
+                if let Some((mk, mv)) = self.mirror_prefix(slot, kv_len, &device, budget)? {
                     k_opt = Some(mk);
                     v_opt = Some(mv);
                 }
@@ -4459,14 +4666,18 @@ impl GatedAttentionLayer {
                             sv.slice_set(&vt.flatten_all()?, 0, off * row_elems)?;
                             off += cs;
                         }
-                        k_opt = Some(
-                            sk.narrow(0, 0, kv_len * row_elems)?
-                                .reshape((1, kv_len, self.n_kv_head, self.head_dim))?,
-                        );
-                        v_opt = Some(
-                            sv.narrow(0, 0, kv_len * row_elems)?
-                                .reshape((1, kv_len, self.n_kv_head, self.head_dim))?,
-                        );
+                        k_opt = Some(sk.narrow(0, 0, kv_len * row_elems)?.reshape((
+                            1,
+                            kv_len,
+                            self.n_kv_head,
+                            self.head_dim,
+                        ))?);
+                        v_opt = Some(sv.narrow(0, 0, kv_len * row_elems)?.reshape((
+                            1,
+                            kv_len,
+                            self.n_kv_head,
+                            self.head_dim,
+                        ))?);
                     }
                 }
             }
@@ -4521,11 +4732,13 @@ impl GatedAttentionLayer {
         let y_all = Tensor::cat(&slot_outs, 0)?; // [B, n_head, 1, hd]
         let gate_sigmoid = candle_nn::ops::sigmoid(&gate_all)?; // [B, n_head, 1, hd]
         let y_all = (y_all * gate_sigmoid)?;
-        let y_all = y_all
-            .transpose(1, 2)?
-            .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+        let y_all =
+            y_all
+                .transpose(1, 2)?
+                .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
         #[cfg(target_os = "macos")]
-        let y_all = dispatch_q4k_matmul(&self.attention_wo, self.attention_wo_opt.as_ref(), &y_all)?;
+        let y_all =
+            dispatch_q4k_matmul(&self.attention_wo, self.attention_wo_opt.as_ref(), &y_all)?;
         #[cfg(not(target_os = "macos"))]
         let y_all = self.attention_wo.forward(&y_all)?;
 
@@ -4985,7 +5198,8 @@ impl HybridBlock {
                     &z_t,
                     &beta_t,
                     &alpha_t,
-                ).map_err(|e| candle_core::Error::Msg(format!("delta fused: {e}")))?;
+                )
+                .map_err(|e| candle_core::Error::Msg(format!("delta fused: {e}")))?;
                 let head_in = gated_all;
                 match &delta.f16_ssm_out {
                     Some(fo) => fo.forward(&head_in)?,
@@ -5027,7 +5241,12 @@ impl HybridBlock {
                 delta.forward_decode_batch_rows(&normed, slots, true, Some(&ctx.slots_dev))?
             }
             HybridLayerType::Attention(attn) => attn
-                .forward_attn_prefill_paged(&normed.reshape((1, k, n_embd))?, ctx, rope_pos_dev, true)?
+                .forward_attn_prefill_paged(
+                    &normed.reshape((1, k, n_embd))?,
+                    ctx,
+                    rope_pos_dev,
+                    true,
+                )?
                 .reshape((k, 1, n_embd))?,
         };
         let x = (layer_out + residual)?;
@@ -5046,9 +5265,15 @@ impl HybridBlock {
     ) -> Result<Tensor> {
         use std::io::Write;
         let residual = x;
-        if crate::scheduler::trace_on() { eprintln!("[fdbp] 1. attn_norm"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[fdbp] 1. attn_norm");
+            let _ = std::io::stderr().flush();
+        }
         let normed = self.attn_norm.forward(x)?;
-        if crate::scheduler::trace_on() { eprintln!("[fdbp] 2. layer dispatch"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[fdbp] 2. layer dispatch");
+            let _ = std::io::stderr().flush();
+        }
 
         let layer_out = match &mut self.layer {
             HybridLayerType::DeltaNet(delta) => {
@@ -5062,25 +5287,40 @@ impl HybridBlock {
                 if std::env::var("QWEN36_GRAPH_SKIP_ATTN").as_deref() == Ok("1") {
                     normed.clone()
                 } else {
-                    if crate::scheduler::trace_on() { eprintln!("[fdbp] 2a. attn call"); let _ = std::io::stderr().flush(); }
+                    if crate::scheduler::trace_on() {
+                        eprintln!("[fdbp] 2a. attn call");
+                        let _ = std::io::stderr().flush();
+                    }
                     attn.forward_attn_decode_paged(&normed, ctx)?
                 }
             }
         };
-        if crate::scheduler::trace_on() { eprintln!("[fdbp] 3. residual"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[fdbp] 3. residual");
+            let _ = std::io::stderr().flush();
+        }
         let x = (layer_out + residual)?;
 
         let residual = &x;
-        if crate::scheduler::trace_on() { eprintln!("[fdbp] 4. ffn_norm"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[fdbp] 4. ffn_norm");
+            let _ = std::io::stderr().flush();
+        }
         let normed = self.ffn_norm.forward(&x)?;
-        if crate::scheduler::trace_on() { eprintln!("[fdbp] 5. ffn"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[fdbp] 5. ffn");
+            let _ = std::io::stderr().flush();
+        }
         let ffn_out = if std::env::var("QWEN36_GRAPH_SKIP_FFN").as_deref() == Ok("1") {
             normed
         } else {
             self.ff.forward_decode_batch(&normed)?
         };
         let x = (ffn_out + residual)?;
-        if crate::scheduler::trace_on() { eprintln!("[fdbp] 6. done"); let _ = std::io::stderr().flush(); }
+        if crate::scheduler::trace_on() {
+            eprintln!("[fdbp] 6. done");
+            let _ = std::io::stderr().flush();
+        }
         Ok(x)
     }
 
@@ -5248,7 +5488,8 @@ impl ModelWeights {
         let load_heavy = |name: &str| -> Result<candle_core::quantized::QTensor> {
             // Если тензор принадлежит блоку `blk.N.*` и N >= max_gpu_layers,
             // загружаем его на CPU для предотвращения WDDM paging на 27B+.
-            let target_device = if let Some(blk_idx) = name.strip_prefix("blk.")
+            let target_device = if let Some(blk_idx) = name
+                .strip_prefix("blk.")
                 .and_then(|rest| rest.split('.').next())
                 .and_then(|num| num.parse::<usize>().ok())
             {
@@ -5584,17 +5825,16 @@ impl ModelWeights {
             .and_then(|m| m.to_u32())
             .map(|v| v as usize)
             .unwrap_or(0);
-        let rms_norm_eps = md_get(&format!("{prefix}.attention.layer_norm_rms_epsilon"))?
-            .to_f32()? as f64;
+        let rms_norm_eps =
+            md_get(&format!("{prefix}.attention.layer_norm_rms_epsilon"))?.to_f32()? as f64;
         let rope_freq_base = md_get(&format!("{prefix}.rope.freq_base"))
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
 
         // Attention параметры
-        let attn_head_count = md_get(&format!("{prefix}.attention.head_count"))?
-            .to_u32()? as usize;
-        let attn_head_count_kv = md_get(&format!("{prefix}.attention.head_count_kv"))?
-            .to_u32()? as usize;
+        let attn_head_count = md_get(&format!("{prefix}.attention.head_count"))?.to_u32()? as usize;
+        let attn_head_count_kv =
+            md_get(&format!("{prefix}.attention.head_count_kv"))?.to_u32()? as usize;
         let attn_head_dim = md_get(&format!("{prefix}.attention.key_length"))
             .and_then(|m| m.to_u32())
             .map(|v| v as usize)
@@ -5763,7 +6003,8 @@ impl ModelWeights {
                     // целиком, и на 27B эмбеддинг съедал VRAM, после чего графы всё
                     // равно отключались по своему порогу — худшее из двух.
                     let has_vram_headroom = if let Ok(cuda_dev) = device.as_cuda_device() {
-                        let force_graphs = std::env::var("QWEN36_CUDA_GRAPHS").as_deref() == Ok("1");
+                        let force_graphs =
+                            std::env::var("QWEN36_CUDA_GRAPHS").as_deref() == Ok("1");
                         // Фактический размер тензора из GGUF-заголовка (флэтовая
                         // планка 1 GiB пропускала ~0.8 GiB эмбеддинг на 27B при
                         // free 2.5 GiB — и модель переставала помещаться в prefill).
@@ -5958,8 +6199,9 @@ impl ModelWeights {
                 heads_per_kv: (n_v_heads / n_k_heads) as u32,
                 batch_size: decode_capacity(),
             };
-            match metal::delta_rule_batched_metal::compile_delta_rule_batched_pipelines(metal_device)
-            {
+            match metal::delta_rule_batched_metal::compile_delta_rule_batched_pipelines(
+                metal_device,
+            ) {
                 Ok(pipelines) => {
                     match metal::delta_rule_batched_metal::create_temp_buffers_batched(
                         metal_device,
@@ -6068,8 +6310,13 @@ impl ModelWeights {
 
         // ── Загрузка слоёв ──
         let requested_moe_backend = std::env::var("QWEN36_MOE_BACKEND").ok();
-        let kv_cache_dtype = std::env::var("QWEN36_KV_CACHE_DTYPE")
-            .unwrap_or_else(|_| if is_moe { "q8".into() } else { "q8_f16".into() });
+        let kv_cache_dtype = std::env::var("QWEN36_KV_CACHE_DTYPE").unwrap_or_else(|_| {
+            if is_moe {
+                "q8".into()
+            } else {
+                "q8_f16".into()
+            }
+        });
         if !matches!(kv_cache_dtype.as_str(), "q8" | "q8_f16") {
             candle_core::bail!(
                 "QWEN36_KV_CACHE_DTYPE must be q8 or q8_f16, got {kv_cache_dtype:?}"
@@ -6128,9 +6375,9 @@ impl ModelWeights {
                 };
 
                 // Shared expert: scalar gate_inp (Linear) + SwiGLU gate/up/down (QMatMul).
-                let shexp_gate_inp_qt =
-                    load_heavy(&format!("{prefix}.ffn_gate_inp_shexp.weight"))?;
-                let shexp_gate_inp_w = shexp_gate_inp_qt.dequantize(device)?.to_dtype(DType::F32)?;
+                let shexp_gate_inp_qt = load_heavy(&format!("{prefix}.ffn_gate_inp_shexp.weight"))?;
+                let shexp_gate_inp_w =
+                    shexp_gate_inp_qt.dequantize(device)?.to_dtype(DType::F32)?;
                 // unsloth GGUF хранит gate как rank-1 [hidden] — Linear ждёт [1, hidden].
                 let shexp_gate_inp_w = if shexp_gate_inp_w.rank() == 1 {
                     let h = shexp_gate_inp_w.dim(0)?;
@@ -6195,16 +6442,15 @@ impl ModelWeights {
                 // ── DeltaNet Layer ──
                 // Слитая проекция qkv+z+b+a — опциональна: контейнер .ytf её
                 // несёт, GGUF нет. Отключается QWEN36_NO_FUSED_IN_PROJ=1.
-                let in_proj_fused = if std::env::var("QWEN36_NO_FUSED_IN_PROJ").as_deref()
-                    == Ok("1")
-                {
-                    None
-                } else {
-                    match load_heavy(&format!("{prefix}.attn_in_proj.weight")) {
-                        Ok(qt) => Some(QMatMul::from_qtensor(qt)?),
-                        Err(_) => None,
-                    }
-                };
+                let in_proj_fused =
+                    if std::env::var("QWEN36_NO_FUSED_IN_PROJ").as_deref() == Ok("1") {
+                        None
+                    } else {
+                        match load_heavy(&format!("{prefix}.attn_in_proj.weight")) {
+                            Ok(qt) => Some(QMatMul::from_qtensor(qt)?),
+                            Err(_) => None,
+                        }
+                    };
                 let wqkv = load_heavy(&format!("{prefix}.attn_qkv.weight"))?;
                 let wgate = load_heavy(&format!("{prefix}.attn_gate.weight"))?;
                 let w_beta = load_heavy(&format!("{prefix}.ssm_beta.weight"))?;
@@ -6360,7 +6606,9 @@ impl ModelWeights {
                             Err(e) => {
                                 log::warn!(
                                     "[{}] Metal delta_rule batched layer {}: state error: {}",
-                                    tag, layer_idx, e
+                                    tag,
+                                    layer_idx,
+                                    e
                                 );
                                 None
                             }
@@ -6592,7 +6840,11 @@ impl ModelWeights {
         // этом пути forward не вызывается (emb берётся из tok_embeddings_cuda).
         #[cfg(feature = "cuda")]
         let tok_embeddings = if tok_embeddings_cuda.is_some() && device.is_cuda() && gpu_only {
-            log::info!("[{}] GPU_ONLY: dropping mmap token_embd (~{:.0} MB RAM freed)", tag, tok_embeddings.data_len as f64 / 1024.0 / 1024.0);
+            log::info!(
+                "[{}] GPU_ONLY: dropping mmap token_embd (~{:.0} MB RAM freed)",
+                tag,
+                tok_embeddings.data_len as f64 / 1024.0 / 1024.0
+            );
             QuantizedEmbedding::empty(tok_embeddings.n_cols)
         } else {
             tok_embeddings
@@ -6983,13 +7235,15 @@ impl ModelWeights {
         if snap.model_nonce != self.instance_nonce {
             candle_core::bail!(
                 "seed_slot_batched: model nonce mismatch: snap={:#x} vs self={:#x}",
-                snap.model_nonce, self.instance_nonce
+                snap.model_nonce,
+                self.instance_nonce
             );
         }
         if snap.blocks.len() != self.blocks.len() {
             candle_core::bail!(
                 "seed_slot_batched: blocks length mismatch: snap={} vs model={}",
-                snap.blocks.len(), self.blocks.len()
+                snap.blocks.len(),
+                self.blocks.len()
             );
         }
         if slot >= decode_capacity() as usize {
@@ -7054,8 +7308,14 @@ impl ModelWeights {
                         Some(kv) => {
                             // Не дублируем F16 память: берем narrow view без deep-clone,
                             // сразу квантуем в q8 строки и пишем в целевой слот.
-                            let k = kv.k.narrow(2, 0, kv.cache_len)?.transpose(1, 2)?.contiguous()?;
-                            let v = kv.v.narrow(2, 0, kv.cache_len)?.transpose(1, 2)?.contiguous()?;
+                            let k =
+                                kv.k.narrow(2, 0, kv.cache_len)?
+                                    .transpose(1, 2)?
+                                    .contiguous()?;
+                            let v =
+                                kv.v.narrow(2, 0, kv.cache_len)?
+                                    .transpose(1, 2)?
+                                    .contiguous()?;
                             let (k_q, k_s) = q8_quantize_rows(&k)?;
                             let (v_q, v_s) = q8_quantize_rows(&v)?;
                             a.kv_cache_batched[slot] = Some(if a.use_q8_f16_kv_cache {
@@ -7123,7 +7383,11 @@ impl ModelWeights {
                         Tensor::zeros(cap * row, DType::F16, dev),
                     ) {
                         (Ok(k), Ok(v)) => {
-                            *m = Some(KvMirror { k, v, valid_tokens: 0 });
+                            *m = Some(KvMirror {
+                                k,
+                                v,
+                                valid_tokens: 0,
+                            });
                         }
                         _ => {
                             budget.fetch_add(cost, std::sync::atomic::Ordering::SeqCst);
@@ -7232,10 +7496,9 @@ impl ModelWeights {
             match (&mut block.layer, saved) {
                 #[cfg(feature = "cuda")]
                 (HybridLayerType::DeltaNet(delta), BatchedBlockCheckpoint::CudaDeltaNet(saved)) => {
-                    let context = delta
-                        .cuda_ctx_batched
-                        .as_mut()
-                        .ok_or_else(|| candle_core::Error::Msg("CUDA batched state is absent".into()))?;
+                    let context = delta.cuda_ctx_batched.as_mut().ok_or_else(|| {
+                        candle_core::Error::Msg("CUDA batched state is absent".into())
+                    })?;
                     let dev = context.dev.clone();
                     delta_rule_batched_cuda::restore_slot_cuda_checkpoint(
                         &dev,
@@ -7245,11 +7508,13 @@ impl ModelWeights {
                     )?;
                 }
                 #[cfg(target_os = "macos")]
-                (HybridLayerType::DeltaNet(delta), BatchedBlockCheckpoint::MetalDeltaNet(saved)) => {
-                    let context = delta
-                        .metal_ctx_batched
-                        .as_ref()
-                        .ok_or_else(|| candle_core::Error::Msg("Metal batched state is absent".into()))?;
+                (
+                    HybridLayerType::DeltaNet(delta),
+                    BatchedBlockCheckpoint::MetalDeltaNet(saved),
+                ) => {
+                    let context = delta.metal_ctx_batched.as_ref().ok_or_else(|| {
+                        candle_core::Error::Msg("Metal batched state is absent".into())
+                    })?;
                     metal::delta_rule_batched_metal::restore_slot_metal_checkpoint(
                         device.as_metal_device()?,
                         &context.layer_state,
@@ -7684,10 +7949,16 @@ impl ModelWeights {
                     layer_in = block.forward_prefill(&layer_in, index_pos)?;
                     if trace {
                         let el = t0.elapsed().as_secs_f64() * 1000.0;
-                        if block.is_deltanet() { d_ms += el; } else { a_ms += el; }
+                        if block.is_deltanet() {
+                            d_ms += el;
+                        } else {
+                            a_ms += el;
+                        }
                         if el > 50.0 {
-                            eprintln!("[pf] slow block {bi} {} {el:.1}ms",
-                                if block.is_deltanet() { "delta" } else { "attn" });
+                            eprintln!(
+                                "[pf] slow block {bi} {} {el:.1}ms",
+                                if block.is_deltanet() { "delta" } else { "attn" }
+                            );
                         }
                     }
                 }
@@ -7850,12 +8121,8 @@ impl ModelWeights {
         rope_positions: &[usize],
         slots: &[u32],
     ) -> Result<Tensor> {
-        let (logits, _) = self.forward_decode_batch_hidden_inner(
-            tokens,
-            cache_positions,
-            rope_positions,
-            slots,
-        )?;
+        let (logits, _) =
+            self.forward_decode_batch_hidden_inner(tokens, cache_positions, rope_positions, slots)?;
         Ok(logits)
     }
 
@@ -7891,10 +8158,15 @@ impl ModelWeights {
         let emb_ready = if let Some(emb) = &self.tok_embeddings_cuda {
             emb.embedding(tokens)? // [b_sz, 1, n_embd] прямо на GPU
         } else {
-            self.tok_embeddings.forward(tokens)?.to_device(tokens.device())?
+            self.tok_embeddings
+                .forward(tokens)?
+                .to_device(tokens.device())?
         };
         #[cfg(not(feature = "cuda"))]
-        let emb_ready = self.tok_embeddings.forward(tokens)?.to_device(tokens.device())?;
+        let emb_ready = self
+            .tok_embeddings
+            .forward(tokens)?
+            .to_device(tokens.device())?;
         let mut layer_in = emb_ready.reshape((b_sz, 1usize, self.hidden_size()))?; // [b_sz, 1, n_embd]
 
         // Batched layers (DeltaNet decode_batch + Attention decode_batch).
@@ -7975,9 +8247,10 @@ impl ModelWeights {
         }
         let mut layer_in = emb_in.clone();
 
-        let ctx = self.paged_ctx.as_ref().ok_or_else(|| {
-            candle_core::Error::Msg("prefill graph: paged ctx missing".into())
-        })?;
+        let ctx = self
+            .paged_ctx
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("prefill graph: paged ctx missing".into()))?;
 
         // seqlens_k = kv_len[slot] + T — одинаков для всех слоёв прохода
         // (kv_len инкрементируется только в конце). Один launch вместо N.
@@ -8022,9 +8295,10 @@ impl ModelWeights {
             candle_core::bail!("verify graph: embeddings shape {:?}", emb_in.dims());
         }
         let mut layer_in = emb_in.clone();
-        let ctx = self.paged_ctx.as_ref().ok_or_else(|| {
-            candle_core::Error::Msg("verify graph: paged ctx missing".into())
-        })?;
+        let ctx = self
+            .paged_ctx
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("verify graph: paged ctx missing".into()))?;
         let slots = vec![slot; k];
         for block in self.blocks.iter_mut() {
             layer_in = block.forward_verify_paged(&layer_in, ctx, rope_pos_dev, &slots)?;
@@ -8055,20 +8329,26 @@ impl ModelWeights {
         if let Some(ev) = self.gprof_events.as_ref() {
             let stream = ctx.dev.cuda_stream().cu_stream();
             let r = unsafe { cudarc::driver::result::event::record(ev[0], stream) };
-            if let Err(e) = r { eprintln!("[gprof] record ev0: {e:?}"); }
+            if let Err(e) = r {
+                eprintln!("[gprof] record ev0: {e:?}");
+            }
         }
         let mut layer_in = emb_in.clone();
         if let Some(ev) = self.gprof_events.as_ref() {
             let stream = ctx.dev.cuda_stream().cu_stream();
             let r = unsafe { cudarc::driver::result::event::record(ev[1], stream) };
-            if let Err(e) = r { eprintln!("[gprof] record ev1: {e:?}"); }
+            if let Err(e) = r {
+                eprintln!("[gprof] record ev1: {e:?}");
+            }
         }
 
         // QWEN36_GRAPH_BLOCKS=N — perf-бисект: ограничить число блоков в графе
         // (логиты мусорные, но replay-time валидно).
         static BLOCK_LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         let limit = *BLOCK_LIMIT.get_or_init(|| {
-            std::env::var("QWEN36_GRAPH_BLOCKS").ok().and_then(|v| v.parse().ok())
+            std::env::var("QWEN36_GRAPH_BLOCKS")
+                .ok()
+                .and_then(|v| v.parse().ok())
         });
         let n_take = limit.unwrap_or(usize::MAX);
         for (bi, block) in self.blocks.iter_mut().take(n_take).enumerate() {
@@ -8076,21 +8356,26 @@ impl ModelWeights {
                 let stream = ctx.dev.cuda_stream().cu_stream();
                 let _ = unsafe { cudarc::driver::result::event::record(bevs[bi], stream) };
             }
-            layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots).map_err(|e| {
-                eprintln!("[graphed-step] ERROR in block {bi}: {e:?}");
-                e
-            })?;
+            layer_in = block
+                .forward_decode_batch_paged(&layer_in, ctx, slots)
+                .map_err(|e| {
+                    eprintln!("[graphed-step] ERROR in block {bi}: {e:?}");
+                    e
+                })?;
         }
         if let Some(bevs) = self.gprof_block_events.as_ref() {
             let stream = ctx.dev.cuda_stream().cu_stream();
-            let _ = unsafe { cudarc::driver::result::event::record(bevs[self.blocks.len()], stream) };
+            let _ =
+                unsafe { cudarc::driver::result::event::record(bevs[self.blocks.len()], stream) };
         }
         // Инкремент kv_len — после ВСЕХ attention слоёв.
         ctx.launch_increment(b_sz)?;
         if let Some(ev) = self.gprof_events.as_ref() {
             let stream = ctx.dev.cuda_stream().cu_stream();
             let r = unsafe { cudarc::driver::result::event::record(ev[2], stream) };
-            if let Err(e) = r { eprintln!("[gprof] record ev2: {e:?}"); }
+            if let Err(e) = r {
+                eprintln!("[gprof] record ev2: {e:?}");
+            }
         }
 
         let hidden = self.norm.forward(&layer_in.i((.., 0, ..))?)?;
@@ -8098,7 +8383,9 @@ impl ModelWeights {
         if let Some(ev) = self.gprof_events.as_ref() {
             let stream = ctx.dev.cuda_stream().cu_stream();
             let r = unsafe { cudarc::driver::result::event::record(ev[3], stream) };
-            if let Err(e) = r { eprintln!("[gprof] record ev3: {e:?}"); }
+            if let Err(e) = r {
+                eprintln!("[gprof] record ev3: {e:?}");
+            }
         }
         Ok((logits, hidden))
     }
@@ -8147,7 +8434,8 @@ impl ModelWeights {
         // Размер 1 токена (K+V в F16) для всех слоёв внимания и всех B слотов
         let q8_budget = crate::real::paged_kv_cuda::kv_pool_is_q8();
         let kv_bytes_per_head = if q8_budget { hd + 2 } else { hd * 2 };
-        let bytes_per_token_all_layers = num_attn_layers * capacity_b * (2 * n_kv * kv_bytes_per_head);
+        let bytes_per_token_all_layers =
+            num_attn_layers * capacity_b * (2 * n_kv * kv_bytes_per_head);
         // Резерв под то, что выделяется ПОСЛЕ пула: графы, активации префила,
         // буферы драйвера. 512 МиБ не хватало: на 3060 с MTP и графами замер
         // показал 846 МиБ в подкачке WDDM. Windows при выходе за VRAM не падает,
@@ -8257,7 +8545,10 @@ impl ModelWeights {
                 if bok {
                     self.gprof_block_events = Some(bevs);
                 }
-                eprintln!("[gprof] events created (blocks={})", self.gprof_block_events.is_some());
+                eprintln!(
+                    "[gprof] events created (blocks={})",
+                    self.gprof_block_events.is_some()
+                );
             }
         }
         Ok(())
@@ -8278,7 +8569,11 @@ impl ModelWeights {
     /// `gguf_path` — путь GGUF (для sha256 против манифеста сайдкара); sidecar
     /// ожидается в `<stem>.ytf16`. Откат: QWEN36_DISABLE_YTF16=1.
     /// Dual-read (R-DUAL): F16 ТОЛЬКО в forward_prefill; decode читает GGUF-квант.
-    pub fn attach_ytf16(&mut self, gguf_path: &std::path::Path, device: &candle_core::Device) -> Result<()> {
+    pub fn attach_ytf16(
+        &mut self,
+        gguf_path: &std::path::Path,
+        device: &candle_core::Device,
+    ) -> Result<()> {
         if std::env::var("QWEN36_DISABLE_YTF16").as_deref() == Ok("1") {
             return Ok(());
         }
@@ -8470,7 +8765,10 @@ impl ModelWeights {
                          проверьте конвертер; QWEN36_DISABLE_YTF16=1 отключает сайдкар.",
                         rel * 100.0
                     ),
-                    Ok(rel) => eprintln!("[ytf] blk.0 vs GGUF: относительная ошибка {:.1}%", rel * 100.0),
+                    Ok(rel) => eprintln!(
+                        "[ytf] blk.0 vs GGUF: относительная ошибка {:.1}%",
+                        rel * 100.0
+                    ),
                     Err(e) => eprintln!("[ytf] WARN проверка сайдкара не удалась: {e}"),
                 }
             }
@@ -8509,8 +8807,6 @@ impl ModelWeights {
         Ok(())
     }
 
-
-
     /// Миграция per-slot KV из batched cache (post-prefill/seed) в paged pool.
     /// Возвращает фактическую длину KV слота.
     /// После миграции освобождает q8 batched кэш слота (~130 MiB @24K на 10 attn-слоёв),
@@ -8534,13 +8830,14 @@ impl ModelWeights {
                     candle_core::bail!("slot {slot} kv_len {kv_len} exceeds paged window");
                 }
                 len = kv_len;
-                let cache = a.kv_cache_batched[slot].as_ref().ok_or_else(|| {
-                    candle_core::Error::Msg("migrate: batched KV missing".into())
-                })?;
+                let cache = a.kv_cache_batched[slot]
+                    .as_ref()
+                    .ok_or_else(|| candle_core::Error::Msg("migrate: batched KV missing".into()))?;
                 let (k, v) = cache.f16_prefix(kv_len)?; // [1, len, n_kv, hd] F16
-                let pool = a.paged_pool.as_ref().ok_or_else(|| {
-                    candle_core::Error::Msg("migrate: paged pool missing".into())
-                })?;
+                let pool = a
+                    .paged_pool
+                    .as_ref()
+                    .ok_or_else(|| candle_core::Error::Msg("migrate: paged pool missing".into()))?;
                 if pool.k_scale.is_some() {
                     // Миграция копирует F16 постранично; для байтового пула
                     // нужна квантующая копия. При graph-префилле (умолчание)
@@ -8564,7 +8861,8 @@ impl ModelWeights {
                     candle_core::Storage::Cuda(vc),
                     candle_core::Storage::Cuda(kpc),
                     candle_core::Storage::Cuda(vpc),
-                ) = (&*k_st, &*v_st, &*kp_st, &*vp_st) {
+                ) = (&*k_st, &*v_st, &*kp_st, &*vp_st)
+                {
                     let k_src = kc.as_cuda_slice::<half::f16>()?;
                     let v_src = vc.as_cuda_slice::<half::f16>()?;
                     let kp_dst = kpc.as_cuda_slice::<half::f16>()?;
@@ -8697,54 +8995,54 @@ impl ModelWeights {
             // Заимствования storage_and_layout должны умереть до того, как k и v
             // уедут в кэш, поэтому копирование живёт в своей области.
             {
-            let (kp_st, _) = pool.k_pool.storage_and_layout();
-            let (vp_st, _) = pool.v_pool.storage_and_layout();
-            let (k_st, k_l) = k.storage_and_layout();
-            let (v_st, v_l) = v.storage_and_layout();
-            if let (
-                candle_core::Storage::Cuda(kpc),
-                candle_core::Storage::Cuda(vpc),
-                candle_core::Storage::Cuda(kc),
-                candle_core::Storage::Cuda(vc),
-            ) = (&*kp_st, &*vp_st, &*k_st, &*v_st)
-            {
-                let kp_src = kpc.as_cuda_slice::<half::f16>()?;
-                let vp_src = vpc.as_cuda_slice::<half::f16>()?;
-                let k_dst = kc.as_cuda_slice::<half::f16>()?;
-                let v_dst = vc.as_cuda_slice::<half::f16>()?;
-                let stream = kc.device.cuda_stream();
-                let (kp_src_ptr, _) = cudarc::driver::DevicePtr::device_ptr(kp_src, &stream);
-                let (vp_src_ptr, _) = cudarc::driver::DevicePtr::device_ptr(vp_src, &stream);
-                let (k_dst_ptr, _) = cudarc::driver::DevicePtr::device_ptr(k_dst, &stream);
-                let (v_dst_ptr, _) = cudarc::driver::DevicePtr::device_ptr(v_dst, &stream);
+                let (kp_st, _) = pool.k_pool.storage_and_layout();
+                let (vp_st, _) = pool.v_pool.storage_and_layout();
+                let (k_st, k_l) = k.storage_and_layout();
+                let (v_st, v_l) = v.storage_and_layout();
+                if let (
+                    candle_core::Storage::Cuda(kpc),
+                    candle_core::Storage::Cuda(vpc),
+                    candle_core::Storage::Cuda(kc),
+                    candle_core::Storage::Cuda(vc),
+                ) = (&*kp_st, &*vp_st, &*k_st, &*v_st)
+                {
+                    let kp_src = kpc.as_cuda_slice::<half::f16>()?;
+                    let vp_src = vpc.as_cuda_slice::<half::f16>()?;
+                    let k_dst = kc.as_cuda_slice::<half::f16>()?;
+                    let v_dst = vc.as_cuda_slice::<half::f16>()?;
+                    let stream = kc.device.cuda_stream();
+                    let (kp_src_ptr, _) = cudarc::driver::DevicePtr::device_ptr(kp_src, &stream);
+                    let (vp_src_ptr, _) = cudarc::driver::DevicePtr::device_ptr(vp_src, &stream);
+                    let (k_dst_ptr, _) = cudarc::driver::DevicePtr::device_ptr(k_dst, &stream);
+                    let (v_dst_ptr, _) = cudarc::driver::DevicePtr::device_ptr(v_dst, &stream);
 
-                let pages = kv_len.div_ceil(ps);
-                for page in 0..pages {
-                    let start = page * ps;
-                    let n = (kv_len - start).min(ps);
-                    let phys = slot * mb + page;
-                    let src_start = (phys * ps) * elem_per_token;
-                    let dst_start = k_l.start_offset() + start * elem_per_token;
-                    let dst_v_start = v_l.start_offset() + start * elem_per_token;
-                    let count_bytes = n * elem_per_token * 2; // f16 = 2 байта
-                    unsafe {
-                        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-                            k_dst_ptr + (dst_start * 2) as u64,
-                            kp_src_ptr + (src_start * 2) as u64,
-                            count_bytes,
-                            stream.cu_stream(),
-                        );
-                        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-                            v_dst_ptr + (dst_v_start * 2) as u64,
-                            vp_src_ptr + (src_start * 2) as u64,
-                            count_bytes,
-                            stream.cu_stream(),
-                        );
+                    let pages = kv_len.div_ceil(ps);
+                    for page in 0..pages {
+                        let start = page * ps;
+                        let n = (kv_len - start).min(ps);
+                        let phys = slot * mb + page;
+                        let src_start = (phys * ps) * elem_per_token;
+                        let dst_start = k_l.start_offset() + start * elem_per_token;
+                        let dst_v_start = v_l.start_offset() + start * elem_per_token;
+                        let count_bytes = n * elem_per_token * 2; // f16 = 2 байта
+                        unsafe {
+                            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                                k_dst_ptr + (dst_start * 2) as u64,
+                                kp_src_ptr + (src_start * 2) as u64,
+                                count_bytes,
+                                stream.cu_stream(),
+                            );
+                            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                                v_dst_ptr + (dst_v_start * 2) as u64,
+                                vp_src_ptr + (src_start * 2) as u64,
+                                count_bytes,
+                                stream.cu_stream(),
+                            );
+                        }
                     }
+                } else {
+                    candle_core::bail!("rehydrate: ожидались CUDA-тензоры");
                 }
-            } else {
-                candle_core::bail!("rehydrate: ожидались CUDA-тензоры");
-            }
             }
             a.kv_cache_batched[slot] = Some(BatchedKvCache::F16(F16KvCache { k, v }));
         }
@@ -8760,6 +9058,18 @@ impl ModelWeights {
     /// в vision-encoder crate размерность должна совпадать с hidden_size).
     pub fn hidden_size(&self) -> usize {
         self.tok_embeddings.n_cols
+    }
+
+    /// Число GQA-групп внимания (n_head / n_kv_head). Нужно адаптеру для
+    /// стейджа seqlens_q однопроходной проверки (строки свёрнуты по группам).
+    /// Модель без attention-слоёв → 1.
+    pub fn attn_kv_groups(&self) -> usize {
+        for block in &self.blocks {
+            if let HybridLayerType::Attention(attn) = &block.layer {
+                return attn.n_head / attn.n_kv_head.max(1);
+            }
+        }
+        1
     }
 
     /// Контекстное окно модели.
@@ -8781,7 +9091,9 @@ impl ModelWeights {
         let n = tokens.len();
         if let Some(emb) = self.tok_embeddings_cuda.as_ref() {
             let ids = Tensor::from_vec(tokens.to_vec(), (1usize, n), device)?;
-            return emb.embedding(&ids)?.reshape((1usize, n, self.hidden_size()));
+            return emb
+                .embedding(&ids)?
+                .reshape((1usize, n, self.hidden_size()));
         }
         let ids = Tensor::from_vec(tokens.to_vec(), (1usize, n), &Device::Cpu)?;
         self.tok_embeddings
@@ -8902,8 +9214,7 @@ impl ModelWeights {
                 HybridLayerType::DeltaNet(_) => None,
             })
             .ok_or_else(|| candle_core::Error::Msg("model has no attention block".into()))?;
-        let (cos, sin) =
-            precompute_mrope(&plan.rope_positions, rope_dim, 10_000_000.0, &device)?;
+        let (cos, sin) = precompute_mrope(&plan.rope_positions, rope_dim, 10_000_000.0, &device)?;
         self.forward_embeds_hidden_inner(embeds, index_pos, Some((&cos, &sin)))
     }
 
@@ -9502,7 +9813,10 @@ mod q8_kv_tests {
             .to_scalar::<f32>()
             .unwrap();
         // Ошибка ≤ 2 шага квантования (scale = amax/127).
-        assert!(diff < 3.0 * 3.0 / 60.0, "q8 roundtrip error too big: {diff}");
+        assert!(
+            diff < 3.0 * 3.0 / 60.0,
+            "q8 roundtrip error too big: {diff}"
+        );
     }
 }
 

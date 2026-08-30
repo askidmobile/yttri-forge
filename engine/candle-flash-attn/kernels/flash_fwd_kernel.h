@@ -321,7 +321,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     flash::Mask<Is_causal, Is_local, Has_alibi> mask(
         binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right,
         alibi_slope, params.mm_prefix_ranges, params.mm_prefix_range_batch_stride,
-        params.max_mm_prefix_ranges, bidb);
+        params.max_mm_prefix_ranges, params.rows_per_position, bidb);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -567,8 +567,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
     if (Is_causal || Is_local) {
-        n_block_max = std::min(n_block_max,
-                               cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
+        if (params.rows_per_position > 1) {
+            // Свёртка GQA (one-pass verify): CTA покрывает kBlockM/rpp позиций,
+            // граница KV — по последней позиции CTA, а не по строке.
+            const int pos_max = ((m_block + 1) * kBlockM - 1) / params.rows_per_position;
+            n_block_max = std::min(n_block_max,
+                                   cute::ceil_div(pos_max + 1 + binfo.actual_seqlen_k - binfo.actual_seqlen_q / params.rows_per_position + params.window_size_right, kBlockN));
+        } else {
+            n_block_max = std::min(n_block_max,
+                                   cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
+        }
     }
     if (Is_causal || Is_local) {
         expand_mm_prefix_block_range<kBlockM, kBlockN>(
@@ -961,7 +969,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     flash::Mask<Is_causal, Is_local, Has_alibi> mask(
         binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right,
         alibi_slope, params.mm_prefix_ranges, params.mm_prefix_range_batch_stride,
-        params.max_mm_prefix_ranges, bidb);
+        params.max_mm_prefix_ranges, params.rows_per_position, bidb);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.

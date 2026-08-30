@@ -105,6 +105,12 @@ struct Flash_fwd_params : public Qkv_params {
     index_t mm_prefix_range_batch_stride;
     int max_mm_prefix_ranges;
 
+    // Однопроходная проверка спекуляции (QWEN36_VERIFY_ONEPASS): строки запроса
+    // свёрнуты по GQA-группам — строка r это (позиция r/rpp, группа r%rpp).
+    // 0 или 1 — обычная раскладка; >1 — причинная граница маски и граница
+    // KV-блоков считаются по позиции, а не по строке.
+    int rows_per_position;
+
     // The dropout probability (probability of keeping an activation).
     float p_dropout;
     // uint32_t p_dropout_in_uint;

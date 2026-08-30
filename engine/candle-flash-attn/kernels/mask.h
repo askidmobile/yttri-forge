@@ -116,6 +116,8 @@ struct Mask {
     const int *__restrict__ mm_prefix_ranges;
     const int mm_prefix_range_batch_stride;
     const int max_mm_prefix_ranges;
+    // Строк запроса на одну позицию (свёртка GQA, one-pass verify). 0/1 — выкл.
+    const int rows_per_position;
 
     __forceinline__ __device__ Mask(const int max_seqlen_k, const int max_seqlen_q,
                                     const int window_size_left, const int window_size_right,
@@ -123,6 +125,7 @@ struct Mask {
                                     const int *__restrict__ mm_prefix_ranges=nullptr,
                                     const int mm_prefix_range_batch_stride=0,
                                     const int max_mm_prefix_ranges=0,
+                                    const int rows_per_position_=0,
                                     const int bidb=0)
         : max_seqlen_k(max_seqlen_k)
         , max_seqlen_q(max_seqlen_q)
@@ -131,7 +134,8 @@ struct Mask {
         , alibi_slope(!Has_alibi ? 0.0 : alibi_slope)
         , mm_prefix_ranges(mm_prefix_ranges == nullptr ? nullptr : mm_prefix_ranges + bidb * mm_prefix_range_batch_stride)
         , mm_prefix_range_batch_stride(mm_prefix_range_batch_stride)
-        , max_mm_prefix_ranges(max_mm_prefix_ranges) {
+        , max_mm_prefix_ranges(max_mm_prefix_ranges)
+        , rows_per_position(rows_per_position_) {
     };
 
     __forceinline__ __device__ bool mm_prefix_allowed(const int row_idx, const int col_idx) const {
@@ -196,8 +200,14 @@ struct Mask {
                     #pragma unroll
                     for (int i = 0; i < size<0, 0>(tensor); ++i) {
                         const int row_idx = row_idx_base + i * 8;
-                        const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
-                        const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
+                        // Свёртка GQA (rows_per_position > 1): строка r — это
+                        // (позиция r/rpp, группа r%rpp), причинная граница
+                        // задаётся позицией. row_idx здесь становится позицией,
+                        // seqlen_q — числом позиций (k = seqlen_q/rpp).
+                        const int row_idx_c = rows_per_position > 1 ? row_idx / rows_per_position : row_idx;
+                        const int seqlen_q_c = rows_per_position > 1 ? max_seqlen_q / rows_per_position : max_seqlen_q;
+                        const int col_idx_limit_left = std::max(0, row_idx_c + max_seqlen_k - seqlen_q_c - window_size_left);
+                        const int col_idx_limit_right = std::min(max_seqlen_k, row_idx_c + 1 + max_seqlen_k - seqlen_q_c + window_size_right);
                         #pragma unroll
                         for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                             const int col_idx_base = col_idx_offset + nj * 8;

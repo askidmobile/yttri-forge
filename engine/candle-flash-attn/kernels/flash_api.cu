@@ -127,6 +127,10 @@ extern "C" void run_mha(
     uint32_t v_scale_row_stride,
     int kv_is_q8,
 
+    // Строк запроса на позицию (свёртка GQA, one-pass verify). 0/1 — обычная
+    // раскладка; >1 — причинная граница по позиции (см. mask.h).
+    int rows_per_position,
+
     void *stream_ptr
 ) {
     Flash_fwd_params params;
@@ -212,6 +216,7 @@ extern "C" void run_mha(
     params.v_scale_row_stride = v_scale_row_stride;
     params.v_scale_head_stride = 1;
     params.kv_is_q8 = kv_is_q8 != 0;
+    params.rows_per_position = rows_per_position;
 
     params.is_seqlens_k_cumulative = true;
     params.unpadded_lse = unpadded_lse;
@@ -231,11 +236,15 @@ extern "C" void run_mha(
         return e == nullptr || std::atoi(e) != 0;
     }();
     const bool is_decode = (seqlen_q == 1);
+    // Однопроходная проверка (rows_per_position > 1): seqlen_q = k*ngroups > 1,
+    // но сплиты считаются по правилу декода — иначе эвристика префилла даст
+    // другое число сплитов, и побитовая сверка с построчным эталоном развалится.
+    const bool decode_splits = is_decode || params.rows_per_position > 1;
     // При одном запросе маска ничего не режет: позиция запроса последняя,
     // так что и is_causal, и правое окно 0 эквивалентны полному вниманию.
     // Настоящее скользящее окно (window_size_left >= 0) так свернуть нельзя.
     const bool mask_is_noop = (window_size_left < 0) && (window_size_right <= 0);
-    if (gqa_swap_enabled && is_decode && h > h_k && mask_is_noop &&
+    if (gqa_swap_enabled && is_decode && rows_per_position <= 1 && h > h_k && mask_is_noop &&
         alibi_slopes_ptr == nullptr && d % 8 == 0) {
         const int ngroups = h / h_k;
         const auto q_head = params.q_head_stride;
@@ -294,7 +303,7 @@ extern "C" void run_mha(
         // попадает в правило ниже. small_q остаётся только для отчёта.
         const bool small_q = !is_decode && params.seqlen_q <= 16;
         int ns;
-        if (is_decode) {
+        if (decode_splits) {
             // Декод: запрос один, поэтому без сплитов сетка это b*h блоков
             // (16-32 на 28 SM) и карта простаивает. Апстримная эвристика
             // считает «волны» в предположении, что блок делает много работы,
@@ -303,7 +312,12 @@ extern "C" void run_mha(
             // 32 — 53.0. Целимся в 9 волн (на b=1 h=16 это ровно 16 сплитов),
             // оставляя каждому сплиту не меньше двух блоков ключей.
             const int target = 9 * num_sms;
-            const int denom = std::max(1, params.b * params.h * num_m_blocks);
+            // Слитая MTP-проверка подаёт позиции как batch с общей page table
+            // (нулевой batch-stride). Чтобы редукция совпадала с построчным
+            // эталоном, оставляем то же число K-сплитов на каждую позицию.
+            const int scheduling_b = params.block_table != nullptr
+                && params.block_table_batch_stride == 0 ? 1 : params.b;
+            const int denom = std::max(1, scheduling_b * params.h * num_m_blocks);
             ns = fa_ceildiv(target, denom);
             ns = std::min(ns, num_n_blocks / 2);
             ns = std::min(ns, 128);
@@ -311,7 +325,7 @@ extern "C" void run_mha(
         } else {
             ns = fa_num_splits_heuristic(params.b * params.h * num_m_blocks, num_sms, num_n_blocks, 128);
         }
-        if (forced_splits > 1 && is_decode) {
+        if (forced_splits > 1 && decode_splits) {
             ns = std::min(forced_splits, num_n_blocks);
         }
         // Печатаем по одному разу для декода (seqlen_q==1) и для префилла.

@@ -220,6 +220,7 @@ impl FlashAttn {
                 /* v_scale_batch_stride */ 0,
                 /* v_scale_row_stride */ 0,
                 /* kv_is_q8 */ 0,
+                /* rows_per_position */ 0,
                 /* stream_ptr */ stream.cu_stream() as *mut core::ffi::c_void,
             )
         }
@@ -823,13 +824,15 @@ impl FlashAttnVarLen {
                 /* max_mm_prefix_ranges */ max_mm_prefix_ranges,
                 // int8-пул идёт своим вызовом (real::paged_attn), не через эту
                 // обёртку: ей мешают дженерики по dtype.
-                /* k_scale_ptr */ std::ptr::null(),
+                /* k_scale_ptr */
+                std::ptr::null(),
                 /* v_scale_ptr */ std::ptr::null(),
                 /* k_scale_batch_stride */ 0,
                 /* k_scale_row_stride */ 0,
                 /* v_scale_batch_stride */ 0,
                 /* v_scale_row_stride */ 0,
                 /* kv_is_q8 */ 0,
+                /* rows_per_position */ 0,
                 /* stream_ptr */ stream.cu_stream() as *mut core::ffi::c_void,
             )
         }

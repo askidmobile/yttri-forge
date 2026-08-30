@@ -8,6 +8,7 @@ use candle_core::{CudaDevice, DType, Device, Result, Tensor};
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 pub const PAGE_SIZE: usize = 64;
+const MAX_VERIFY_ROWS: usize = 64;
 
 /// Разделяемый контекст paged decode на уровне модели (общий для attention слоёв).
 ///
@@ -25,8 +26,15 @@ pub struct PagedModelCtx {
     pub seqlens_q_t: Tensor,
     /// Prefill seqlens_q: [0, T] — пишется host-side ВНЕ графа (T фиксирован графом).
     pub seqlens_q_pf_t: Tensor,
+    /// Слитая MTP-проверка: статические [0, 1, ..., MAX_VERIFY_ROWS].
+    pub seqlens_q_verify_t: Tensor,
     /// Cumulative seqlens_k (kernel-written per step): [capacity_b + 1] i32.
     pub seqlens_k_t: Tensor,
+    /// Cumulative K-длины T позиций одного слота: [MAX_VERIFY_ROWS + 1].
+    pub seqlens_k_verify_t: Tensor,
+    /// Однопроходная проверка (QWEN36_VERIFY_ONEPASS): seqlens_k = [0, kv0+k]
+    /// для b=1 — device-cumsum из kv_len (capture-safe).
+    pub seqlens_k_onepass_t: Tensor,
     /// Block table: [capacity_b, max_blocks] u32 (bidx → slot pages).
     pub block_table_t: Tensor,
     /// RoPE positions: [capacity_b] u32.
@@ -79,6 +87,13 @@ impl PagedModelCtx {
         let seqlens_q_t = Tensor::from_vec(seqlens_q_host, capacity_b + 1, &device)?;
         let seqlens_k_t = Tensor::zeros(capacity_b + 1, DType::U32, &device)?;
         let seqlens_q_pf_t = Tensor::zeros(2, DType::U32, &device)?;
+        let seqlens_q_verify_t = Tensor::from_vec(
+            (0..=MAX_VERIFY_ROWS as u32).collect::<Vec<_>>(),
+            MAX_VERIFY_ROWS + 1,
+            &device,
+        )?;
+        let seqlens_k_verify_t = Tensor::zeros(MAX_VERIFY_ROWS + 1, DType::U32, &device)?;
+        let seqlens_k_onepass_t = Tensor::zeros(2, DType::U32, &device)?;
         let block_table_t = Tensor::zeros((capacity_b, max_blocks), DType::U32, &device)?;
         let rope_pos_t = Tensor::zeros(capacity_b, DType::U32, &device)?;
         Ok(Self {
@@ -87,7 +102,10 @@ impl PagedModelCtx {
             slots_dev,
             seqlens_q_t,
             seqlens_q_pf_t,
+            seqlens_q_verify_t,
             seqlens_k_t,
+            seqlens_k_verify_t,
+            seqlens_k_onepass_t,
             block_table_t,
             rope_pos_t,
             capacity_b,
@@ -226,6 +244,73 @@ impl PagedModelCtx {
         builder.arg(&slots_ptr);
         builder.arg(&out_ptr);
         let b_i32 = b as i32;
+        let t_i32 = t as i32;
+        builder.arg(&b_i32);
+        builder.arg(&t_i32);
+        unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        Ok(out)
+    }
+
+    /// MTP verify одного слота: cumulative длины последовательностей K равны
+    /// [0, kv0+1, (kv0+1)+(kv0+2), ...]. Каждая позиция становится отдельным
+    /// элементом batch и видит ровно тот же префикс, что в построчном пути.
+    pub fn seqlens_k_for_verify(&self, t: usize) -> Result<Tensor> {
+        if t == 0 || t > MAX_VERIFY_ROWS {
+            candle_core::bail!("verify rows must be in 1..={MAX_VERIFY_ROWS}, got {t}");
+        }
+        let func = self.dev.get_or_load_func(
+            "cumsum_seqlens_verify_single_slot",
+            &candle_core::cuda_backend::kernels::QUANTIZED,
+        )?;
+        let out = self.seqlens_k_verify_t.narrow(0, 0, t + 1)?;
+        let stream = self.dev.cuda_stream();
+        let (kv_len_ptr, _g1) = cudarc::driver::DevicePtr::device_ptr(&self.kv_len_dev, &stream);
+        let (slots_ptr, _g2) = cudarc::driver::DevicePtr::device_ptr(&self.slots_dev, &stream);
+        let out_ptr = tensor_cuda_ptr(&out)?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(&kv_len_ptr);
+        builder.arg(&slots_ptr);
+        builder.arg(&out_ptr);
+        let t_i32 = t as i32;
+        builder.arg(&t_i32);
+        unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        Ok(out)
+    }
+
+    pub fn seqlens_q_verify(&self, t: usize) -> Result<Tensor> {
+        if t == 0 || t > MAX_VERIFY_ROWS {
+            candle_core::bail!("verify rows must be in 1..={MAX_VERIFY_ROWS}, got {t}");
+        }
+        self.seqlens_q_verify_t.narrow(0, 0, t + 1)
+    }
+
+    /// Однопроходная проверка одного слота: b=1, длина K = kv_len[slot]+k.
+    /// slot берётся из slots_dev[0] (стейджится вызовом stage_inputs).
+    /// Device-cumsum — capture-safe, как seqlens_k_for_prefill.
+    pub fn seqlens_k_onepass(&self, t: usize) -> Result<Tensor> {
+        if t == 0 || t > MAX_VERIFY_ROWS {
+            candle_core::bail!("verify rows must be in 1..={MAX_VERIFY_ROWS}, got {t}");
+        }
+        let func = self.dev.get_or_load_func(
+            "cumsum_seqlens_from_kvlen_offset",
+            &candle_core::cuda_backend::kernels::QUANTIZED,
+        )?;
+        let out = self.seqlens_k_onepass_t.clone();
+        let stream = self.dev.cuda_stream();
+        let (kv_len_ptr, _g1) = cudarc::driver::DevicePtr::device_ptr(&self.kv_len_dev, &stream);
+        let (slots_ptr, _g2) = cudarc::driver::DevicePtr::device_ptr(&self.slots_dev, &stream);
+        let out_ptr = tensor_cuda_ptr(&out)?;
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let mut builder = func.builder();
+        builder.arg(&kv_len_ptr);
+        builder.arg(&slots_ptr);
+        builder.arg(&out_ptr);
+        let b_i32 = 1i32;
         let t_i32 = t as i32;
         builder.arg(&b_i32);
         builder.arg(&t_i32);
