@@ -246,7 +246,8 @@ impl<M: BatchModel> BatchScheduler<M> {
     }
 
     /// Prefix-cache admit: snapshot уже покрывает `primed_prefix_len` токенов
-    /// prompt'а. Слот стартует в Prefilling с prefill_done = primed_prefix_len —
+    /// prompt'а (произвольной длины). Слот стартует в Prefilling с
+    /// prefill_done = primed_prefix_len —
     /// остаётся ОДИН токен (последний), который прогоняется через модель после
     /// restore snapshot'а (adapter.prefill_chunk, reset_first=false).
     /// Caller обязан внедрить snapshot через `model_mut().inject_slot_snapshot`
@@ -257,7 +258,17 @@ impl<M: BatchModel> BatchScheduler<M> {
         max_new: usize,
         primed_prefix_len: usize,
     ) -> Option<usize> {
-        debug_assert!(primed_prefix_len + 1 == prompt.len());
+        // Прежний контракт «остался ровно один токен» отменён поиском по
+        // префиксу: снимок покрывает произвольный префикс, хвост досчитывается
+        // обычным префилом (цикл ниже общий: reset_first = prefill_done == 0).
+        debug_assert!(
+            primed_prefix_len > 0,
+            "primed без префикса — это обычный submit"
+        );
+        debug_assert!(
+            primed_prefix_len < prompt.len(),
+            "префикс не короче промпта: досчитывать нечего, логитов в снимке нет"
+        );
         let req = SlotRequest {
             prompt,
             max_new,

@@ -307,6 +307,16 @@ pub struct Qwen35BatchAdapter {
     /// Per-slot snapshot после prefill — источник state для seed в batched buffers.
     /// Хранится и для time-multiplexed fallback (если batched decode disabled).
     slot_snaps: Vec<Option<StateSnapshot>>,
+    /// Снимок на границе последнего чанка префила — для prefix cache.
+    /// Снимок конца промпта для кеша непригоден: хвост промпта (суффикс
+    /// генерации `<|im_start|>assistant`) на следующем ходу заменяется
+    /// ответом, и запись перестаёт быть префиксом. Граница чанка лежит
+    /// заведомо раньше расхождения. Откатить снимок назад нельзя: три
+    /// четверти слоёв — DeltaNet с рекуррентным состоянием.
+    slot_prefix_snaps: Vec<Option<(usize, StateSnapshot)>>,
+    /// Снимать ли границу (включается сервером, когда кеш префикса активен):
+    /// лишний снимок стоит копии всего KV в VRAM.
+    capture_prefix: bool,
     /// Признак того, что слот уже засеян в batched buffers (после prefill).
     /// True = batched decode может использовать этот slot без повторного seed.
     slot_seeded: Vec<bool>,
@@ -520,6 +530,8 @@ impl Qwen35BatchAdapter {
             device,
             profile,
             slot_snaps: (0..num_slots).map(|_| None).collect(),
+            slot_prefix_snaps: (0..num_slots).map(|_| None).collect(),
+            capture_prefix: false,
             slot_seeded: vec![false; num_slots],
             #[cfg(feature = "cuda")]
             decode_graphs: Vec::new(),
@@ -601,6 +613,16 @@ impl Qwen35BatchAdapter {
     /// Сервер забирает его в LRU-кэш; при повторном prompt'е — inject + primed admit.
     pub fn slot_snapshot(&self, slot: usize) -> Option<StateSnapshot> {
         self.slot_snaps[slot].clone()
+    }
+
+    /// Включить снятие снимка на границе последнего чанка префила.
+    pub fn set_prefix_capture(&mut self, on: bool) {
+        self.capture_prefix = on;
+    }
+
+    /// Забрать снимок границы: (позиция, состояние). Одноразовый.
+    pub fn take_prefix_snapshot(&mut self, slot: usize) -> Option<(usize, StateSnapshot)> {
+        self.slot_prefix_snaps.get_mut(slot).and_then(Option::take)
     }
 
     /// Внедрить snapshot слоту (prefix-cache hit): при следующем prefill_chunk
@@ -866,6 +888,7 @@ impl BatchModel for Qwen35BatchAdapter {
             self.state_owner = None;
             self.model.clear_state();
             self.slot_snaps[sidx] = None;
+            self.slot_prefix_snaps[sidx] = None;
             self.slot_seeded[sidx] = false;
             #[cfg(feature = "cuda")]
             {
@@ -901,6 +924,16 @@ impl BatchModel for Qwen35BatchAdapter {
             return Err(anyhow!(
                 "prefill_chunk: slot {sidx} без snapshot и не reset"
             ));
+        }
+
+        // Снимок границы для prefix cache: состояние слота здесь отвечает
+        // ровно chunk.start_pos, и эта позиция кратна размеру чанка.
+        if self.capture_prefix && chunk.is_final && chunk.start_pos > 0 {
+            let snap = self
+                .model
+                .snapshot_slot_state(&self.device, sidx, chunk.start_pos)
+                .map_err(|e| anyhow!("prefix snapshot: {e}"))?;
+            self.slot_prefix_snaps[sidx] = Some((chunk.start_pos, snap));
         }
 
         let pf_restore = pf_t0.elapsed();
