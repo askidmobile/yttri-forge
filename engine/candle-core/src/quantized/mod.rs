@@ -11,6 +11,7 @@ mod dummy_metal;
 pub mod ggml_file;
 pub mod gguf_file;
 pub mod imatrix_file;
+pub mod iq1s;
 pub mod k_quants;
 pub mod q4k_opt;
 pub mod q4k_v3;
