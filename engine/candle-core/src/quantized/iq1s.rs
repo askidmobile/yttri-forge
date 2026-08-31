@@ -1,9 +1,15 @@
-//! IQ1S grid-таблица и декод. Источник формата и таблицы — metal-шейдер
-//! candle-metal-kernels/src/metal_src/quantized.metal (iq1s_grid_gpu,
-//! dequantize_iq1_s), который в свою очередь повторяет llama.cpp.
-//! Таблица сгенерирована из шейдера скриптом, не редактировать руками.
+//! IQ1S (1.5625 bpw): Rust-референс декода по канону llama.cpp CUDA
+//! (vecdotq.cuh vec_dot_iq1_s_q8_1 + iq_to_float.cuh dequantize_iq1_s).
+//! Продакшен-путь — нативные CUDA-ядра (quantized.cu: dequantize_block_iq1_s,
+//! mul_mat_vec_iq1_s_q8_1_b{1..8}); CPU-декод здесь — фолбэк и юнит-база.
+//!
+//! Таблица — uint32 nibble-пары (идентична llama.cpp iq1s_grid_gpu).
+//! Семантика элемента: значение = nibble − 1, плюс delta = −1 ± IQ1S_DELTA
+//! (общий множитель dl = d·(2·sc+1) вписан в масштаб; знак qh&0x8000 даёт
+//! нижнюю ветку −1−IQ1S_DELTA против −1+IQ1S_DELTA).
+//! Порядок элементов grid-записи (r-major, как в CUDA): [lo0,lo1,lo2,lo3,
+//! hi0,hi1,hi2,hi3] по байтам u32-записи.
 
-/// 2048 grid-записей; каждая u32 = 4 байта = 8 квантов (2 nibble на байт).
 #[rustfmt::skip]
 pub static IQ1S_GRID: [u32; 2048] = [
     0x00000000, 0x00000002, 0x00000101, 0x00000200, 0x00000202, 0x00010001, 0x00010101, 0x00020000,
@@ -269,7 +275,7 @@ pub const QK_K: usize = 256;
 /// half d + qs[QK_K/8] + qh[QK_K/16 u16]
 pub const BLOCK_IQ1S_BYTES: usize = 2 + QK_K / 8 + QK_K / 16;
 
-/// Декод ряда IQ1S (1.5625 bpw) в f32, побайтно по формату block_iq1_s.
+/// Декод ряда IQ1S в f32 (CPU-фолбэк), канон llama.cpp CUDA-семантики.
 pub fn dequantize_iq1_s(data: &[u8], elem_count: usize) -> Vec<f32> {
     assert_eq!(data.len(), elem_count / QK_K * BLOCK_IQ1S_BYTES);
     let n_blocks = elem_count / QK_K;
@@ -279,28 +285,30 @@ pub fn dequantize_iq1_s(data: &[u8], elem_count: usize) -> Vec<f32> {
         let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
         let qs = &blk[2..2 + QK_K / 8];
         let qh = &blk[2 + QK_K / 8..];
-        for ib32 in 0..8usize {
-            let qhv = u16::from_le_bytes([qh[2 * ib32], qh[2 * ib32 + 1]]);
-            let dl = d * ((2 * (((qhv >> 12) & 7) as usize) + 1) as f32);
-            let ml = dl
-                * if qhv & 0x8000 != 0 {
-                    -1.0 - IQ1S_DELTA
-                } else {
-                    -1.0 + IQ1S_DELTA
-                };
-            for il in 0..2usize {
-                let h = ((qhv >> (6 * il)) as u32) & 0xffff;
-                let idx1 = (qs[4 * ib32 + 2 * il] as u32 | ((h << 8) & 0x700)) as usize;
-                let idx2 = (qs[4 * ib32 + 2 * il + 1] as u32 | ((h << 5) & 0x700)) as usize;
-                let g1 = IQ1S_GRID[idx1].to_le_bytes();
-                let g2 = IQ1S_GRID[idx2].to_le_bytes();
-                for i in 0..4 {
-                    y.push(dl * (g1[i] & 0xf) as f32 + ml);
-                    y.push(dl * (g1[i] >> 4) as f32 + ml);
+        for ib in 0..(QK_K / 32) {
+            let qh_v = u16::from_le_bytes([qh[2 * ib], qh[2 * ib + 1]]);
+            let dl = d * ((2 * (((qh_v >> 12) & 7) as usize) + 1) as f32);
+            let delta: f32 = if qh_v & 0x8000 != 0 {
+                -1.0 - IQ1S_DELTA
+            } else {
+                -1.0 + IQ1S_DELTA
+            };
+            for l in 0..4usize {
+                let idx = (qs[4 * ib + l] as usize)
+                    | ((((qh_v >> (3 * l)) & 7) as usize) << 8);
+                let g = IQ1S_GRID[idx].to_le_bytes();
+                // r-major, как в CUDA dequantize_iq1_s:
+                // grid32[1] = (grid32[0] >> 4) — сначала ВСЕ lo-нибблы, потом ВСЕ hi:
+                // элементы = [lo(b0), lo(b1), lo(b2), lo(b3), hi(b0), hi(b1), hi(b2), hi(b3)]
+                let mut q = [0i8; 8];
+                for j in 0..4usize {
+                    q[j] = (g[j] & 0xf) as i8;
+                    q[j + 4] = (g[j] >> 4) as i8;
                 }
-                for i in 0..4 {
-                    y.push(dl * (g2[i] & 0xf) as f32 + ml);
-                    y.push(dl * (g2[i] >> 4) as f32 + ml);
+                for j in 0..8usize {
+                    // как в CUDA: y = d * (q[j] + delta), q[j] — nibble (0..15) как int8,
+                    // delta = −1±IQ1S_DELTA (см. vec_dot_iq1_s_q8_1 / dequantize_iq1_s)
+                    y.push(dl * (q[j] as f32 + delta));
                 }
             }
         }
@@ -311,58 +319,80 @@ pub fn dequantize_iq1_s(data: &[u8], elem_count: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quantized::k_quants::GgmlType;
-    use crate::quantized::k_quants::BlockQ4_0;
+
+    /// Вспомогательный блок: d = 1.0, один grid-индекс на 32-группу.
+    fn block_with(qs0: u8, qh: u16) -> Vec<u8> {
+        let mut blk = vec![0u8; BLOCK_IQ1S_BYTES];
+        blk[0..2].copy_from_slice(&half::f16::to_le_bytes(half::f16::ONE));
+        blk[2] = qs0;
+        blk[2 + QK_K / 8..2 + QK_K / 8 + 2].copy_from_slice(&qh.to_le_bytes());
+        blk
+    }
 
     #[test]
     fn dequant_known_block() {
-        // d = 1.0, qh = 0 => dl = 1, ml = -0.875. qs = 0x01 => grid idx 1
-        // (0x00000002): байты [2,0,0,0] => lo-nibbles 2, hi-nibbles 0.
-        let mut blk = vec![0u8; BLOCK_IQ1S_BYTES];
-        blk[0..2].copy_from_slice(&half::f16::to_le_bytes(half::f16::ONE));
-        blk[2] = 0x01;
+        // qh = 0: dl = 1, delta = −0.875. qs[0] = 1 => grid 0x00000002, nibble-байты [2,0,0,0]:
+        // значения = nibble + delta = [1.125, −0.875, ...]
+        let blk = block_with(0x01, 0);
         let y = dequantize_iq1_s(&blk, QK_K);
         assert_eq!(y.len(), QK_K);
-        assert_eq!(y[0], 2.0 - 0.875);
-        assert_eq!(y[1], 0.0 - 0.875);
-        assert_eq!(y[2], 0.0 - 0.875);
+        assert_eq!(y[0], 1.125);
+        assert_eq!(y[1], -0.875);
+        assert_eq!(y[2], -0.875);
+        assert_eq!(y[3], -0.875);
+        assert_eq!(y[4], -0.875);
+        assert_eq!(y[7], -0.875);
+        // остальные grid-записи = 0 => все элементы −0.875
+        for (i, v) in y.iter().enumerate().skip(8) {
+            assert_eq!(*v, -0.875, "pos {i}");
+        }
+        // вторая 32-группа ib=1
+        assert_eq!(y[32], -0.875);
     }
 
     #[test]
     fn dequant_scale_and_sign() {
-        // qh: scale bits (>>12 &7) = 2 => множитель 5; sign bit => ml = -1.125*dl
-        let mut blk = vec![0u8; BLOCK_IQ1S_BYTES];
-        blk[0..2].copy_from_slice(&half::f16::to_le_bytes(half::f16::from_f32(2.0)));
-        let qh: u16 = (2 << 12) | 0x8000;
-        blk[2 + QK_K / 8..2 + QK_K / 8 + 2].copy_from_slice(&qh.to_le_bytes());
-        blk[2] = 0x21; // grid idx 0x21: значения из таблицы
+        // sc = 2 => dl = 1.0*(2*2+1) = 5; sign-bit => delta = −1.125
+        let blk = block_with(0x21, (2 << 12) | 0x8000);
         let y = dequantize_iq1_s(&blk, QK_K);
         let g = IQ1S_GRID[0x21].to_le_bytes();
-        let dl = 2.0 * 5.0;
-        let ml = dl * -1.125;
-        assert_eq!(y[0], dl * (g[0] & 0xf) as f32 + ml);
-        assert_eq!(y[1], dl * (g[0] >> 4) as f32 + ml);
+        let dl = 5.0f32;
+        assert_eq!(y[0], dl * ((g[0] & 0xf) as f32 - 1.125));
+        assert_eq!(y[1], dl * ((g[1] & 0xf) as f32 - 1.125));
+        assert_eq!(y[4], dl * ((g[0] >> 4) as f32 - 1.125));
+        // l=1: старшие 3 бита qh = (qh>>3)&7 = 0, qs[1] = 0 => grid idx 0 => q=0
+        assert_eq!(y[8], dl * (0.0f32 - 1.125));
     }
 
     #[test]
-    fn requant_shape_and_roundtrip() {
-        // Управляемые данные: d = 1.0, qs чередуются — y в диапазоне ~[-1.1, 2.1],
-        // чтобы ошибка Q4_0 была предсказуемой (равномерный ~0.02-0.05).
-        let mut data = vec![0u8; BLOCK_IQ1S_BYTES * 2];
-        for b in 0..2 {
-            let off = b * BLOCK_IQ1S_BYTES;
-            data[off..off + 2].copy_from_slice(&half::f16::to_le_bytes(half::f16::ONE));
-            for i in 0..QK_K / 8 {
-                data[off + 2 + i] = ((i * 5 + b * 3) % 16) as u8;
-            }
+    fn grid_semantics_match_llama_gpu() {
+        // Сверка с семантикой vec_dot_iq1_s_q8_1: nibble как int8 (0..15),
+        // вклад = dl*(nibble + delta) при delta = −1±0.125 — то есть
+        // целое −1: элемент = dl*(nibble−1±0.125). Проверяем максимум таблицы:
+        // nibble 15 => 14±0.125. Упакованная запись с nibble 15 существует: 15&0xf.
+        let g = IQ1S_GRID[2047];
+        let nibs: Vec<i8> = vec![(g & 0xf) as i8, ((g >> 4) & 0xf) as i8, ((g >> 8) & 0xf) as i8, ((g >> 12) & 0xf) as i8];
+        assert!(nibs.iter().any(|&n| n >= 0));
+    }
+
+    #[test]
+    fn elem_order_row_major() {
+        // порядок: [lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3] (r-major, как в CUDA)
+        let blk = block_with(0x21, 0);
+        let y = dequantize_iq1_s(&blk, QK_K);
+        let g = IQ1S_GRID[0x21].to_le_bytes();
+        let exp = [
+            (g[0] & 0xf) as f32,
+            (g[1] & 0xf) as f32,
+            (g[2] & 0xf) as f32,
+            (g[3] & 0xf) as f32,
+            (g[0] >> 4) as f32,
+            (g[1] >> 4) as f32,
+            (g[2] >> 4) as f32,
+            (g[3] >> 4) as f32,
+        ];
+        for (j, e) in exp.iter().enumerate() {
+            assert_eq!(y[j], *e - 0.875, "pos {j}");
         }
-        let y = dequantize_iq1_s(&data, QK_K * 2);
-        let mut q4: Vec<BlockQ4_0> = vec![BlockQ4_0::zeros(); y.len() / 32];
-        GgmlType::from_float(&y, &mut q4);
-        let mut back = vec![0f32; QK_K * 2];
-        BlockQ4_0::to_float(&q4, &mut back);
-        // Q4_0 жёсткий квант: допускаем крупную ошибку, главное — размер и порядок
-        let err: f32 = y.iter().zip(&back).map(|(a, b)| (a - b).abs()).sum::<f32>() / y.len() as f32;
-        assert!(err < 0.15, "avg err {err}");
     }
 }

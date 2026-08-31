@@ -1096,6 +1096,22 @@ static const __device__ uint64_t iq2xs_grid[512] = {
     0x2b2b2b2b082b2b08, 0x2b2b2b2b082b2b2b, 0x2b2b2b2b2b190819, 0x2b2b2b2b2b2b2b2b,
 };
 
+// --- IQ1_S (1.5625 bpw) — порт из llama.cpp master --------------------------
+// Канон — CPU-таблица-алгоритмы llama.cpp (ggml-quants.c, vecdotq.cuh):
+// uint32-таблица iq1s_grid_gpu (nibbles) + 3-битные поля qh по 3*l.
+// НЕ сверять с metal-шейдером данного форка — там искажённая раскладка qh.
+#define QR1_S 8
+#define QI1_S (QK_K / (4 * QR1_S))
+#define IQ1S_DELTA 0.125f
+#define VDR_IQ1_S_Q8_1_MMVQ 1
+
+typedef struct {
+    ggml_half d;             // супер-масштаб блока (f16)
+    uint8_t  qs[QK_K/8];     // низкие 8 бит grid-индекса (по байту на grid)
+    uint16_t qh[QK_K/32];    // старшие 3 бита по 3*l + знак дельты + 3-битный множитель
+} block_iq1_s;
+static_assert(sizeof(block_iq1_s) == 2 + QK_K/8 + QK_K/16, "wrong iq1_s block size");
+
 // --- IQ1_M (1.75 bpw, Qwen3.8 UD: ssm_beta/ssm_alpha) -----------------------
 // Порт из llama.cpp. Таблица в __device__ global, НЕ __constant__ (см. урок
 // про дивергентные lookup выше).
@@ -2195,6 +2211,32 @@ static __device__ void dequantize_block_iq2_xs(const void * __restrict__ vx, dst
     yy[i * QK_K + pos] = value;
 }
 
+// IQ1_S dequantize — вербатим-порт llama.cpp dequantize_iq1_s (iq_to_float.cuh).
+// 256 тредов: il = tid/8 — номер grid-записи в 32-группе (4 записи по 8 эл),
+// ib = tid%8 — номер 32-группы. Один grid u32 = 8 int8-значений (пары nibbles).
+template<typename dst_t>
+static __device__ void dequantize_block_iq1_s(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int tid = threadIdx.x; // 0..255
+    const int i = blockIdx.x;
+    const block_iq1_s * x = (const block_iq1_s *) vx;
+
+    const int64_t il = tid/8; // 0..3
+    const int64_t ib = tid%8; // 0..7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+
+    const float delta = x[i].qh[ib] & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    const float d = __half2float(x[i].d) * (2*((x[i].qh[ib] >> 12) & 7) + 1);
+
+    uint32_t grid32[2];
+    grid32[0] = iq1s_grid_gpu[x[i].qs[4*ib+il] | (((x[i].qh[ib] >> 3*il) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+    const int8_t * q = (const int8_t *)grid32;
+    for (int j = 0; j < 8; ++j) {
+        y[j] = (dst_t)(d * (q[j] + delta));
+    }
+}
+
 // IQ2_XXS dequantize: 256 threads per block, 1 element per thread.
 // Ported from Metal dequantize_iq2_xxs (quantized.metal:7081-7103).
 template<typename dst_t>
@@ -2305,6 +2347,7 @@ DEQUANTIZE_K(iq3_s)
 DEQUANTIZE_K(iq2_xs)
 DEQUANTIZE_K(iq2_xxs)
 DEQUANTIZE_K(iq4_xs)
+DEQUANTIZE_K(iq1_s)
 DEQUANTIZE_K(iq1_m)
 DEQUANTIZE(q4_0)
 DEQUANTIZE(q4_1)
@@ -3771,6 +3814,37 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
     return s * 0x01010101;
+}
+
+static __device__ __forceinline__ float vec_dot_iq1_s_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+
+    const block_iq1_s * bq1 = (const block_iq1_s *) vbq;
+
+    const int       qs_packed = get_int_from_uint8_aligned(reinterpret_cast<const uint8_t *>(bq1->qs), iqs);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq1->qh[iqs];
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int grid = iq1s_grid_gpu[qs[l0/2] | (((qh >> 3*(l0/2)) & 0x07) << 8)];
+
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+
+        const int u0 = get_int_from_int8_aligned(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_from_int8_aligned(bq8_1[iqs].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+    }
+
+    const float  d1q   = __half2float(bq1->d) * (((qh >> 11) & 0x0E) + 1);
+    const float  delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
+    const float2 ds    = __half22float2(bq8_1[iqs].ds);
+    return d1q * (ds.x*sumi + ds.y*delta);
 }
 
 static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
@@ -5459,6 +5533,12 @@ MMVQ_Q6_K_HOISTED_EXTERN(8)
 #endif
 
 #define MMVQ_IQ_EXTERN(B) \
+extern "C" __global__ void mul_mat_vec_iq1_s_q8_1_cuda##B( \
+    const void * vx, const void * vy, float * dst, \
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) { \
+    mul_mat_vec_q<B, QK_K, QI1_S, block_iq1_s, VDR_IQ1_S_Q8_1_MMVQ, vec_dot_iq1_s_q8_1> \
+        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); \
+} \
 extern "C" __global__ void mul_mat_vec_iq1_m_q8_1_cuda##B( \
     const void * vx, const void * vy, float * dst, \
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) { \

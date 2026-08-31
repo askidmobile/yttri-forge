@@ -230,22 +230,11 @@ pub fn qtensor_from_ggml(
         GgmlDType::IQ1M => {
             from_raw_data_bytes(raw_data, size_in_bytes, dims, ggml_dtype, device)
         }
-        // IQ1S: CUDA-ядра в candle-kernels нет (только Metal), поэтому при
-        // загрузке переквантовуем в Q4_0: декод на CPU по формату из metal-шейдера,
-        // дальше весь путь (mmvq/mmq) — как у обычного Q4_0. Рост VRAM ~2.9x
-        // на самих IQ1S-тензорах (~0.35 ГБ → ~1 ГБ на 27B), зато без новых CUDA-ядер.
+        // IQ1S — нативные CUDA-ядра (квантовые байты как у остальных IQ-типов).
+        // CUDA-диспатчи: mmvq mul_mat_vec_iq1_s_q8_1_b{1..8} + dequantize f32/f16.
+        // Rust-референс декода — quantized::iq1s (юнит-тесты формы/порядка).
         GgmlDType::IQ1S => {
-            let elem_count: usize = dims.iter().product();
-            let y = super::iq1s::dequantize_iq1_s(&raw_data[..size_in_bytes], elem_count);
-            let mut q4: Vec<k_quants::BlockQ4_0> =
-                vec![k_quants::BlockQ4_0::zeros(); elem_count / k_quants::QK4_0];
-            k_quants::GgmlType::from_float(&y, &mut q4);
-            let data: QStorage = match device {
-                Device::Cpu => QStorage::Cpu(Box::new(q4)),
-                Device::Metal(metal) => super::metal::load_quantized(metal, &q4)?,
-                Device::Cuda(cuda) => super::cuda::load_quantized(cuda, &q4)?,
-            };
-            super::QTensor::new(data, dims)
+            from_raw_data_bytes(raw_data, size_in_bytes, dims, ggml_dtype, device)
         }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }
