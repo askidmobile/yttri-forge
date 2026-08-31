@@ -1739,6 +1739,7 @@ impl QCudaStorage {
                 | GgmlDType::IQ2XXS
                 | GgmlDType::IQ1M
                 | GgmlDType::IQ4XS
+                | GgmlDType::IQ1S
         );
         let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             if iq_type && dequant_cache_enabled() {
@@ -1803,6 +1804,7 @@ impl QCudaStorage {
                 | GgmlDType::IQ2XXS
                 | GgmlDType::IQ1M
                 | GgmlDType::IQ4XS
+                | GgmlDType::IQ1S
         );
         // Кэшированная полная деквантизация (A100 80GB): один matmul по кэшу
         // вместо tiled dequant каждый вызов.
