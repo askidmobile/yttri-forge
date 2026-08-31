@@ -2,7 +2,7 @@
 // ВНИМАНИЕ: cudaforge кэширует nvcc-компиляцию по mtime/содержимому самого
 // .cu — изменения в инклюдах (mmq_common.cuh/mmq_gguf.cuh) кэш НЕ сбрасывают,
 // даже при сработавшем rerun-if-changed. Меняешь .cuh — бампни этот файл.
-// cache-bust: 2026-08-18 real IQ grid tables in mmq_common.cuh
+// cache-bust: 2026-08-31 IQ1_S native (full 2048-grid in mmq_common.cuh)
 // extern "C" __global__ обёртки над llama.cpp mul_mat_q (Tensor-Core MMA) для
 // плотного prefill. Вызываются из candle-core fast_mmq.rs через cudarc.
 // Включён в PTX-сборку (имя не совпадает с exclude "mmq_*.cu").
@@ -184,6 +184,10 @@ DEFINE_MMQ_DENSE(GGML_TYPE_IQ3_XXS, iq3_xxs, 128)
 DEFINE_MMQ_DENSE(GGML_TYPE_IQ3_S, iq3_s, 32)
 DEFINE_MMQ_DENSE(GGML_TYPE_IQ3_S, iq3_s, 64)
 DEFINE_MMQ_DENSE(GGML_TYPE_IQ3_S, iq3_s, 128)
+DEFINE_MMQ_DENSE(GGML_TYPE_IQ1_S, iq1_s, 32)
+DEFINE_MMQ_DENSE(GGML_TYPE_IQ1_S, iq1_s, 64)
+DEFINE_MMQ_DENSE(GGML_TYPE_IQ1_S, iq1_s, 128)
+
 DEFINE_MMQ_DENSE(GGML_TYPE_IQ4_XS, iq4_xs, 32)
 DEFINE_MMQ_DENSE(GGML_TYPE_IQ4_XS, iq4_xs, 64)
 DEFINE_MMQ_DENSE(GGML_TYPE_IQ4_XS, iq4_xs, 128)

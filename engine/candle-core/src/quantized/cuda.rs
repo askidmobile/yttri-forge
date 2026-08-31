@@ -1539,6 +1539,7 @@ impl QCudaStorage {
             GgmlDType::IQ3XXS => ("iq3_xxs", 76, "candle_mmq_quant_d4"),
             GgmlDType::IQ3S => ("iq3_s", 76, "candle_mmq_quant_d4"),
             GgmlDType::IQ4XS => ("iq4_xs", 76, "candle_mmq_quant_d4"),
+            GgmlDType::IQ1S => ("iq1_s", 76, "candle_mmq_quant_d4"),
             _ => return Ok(None),
         };
         let (n, k) = self_shape.dims2()?;
