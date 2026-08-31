@@ -1106,7 +1106,7 @@ static const __device__ uint64_t iq2xs_grid[512] = {
 #define VDR_IQ1_S_Q8_1_MMVQ 1
 
 typedef struct {
-    ggml_half d;             // супер-масштаб блока (f16)
+    half d;                  // супер-масштаб блока (f16)
     uint8_t  qs[QK_K/8];     // низкие 8 бит grid-индекса (по байту на grid)
     uint16_t qh[QK_K/32];    // старшие 3 бита по 3*l + знак дельты + 3-битный множитель
 } block_iq1_s;
