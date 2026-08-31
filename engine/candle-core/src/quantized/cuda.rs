@@ -1269,6 +1269,7 @@ impl QCudaStorage {
                 | GgmlDType::IQ2XS
                 | GgmlDType::IQ2XXS
                 | GgmlDType::IQ1M
+                | GgmlDType::IQ1S
                 | GgmlDType::IQ4XS
         );
         if fast_kernel {
