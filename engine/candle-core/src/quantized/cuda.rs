@@ -1539,7 +1539,9 @@ impl QCudaStorage {
             GgmlDType::IQ3XXS => ("iq3_xxs", 76, "candle_mmq_quant_d4"),
             GgmlDType::IQ3S => ("iq3_s", 76, "candle_mmq_quant_d4"),
             GgmlDType::IQ4XS => ("iq4_xs", 76, "candle_mmq_quant_d4"),
-            GgmlDType::IQ1S => ("iq1_s", 76, "candle_mmq_quant_d4"),
+            // IQ1S намеренно не в MMQ (ponytail: MMA-тайл IQ1_S даёт NaN — расхождение
+            // с llama.cpp не локализовано; потолок: медленнее prefill через dmmv.
+            // Апгрейд: локализовать тайл-несоответствие и вернуть mul_mat_q_iq1_s).
             _ => return Ok(None),
         };
         let (n, k) = self_shape.dims2()?;
