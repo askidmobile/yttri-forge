@@ -3821,7 +3821,11 @@ static __device__ __forceinline__ float vec_dot_iq1_s_q8_1(
 
     const block_iq1_s * bq1 = (const block_iq1_s *) vbq;
 
-    const int       qs_packed = get_int_from_uint8_aligned(reinterpret_cast<const uint8_t *>(bq1->qs), iqs);
+    // block_iq1_s = 50 байт — не кратен 4: qs может лежать по нечётным смещениям.
+    // Чтение строго БЕЗ выравнивания (как get_int_b2 в llama.cpp), иначе
+    // CUDA_ERROR_MISALIGNED_ADDRESS в MMVQ на реальном GGUF.
+    const int qs_packed = (int)bq1->qs[4*iqs+0] | ((int)bq1->qs[4*iqs+1] << 8)
+                        | ((int)bq1->qs[4*iqs+2] << 16) | ((int)bq1->qs[4*iqs+3] << 24);
     const uint8_t * qs        = (const uint8_t *) &qs_packed;
 
     const int qh = bq1->qh[iqs];
