@@ -235,7 +235,7 @@ fn dequantize_f32(
         GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f32", true, 256, nb),
         GgmlDType::IQ2XXS => ("dequantize_block_iq2_xxs_f32", true, 256, nb),
         GgmlDType::IQ1S => ("dequantize_block_iq1_s_f32", true, 32, nb),
-        GgmlDType::IQ1M => ("dequantize_block_iq1_m_f32", true, 256, nb),
+        GgmlDType::IQ1M => ("dequantize_block_iq1_m_f32", true, 32, nb),
         GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f32", true, 256, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
@@ -299,7 +299,7 @@ fn dequantize_f32_rowslice(
         GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f32", 256),
         GgmlDType::IQ2XXS => ("dequantize_block_iq2_xxs_f32", 256),
         GgmlDType::IQ1S => ("dequantize_block_iq1_s_f32", 32),
-        GgmlDType::IQ1M => ("dequantize_block_iq1_m_f32", 256),
+        GgmlDType::IQ1M => ("dequantize_block_iq1_m_f32", 32),
         GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f32", 256),
         // K-quants и Q8_0 — для MoE reference rowslice (Q8_0 эксперты).
         GgmlDType::Q2K => ("dequantize_block_q2_K_f32", 64),
@@ -366,7 +366,7 @@ fn dequantize_f16(
         GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f16", true, 256, nb),
         GgmlDType::IQ2XXS => ("dequantize_block_iq2_xxs_f16", true, 256, nb),
         GgmlDType::IQ1S => ("dequantize_block_iq1_s_f16", true, 32, nb),
-        GgmlDType::IQ1M => ("dequantize_block_iq1_m_f16", true, 256, nb),
+        GgmlDType::IQ1M => ("dequantize_block_iq1_m_f16", true, 32, nb),
         GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f16", true, 256, nb),
         // BF16 — не квант: простой cast bf16→f16 (dequantize_f16 вызывается
         // из QMatMul::from_arc для F16/BF16 весов; без этого полные BF16

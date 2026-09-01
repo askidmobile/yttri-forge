@@ -8243,6 +8243,24 @@ impl ModelWeights {
                         layer_in = layer_in.to_device(&block_dev)?;
                     }
                     layer_in = block.forward_prefill(&layer_in, index_pos)?;
+                    // Бисекция недетерминизма: QWEN36_BISECT_HIDDEN=N — после
+                    // слоя N печатать FNV-1a checksum hidden (первые 4 строки
+                    // каждого чанка). Два прогона в одном процессе покажут
+                    // слой, с которого расходятся биты.
+                    if let Ok(stop) = std::env::var("QWEN36_BISECT_HIDDEN") {
+                        if stop.as_str() == "all"
+                            || stop.parse::<usize>().map(|v| v == bi).unwrap_or(false)
+                        {
+                            let flat = layer_in.flatten_all()?.to_dtype(DType::F32)?;
+                            let v = flat.to_vec1::<f32>()?;
+                            let mut hash: u64 = 0xcbf29ce484222325;
+                            for x in &v {
+                                hash ^= x.to_bits() as u64;
+                                hash = hash.wrapping_mul(0x100000001b3);
+                            }
+                            eprintln!("[bisect] after block {bi}: fnv={hash:016x} n={}", v.len());
+                        }
+                    }
                     if trace {
                         let el = t0.elapsed().as_secs_f64() * 1000.0;
                         if block.is_deltanet() {
@@ -8272,12 +8290,26 @@ impl ModelWeights {
             self.truncate_kv_cache_to_window();
         } else {
             // Оптимальный путь: single token (авторегрессивная генерация)
-            for block in self.blocks.iter_mut() {
+            for (bi, block) in self.blocks.iter_mut().enumerate() {
                 let block_dev = block.device();
                 if !layer_in.device().same_device(&block_dev) {
                     layer_in = layer_in.to_device(&block_dev)?;
                 }
                 layer_in = block.forward(&layer_in, index_pos)?;
+                if let Ok(stop) = std::env::var("QWEN36_BISECT_HIDDEN") {
+                    if stop.as_str() == "all"
+                        || stop.parse::<usize>().map(|v| v == bi).unwrap_or(false)
+                    {
+                        let flat = layer_in.flatten_all()?.to_dtype(DType::F32)?;
+                        let v = flat.to_vec1::<f32>()?;
+                        let mut hash: u64 = 0xcbf29ce484222325;
+                        for x in &v {
+                            hash ^= x.to_bits() as u64;
+                            hash = hash.wrapping_mul(0x100000001b3);
+                        }
+                        eprintln!("[bisect] decode after block {bi}: fnv={hash:016x} n={}", v.len());
+                    }
+                }
             }
         }
 

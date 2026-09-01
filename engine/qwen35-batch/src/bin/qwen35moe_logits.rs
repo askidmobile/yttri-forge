@@ -212,6 +212,24 @@ fn main() -> Result<()> {
     })?;
     let prefill = prefill_started.elapsed();
 
+    // Двойной prefill в одном процессе: детекция гонки ядер против
+    // межпроцессного состояния. QWEN36_LOGITS_DOUBLE=1 печатает второй
+    // prefill той же кучи токенов (state reset), checksum сравним вручную.
+    if std::env::var("QWEN36_LOGITS_DOUBLE").as_deref() == Ok("1") {
+        let logits2 = adapter.prefill_chunk(&PrefillChunk {
+            slot_idx: 0,
+            reset_first: true,
+            tokens: prompt_tokens.clone(),
+            start_pos: 0,
+            is_final: true,
+        })?;
+        println!(
+            "{}",
+            serde_json::to_string(&record(0, &logits2, false))
+                .context("serialize double prefill record")?
+        );
+    }
+
     let mut full_steps = BTreeSet::new();
     if let Ok(value) = std::env::var("QWEN36_LOGITS_FULL_STEP") {
         full_steps.insert(

@@ -1,6 +1,5 @@
 //! Support for the GGML file format.
 
-use super::k_quants::GgmlType;
 use super::{k_quants, GgmlDType, QStorage};
 use crate::{Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt};

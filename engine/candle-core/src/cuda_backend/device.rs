@@ -424,6 +424,21 @@ impl CudaDevice {
         stream: Arc<cudarc::driver::CudaStream>,
     ) -> Result<Self> {
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
+        // Детерминизм GEMM: запретить cuBLAS эпилоги с атомиками (split-K).
+        // Дрейф логитов ±0.02–0.06 на 27B (K=5120) — замер 2026-09-01:
+        // 4 идентичных прогона prefill давали 4 разных checksum; на 4B
+        // (K=2560) тот же путь стабилен — эвристика algos под большие формы
+        // выбирает атомарные редукции. NOT_ALLOWED — канон от NVIDIA
+        // (используется cudnn/cublas для bit-exact повторов).
+        let status = unsafe {
+            cudarc::cublas::sys::cublasSetAtomicsMode(
+                *blas.handle(),
+                cudarc::cublas::sys::cublasAtomicsMode_t::CUBLAS_ATOMICS_NOT_ALLOWED,
+            )
+        };
+        if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            eprintln!("[cuda] cublasSetAtomicsMode(NOT_ALLOWED) failed: {status:?}");
+        }
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],

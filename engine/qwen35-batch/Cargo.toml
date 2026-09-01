@@ -166,3 +166,8 @@ required-features = ["real-model"]
 name = "tok_encode_probe"
 path = "src/bin/tok_encode_probe.rs"
 required-features = ["real-model"]
+
+[[bin]]
+name = "qwen36_verify_iq1s_dequant"
+path = "src/bin/verify_iq1s_dequant.rs"
+required-features = ["real-model"]
