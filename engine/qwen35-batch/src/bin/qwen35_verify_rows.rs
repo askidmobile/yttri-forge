@@ -100,6 +100,12 @@ fn main() -> Result<()> {
         }
     }
 
+    // ROWS_FORCE_DMMV=1: оба пути через dequant+cuBLAS вместо MMVQ. Проверяет
+    // гипотезу о том, что разницу даёт геометрия запуска MMVQ по b_size.
+    if std::env::var("ROWS_FORCE_DMMV").as_deref() == Ok("1") {
+        candle_core::quantized::cuda::set_force_dmmv(true);
+        println!("[rows] FORCE_DMMV включён");
+    }
     let device = Device::new_cuda(0)?;
     let mut model = Qwen35BatchAdapter::load(Path::new(&text), device, 1)?;
     model.load_mtp(Path::new(&mtp))?;
@@ -182,6 +188,33 @@ fn main() -> Result<()> {
         None => println!("[rows] ВЕРДИКТ: argmax совпал на всех {k} строках"),
         Some(r) => println!("[rows] ВЕРДИКТ: первая расхождение на строке {r} из {k}"),
     }
+
+    // Повторяемость самого пути проверки: два одинаковых вызова из одного
+    // состояния. Разные логиты = путь недетерминирован (гонка/грязный буфер).
+    // Одинаковые = путь стабилен, но систематически считает иначе, чем декод.
+    model.reset_slot(0)?;
+    let chunk = PrefillChunk {
+        slot_idx: 0,
+        reset_first: true,
+        tokens: prompt.clone(),
+        start_pos: 0,
+        is_final: true,
+    };
+    let _ = model.prefill_chunk(&chunk)?;
+    model.speculative_begin(0)?;
+    let multi2 = model.speculative_verify(0, &inputs, pos)?;
+    model.speculative_rollback(0)?;
+    let mut repeat_max = 0.0f32;
+    for row in 0..k {
+        let (d, _) = max_abs_diff(&multi[row], &multi2[row]);
+        if d > repeat_max {
+            repeat_max = d;
+        }
+    }
+    println!(
+        "[rows] повтор той же проверки: max|Δ|={repeat_max:.6} ({})",
+        if repeat_max == 0.0 { "путь ДЕТЕРМИНИРОВАН" } else { "путь НЕДЕТЕРМИНИРОВАН" }
+    );
 
     // Один раунд почти всегда совпадает по argmax: |Δlogit| ~0.3 переворачивает
     // выбор только там, где зазор до второго кандидата меньше. Считаем, как
