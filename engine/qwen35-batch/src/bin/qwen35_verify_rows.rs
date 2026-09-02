@@ -61,7 +61,7 @@ fn top2_gap(v: &[f32]) -> f32 {
     v1 - v2
 }
 
-fn build_prompt(model: &Path, n: usize) -> Result<Vec<u32>> {
+fn build_prompt(model: &Path, n: usize, offset: usize) -> Result<Vec<u32>> {
     let tok = tokenizer::load_from_gguf_path(model)?;
     let path = std::env::var("QWEN36_GATE_CORPUS")
         .unwrap_or_else(|_| "/root/ppl-corpus.txt".to_string());
@@ -74,7 +74,8 @@ fn build_prompt(model: &Path, n: usize) -> Result<Vec<u32>> {
     if ids.is_empty() {
         return Err(anyhow!("корпус {path} дал пустой набор токенов"));
     }
-    Ok(ids.into_iter().cycle().take(n).collect())
+    let skip = offset % ids.len();
+    Ok(ids.into_iter().cycle().skip(skip).take(n).collect())
 }
 
 fn main() -> Result<()> {
@@ -83,7 +84,7 @@ fn main() -> Result<()> {
         .next()
         .context("usage: qwen35_verify_rows TEXT.gguf MTP.gguf [--prompt N] [--k K]")?;
     let mtp = argv.next().context("missing MTP.gguf")?;
-    let (mut prompt_len, mut k) = (512usize, 4usize);
+    let (mut prompt_len, mut k, mut offset) = (512usize, 4usize, 0usize);
     let rest: Vec<String> = argv.collect();
     let mut i = 0;
     while i < rest.len() {
@@ -94,6 +95,10 @@ fn main() -> Result<()> {
             }
             "--k" => {
                 k = rest[i + 1].parse()?;
+                i += 2;
+            }
+            "--offset" => {
+                offset = rest[i + 1].parse()?;
                 i += 2;
             }
             other => return Err(anyhow!("неизвестный аргумент {other}")),
@@ -109,8 +114,8 @@ fn main() -> Result<()> {
     let device = Device::new_cuda(0)?;
     let mut model = Qwen35BatchAdapter::load(Path::new(&text), device, 1)?;
     model.load_mtp(Path::new(&mtp))?;
-    let prompt = build_prompt(Path::new(&text), prompt_len)?;
-    println!("[rows] prompt={} k={}", prompt.len(), k);
+    let prompt = build_prompt(Path::new(&text), prompt_len, offset)?;
+    println!("[rows] prompt={} k={} offset={offset}", prompt.len(), k);
 
     // Префилл слота 0 одним чанком: дальше оба пути стартуют из этого состояния.
     let chunk = PrefillChunk {

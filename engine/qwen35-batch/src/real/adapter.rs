@@ -38,6 +38,12 @@ struct PendingVerify {
     inputs: Vec<u32>,
     pos: usize,
     hidden: Tensor,
+    /// Писал ли путь проверки теневые снимки DeltaNet. Их пишет ТОЛЬКО
+    /// графовый `forward_verify_paged` (shadow=true и b>1); построчный
+    /// `verify_eager` идёт с b=1, где `shadow_rows = b - 1 = 0`.
+    /// `speculative_accept` при частичном приёме обязан смотреть на это, а не
+    /// на `paged_authority`: иначе восстанавливается снимок, которого нет.
+    shadow_written: bool,
 }
 
 /// Адаптер реальной Qwen3.5-4B над `BatchModel` (true batched decode).
@@ -1548,7 +1554,7 @@ impl BatchModel for Qwen35BatchAdapter {
         let rope_positions = self.rope_positions_for(slot, pos, k)?;
         let slots = vec![slot as u32; k];
         #[cfg(feature = "cuda")]
-        let (flat, hidden) = if self.paged_authority(slot) {
+        let (flat, hidden, shadow_written) = if self.paged_authority(slot) {
             // Пул — единственная копия KV слота: проверка идёт по нему графом.
             // k строк одного слота — это префил-чанк длины k (append k позиций
             // подряд + FA2 varlen с причинной маской), а НЕ декод B=k: у
@@ -1567,16 +1573,25 @@ impl BatchModel for Qwen35BatchAdapter {
             let rope_host: Vec<u32> = rope_positions.iter().map(|&p| p as u32).collect();
             let (flat, hidden, _) = self.paged_graph_run(true, slot, pos, inputs, rope_host)?;
             self.model.paged_ctx.as_mut().unwrap().kv_len_host[slot] = (pos + k) as u32;
-            (flat, hidden)
+            // Графовый путь зовёт forward_verify_paged с shadow=true: при k>1
+            // теневые снимки записаны, откат может на них опереться.
+            (flat, hidden, k > 1)
         } else {
-            self.verify_eager(inputs, &cache_positions, &rope_positions, &slots)?
+            let (flat, hidden) =
+                self.verify_eager(inputs, &cache_positions, &rope_positions, &slots)?;
+            (flat, hidden, false)
         };
         #[cfg(not(feature = "cuda"))]
-        let (flat, hidden) = self.verify_eager(inputs, &cache_positions, &rope_positions, &slots)?;
+        let (flat, hidden, shadow_written) = {
+            let (flat, hidden) =
+                self.verify_eager(inputs, &cache_positions, &rope_positions, &slots)?;
+            (flat, hidden, false)
+        };
         self.verify_pending[slot] = Some(PendingVerify {
             inputs: inputs.to_vec(),
             pos,
             hidden,
+            shadow_written,
         });
         let vocab = self.vocab_size();
         if flat.len() != k * vocab {
@@ -1605,7 +1620,11 @@ impl BatchModel for Qwen35BatchAdapter {
         #[cfg(not(feature = "cuda"))]
         let paged = false;
         if consumed < k {
-            if paged && consumed > 0 {
+            // Снимки пишет только графовая проверка (`forward_verify_paged`,
+            // shadow=true при b>1). Построчный `verify_eager` их не пишет, и
+            // без этой проверки restore_slot_from_shadow подсунул бы состояние
+            // чужого раунда.
+            if paged && consumed > 0 && pending.shadow_written {
                 // Ф3: без перепрогона. DeltaNet возвращается к теневому снимку
                 // после строки consumed-1 — он снят внутри графа проверки
                 // (delta_rule_batched_cuda::dispatch_delta_rule_batched_seq,
@@ -1648,19 +1667,29 @@ impl BatchModel for Qwen35BatchAdapter {
                     self.model
                         .rehydrate_kv_from_paged(slot)
                         .map_err(|e| anyhow!("speculative accept rehydrate: {e}"))?;
-                    let cache_positions: Vec<usize> =
-                        (pending.pos..pending.pos + consumed).collect();
+                    // Построчно, а не одним батчем: геометрия ядра матвека
+                    // зависит от размера батча, поэтому перепрогон пачкой
+                    // оставлял бы состояние, не равное состоянию обычного
+                    // декода — та же причина, что и у батчевой проверки
+                    // (см. verify_eager). Наружу это выглядело как выпавший
+                    // токен: «index. html» вместо «index.html».
                     let rope_positions = self.rope_positions_for(slot, pending.pos, consumed)?;
-                    let ids = Tensor::from_vec(
-                        pending.inputs[..consumed].to_vec(),
-                        (consumed, 1usize),
-                        &self.device,
-                    )?;
-                    let slots = vec![slot as u32; consumed];
-                    let _ = self
-                        .model
-                        .forward_decode_batch(&ids, &cache_positions, &rope_positions, &slots)
-                        .map_err(|error| anyhow!("speculative accept re-run: {error}"))?;
+                    for row in 0..consumed {
+                        let ids = Tensor::from_vec(
+                            vec![pending.inputs[row]],
+                            (1usize, 1usize),
+                            &self.device,
+                        )?;
+                        let _ = self
+                            .model
+                            .forward_decode_batch(
+                                &ids,
+                                &[pending.pos + row],
+                                &rope_positions[row..=row],
+                                &[slot as u32],
+                            )
+                            .map_err(|error| anyhow!("speculative accept re-run: {error}"))?;
+                    }
                 }
             }
         }
