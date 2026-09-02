@@ -965,7 +965,14 @@ impl BatchModel for Qwen35BatchAdapter {
             // Перезалитый пул снова авторитетен: graph-префилл продолжит
             // append с kv_len_host = cache_len снимка. Если пул недоступен
             // (не CUDA / int8) — авторитет остаётся за single-slot/batched.
-            self.paged_dirty[sidx] = !pool_ok;
+            // Само поле существует только на CUDA: вне её страничного пула
+            // нет, и авторитет всегда за single-slot/batched.
+            #[cfg(feature = "cuda")]
+            {
+                self.paged_dirty[sidx] = !pool_ok;
+            }
+            #[cfg(not(feature = "cuda"))]
+            let _ = pool_ok;
             if pool_ok {
                 // K/V уже скопирован в постоянный paged pool. Не держим вторую
                 // копию длиной со весь префикс во время suffix-prefill/decode.

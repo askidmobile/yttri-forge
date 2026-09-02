@@ -22,6 +22,13 @@ env_logger = { version = "0.11", optional = true }
 serde_json = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# На macOS backend всегда Metal: весь код под `cfg(target_os = "macos")`
+# зовёт методы MetalDevice, которые есть только при этой фиче. Без неё
+# candle-core подставляет пустышку dummy_metal_backend, и сборка без
+# `--features metal` разваливалась (121 ошибка). Включаем фичу платформой,
+# а не 152 правками гейтов на `all(target_os, feature)`.
+candle-core = { path = "../candle-core", features = ["metal"] }
+candle-nn = { path = "../candle-nn", features = ["metal"] }
 candle-metal-kernels = { path = "../candle-metal-kernels" }
 objc2 = "0.6.3"
 objc2-metal = "0.3.2"
@@ -44,6 +51,14 @@ cuda = [
     "dep:cudarc",
     "dep:candle-flash-attn",
 ]
+
+# Тест зовёт real::ytf16 и без объявления собирался даже без фич.
+# Соседи (vision_qwen35, prefix_snapshot_parity) закрыты внутренним
+# `#![cfg(feature = "real-model")]`, здесь такого нет.
+[[test]]
+name = "ytf16_compat"
+path = "tests/ytf16_compat.rs"
+required-features = ["real-model"]
 
 [[test]]
 name = "fa2_paged"
@@ -170,4 +185,11 @@ required-features = ["real-model"]
 [[bin]]
 name = "qwen36_verify_iq1s_dequant"
 path = "src/bin/verify_iq1s_dequant.rs"
+required-features = ["real-model"]
+
+# Без объявления бинарь собирался всегда и ломал `cargo check` без фич:
+# он импортирует qwen35_batch::real, а этот модуль живёт за `real-model`.
+[[bin]]
+name = "qwen35_verify_fused_logits"
+path = "src/bin/qwen35_verify_fused_logits.rs"
 required-features = ["real-model"]

@@ -4120,6 +4120,7 @@ impl GatedAttentionLayer {
     /// декода. Одна причинная FA2 на k строк свёртку не получает (маска не
     /// noop): 24 CTA читают KV шестикратно, и цена растёт с контекстом —
     /// +9 мс над шагом декода на 32K, +30 мс на 128K (замер 2026-08-27).
+    #[cfg(feature = "cuda")]
     fn forward_attn_prefill_paged(
         &mut self,
         x: &Tensor,
@@ -5405,6 +5406,7 @@ impl HybridBlock {
     #[cfg(feature = "cuda")]
     /// yttri-forge: paged prefill pass для одного блока (graph-friendly).
     /// x: [1, T, n_embd]; rope_pos_dev: [T] u32 (позиции start..start+T).
+    #[cfg(feature = "cuda")]
     fn forward_prefill_paged(
         &mut self,
         x: &Tensor,
@@ -5506,6 +5508,7 @@ impl HybridBlock {
         ffn_out + residual
     }
 
+    #[cfg(feature = "cuda")]
     fn forward_decode_batch_paged(
         &mut self,
         x: &Tensor,
@@ -8562,6 +8565,7 @@ impl ModelWeights {
     /// kv_len_dev[slot] должен быть выставлен в start_pos ДО вызова (host H2D).
     /// Возвращает (logits_last [1,vocab] F32, hidden_all [1,T,n_embd]).
     /// Требует: MTP off, vision off, cuda_ctx на DeltaNet слоях, paged pool.
+    #[cfg(feature = "cuda")]
     pub fn forward_prefill_graphed(
         &mut self,
         emb_in: &Tensor,
@@ -8636,6 +8640,7 @@ impl ModelWeights {
         Ok((self.output.forward(&hidden)?, hidden))
     }
 
+    #[cfg(feature = "cuda")]
     pub fn forward_decode_batch_graphed(
         &mut self,
         emb_in: &Tensor,
