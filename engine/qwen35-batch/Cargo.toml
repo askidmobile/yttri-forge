@@ -162,6 +162,12 @@ name = "qwen35_mtp_probe"
 path = "src/bin/qwen35_mtp_probe.rs"
 required-features = ["real-model", "cuda"]
 
+# Пробник: логиты многострочной проверки против одиночных декодов.
+[[bin]]
+name = "qwen35_verify_rows"
+path = "src/bin/qwen35_verify_rows.rs"
+required-features = ["real-model", "cuda"]
+
 [[bin]]
 name = "qwen35_mtp_gate"
 path = "src/bin/qwen35_mtp_gate.rs"
