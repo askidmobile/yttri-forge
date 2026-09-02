@@ -1881,16 +1881,61 @@ impl Qwen35BatchAdapter {
         self.model
             .rehydrate_kv_from_paged(slots[0] as usize)
             .map_err(|e| anyhow!("speculative verify rehydrate: {e}"))?;
-        let ids = Tensor::from_vec(inputs.to_vec(), (inputs.len(), 1usize), &self.device)?;
-        let (logits, hidden) = self
-            .model
-            .forward_decode_batch_with_hidden(&ids, cache_positions, rope_positions, slots)
-            .map_err(|error| anyhow!("speculative verify forward: {error}"))?;
-        let flat = logits
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()
-            .map_err(|error| anyhow!("speculative verify logits: {error}"))?;
+
+        // Строки идут по одной, а не одним батчем: геометрия запуска MMVQ
+        // зависит от размера батча (`mul_mat_vec_via_q8_1`: b_size=1 даёт
+        // (nrows,4), 2..=4 даёт (nrows/2,4)), а разная раскладка потоков меняет
+        // порядок суммирования — сложение f32 не ассоциативно. Одиночный декод
+        // всегда идёт b_size=1, поэтому батчевая проверка возвращала ДРУГИЕ
+        // логиты: замер qwen35_verify_rows дал max|Δlogit| до 6.5 при зазоре
+        // 1.2, что переворачивало argmax и роняло токен из выдачи (наружу это
+        // выглядело как «index. html» вместо «index.html»). Построчно
+        // расхождение ровно нулевое.
+        //
+        // Цена: k запусков вместо одного. Веса всё равно читаются из кеша L2,
+        // а спекуляция выигрывает на пропущенных шагах декода, не на батче
+        // проверки. Откат — QWEN36_VERIFY_BATCHED=1.
+        let batched = std::env::var("QWEN36_VERIFY_BATCHED").as_deref() == Ok("1");
+        if batched || inputs.len() == 1 {
+            let ids = Tensor::from_vec(inputs.to_vec(), (inputs.len(), 1usize), &self.device)?;
+            let (logits, hidden) = self
+                .model
+                .forward_decode_batch_with_hidden(&ids, cache_positions, rope_positions, slots)
+                .map_err(|error| anyhow!("speculative verify forward: {error}"))?;
+            let flat = logits
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()
+                .map_err(|error| anyhow!("speculative verify logits: {error}"))?;
+            return Ok((flat, hidden));
+        }
+
+        let mut flat: Vec<f32> = Vec::new();
+        let mut hidden_rows: Vec<Tensor> = Vec::with_capacity(inputs.len());
+        for row in 0..inputs.len() {
+            let ids = Tensor::from_vec(vec![inputs[row]], (1usize, 1usize), &self.device)?;
+            let (logits, hidden) = self
+                .model
+                .forward_decode_batch_with_hidden(
+                    &ids,
+                    &cache_positions[row..=row],
+                    &rope_positions[row..=row],
+                    &slots[row..=row],
+                )
+                .map_err(|error| anyhow!("speculative verify forward: {error}"))?;
+            flat.extend(
+                logits
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()
+                    .map_err(|error| anyhow!("speculative verify logits: {error}"))?,
+            );
+            hidden_rows.push(hidden);
+        }
+        // Hidden склеиваем в ту же форму [k, H], что даёт батчевый путь:
+        // speculative_accept читает строки по индексу.
+        let hidden = Tensor::cat(&hidden_rows, 0)
+            .map_err(|e| anyhow!("speculative verify hidden concat: {e}"))?;
         Ok((flat, hidden))
     }
 

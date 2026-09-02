@@ -189,6 +189,46 @@ fn main() -> Result<()> {
         Some(r) => println!("[rows] ВЕРДИКТ: первая расхождение на строке {r} из {k}"),
     }
 
+    // Направление «построчная проверка»: k вызовов speculative_verify по одной
+    // строке вместо одного батча. Если геометрия матвека — единственная
+    // причина, логиты обязаны совпасть с одиночным декодом бит-в-бит.
+    if std::env::var("ROWS_SERIAL_VERIFY").as_deref() == Ok("1") {
+        model.reset_slot(0)?;
+        let chunk = PrefillChunk {
+            slot_idx: 0,
+            reset_first: true,
+            tokens: prompt.clone(),
+            start_pos: 0,
+            is_final: true,
+        };
+        let _ = model.prefill_chunk(&chunk)?;
+        let mut worst = 0.0f32;
+        let mut mismatch = 0usize;
+        for row in 0..k {
+            model.speculative_begin(0)?;
+            let one = model.speculative_verify(0, &inputs[row..=row], pos + row)?;
+            model.speculative_rollback(0)?;
+            // Состояние двигаем обычным декодом: у пробника нет черновика,
+            // а commit без него падает («committed length exceeds draft KV»).
+            let batch = DecodeBatch {
+                items: vec![DecodeItem { slot_idx: 0, token: inputs[row], pos: pos + row }],
+            };
+            let _ = model.decode_batch(&batch)?;
+            let (d, _) = max_abs_diff(&single[row], &one[0]);
+            if d > worst {
+                worst = d;
+            }
+            if argmax(&single[row]) != argmax(&one[0]) {
+                mismatch += 1;
+            }
+            println!("[rows] построчная строка {row}: max|Δ|={d:.6}");
+        }
+        println!(
+            "[rows] ПОСТРОЧНАЯ ПРОВЕРКА: max|Δ|={worst:.6} расхождений argmax={mismatch} из {k}"
+        );
+        return Ok(());
+    }
+
     // Повторяемость самого пути проверки: два одинаковых вызова из одного
     // состояния. Разные логиты = путь недетерминирован (гонка/грязный буфер).
     // Одинаковые = путь стабилен, но систематически считает иначе, чем декод.
