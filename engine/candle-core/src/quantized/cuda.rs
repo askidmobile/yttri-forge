@@ -42,6 +42,12 @@ pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Текущий режим матвека. Нужен вызывающим, которые временно переключают
+/// путь и обязаны вернуть прежний, а не жёстко выключить.
+pub fn force_dmmv() -> bool {
+    FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // Per-device Q8_1 scratch cache: 2 слота на размер, чтобы избежать self-deadlock
 // когда вход слоя и выход attention_wo имеют одинаковую размерность (например 9B: 4096 == 4096).
 static Q81_SCRATCH: std::sync::OnceLock<
