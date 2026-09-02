@@ -6193,7 +6193,12 @@ impl ModelWeights {
         // с ModelSpec.context_window и official Best Practices Qwen3.5-4B,
         // покрывает все facultative tasks (mail digest, треды писем, длинные
         // транскрипции до 60 мин, summarization больших документов).
-        let env_limit = std::env::var("YTTRI_CONTEXT_LIMIT")
+        // Имя без префикса — основное; YTTRI_/QWEN36_ приняты для старых
+        // конфигов. Умолчание 81920 не поднимаем: оно про VRAM, а не про
+        // модель, и на маленькой карте защищает от неподъёмного пула.
+        let env_limit = std::env::var("CONTEXT_LIMIT")
+            .or_else(|_| std::env::var("YTTRI_CONTEXT_LIMIT"))
+            .or_else(|_| std::env::var("QWEN36_CONTEXT_LIMIT"))
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(81920);
