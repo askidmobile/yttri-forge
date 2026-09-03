@@ -2690,7 +2690,7 @@ unsafe fn gemm_strided_batched_f32(
         cfg.stride_c,
         cfg.batch_size,
         compute_type,
-        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
     )
 }
 
@@ -2749,7 +2749,7 @@ unsafe fn gemm_strided_batched_f16(
         cfg.stride_c,
         cfg.batch_size,
         compute_type,
-        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
     )
 }
 
@@ -2808,6 +2808,6 @@ unsafe fn gemm_strided_batched_bf16(
         cfg.stride_c,
         cfg.batch_size,
         compute_type,
-        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
     )
 }

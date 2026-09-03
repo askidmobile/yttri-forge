@@ -41,13 +41,13 @@ pub(crate) fn select_backend(
         Some("reference") => return Ok(MoeBackend::Reference),
         Some("ptx") => {}
         Some(value) => {
-            candle_core::bail!("invalid QWEN36_MOE_BACKEND={value:?}; expected ptx or reference")
+            candle_core::bail!("invalid MOE_BACKEND={value:?}; expected ptx or reference")
         }
         None if !is_cuda => return Ok(MoeBackend::Reference),
         None => {}
     }
     if !is_cuda {
-        candle_core::bail!("QWEN36_MOE_BACKEND=ptx requires CUDA")
+        candle_core::bail!("MOE_BACKEND=ptx requires CUDA")
     }
     let dual_supported = gate == up
         && matches!(

@@ -150,46 +150,46 @@ impl Drop for DraftGraph {
     }
 }
 
-/// QWEN36_MTP_GRAPH=0 — черновик eager (диагностика).
+/// MTP_GRAPH=0 — черновик eager (диагностика).
 #[cfg(feature = "cuda")]
 fn draft_graph_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH").as_deref() != Ok("0"))
+    *ON.get_or_init(|| std::env::var("MTP_GRAPH").as_deref() != Ok("0"))
 }
 
-/// QWEN36_MTP_GRAPH_RECAPTURE=1 — перезахватывать граф на каждом вызове
+/// MTP_GRAPH_RECAPTURE=1 — перезахватывать граф на каждом вызове
 /// черновика (диагностика: исчез ли недетерминизм вместе с состоянием,
 /// живущим внутри графа между вызовами).
 #[cfg(feature = "cuda")]
 fn draft_graph_recapture() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_RECAPTURE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("MTP_GRAPH_RECAPTURE").as_deref() == Ok("1"))
 }
 
-/// QWEN36_MTP_GRAPH_LEAK=1 — при перезахвате старый граф не разрушать и его
+/// MTP_GRAPH_LEAK=1 — при перезахвате старый граф не разрушать и его
 /// стейджинг не освобождать (утечка; диагностика: виновато ли разрушение).
 #[cfg(feature = "cuda")]
 fn draft_graph_leak() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_LEAK").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("MTP_GRAPH_LEAK").as_deref() == Ok("1"))
 }
 
-/// QWEN36_MTP_DRAFT_LOG=1 — печатать id каждого чернового токена. Нужен, чтобы
+/// MTP_DRAFT_LOG=1 — печатать id каждого чернового токена. Нужен, чтобы
 /// сравнить последовательности черновика между прогонами, не вмешиваясь в них:
 /// D2H этого id в обычном пути и так есть.
 #[cfg(feature = "cuda")]
 fn draft_id_log() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_MTP_DRAFT_LOG").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("MTP_DRAFT_LOG").as_deref() == Ok("1"))
 }
 
-/// QWEN36_MTP_GRAPH_CHECK=1 — после каждого replay повторить проход eager на
+/// MTP_GRAPH_CHECK=1 — после каждого replay повторить проход eager на
 /// тех же входах и сравнить id и hidden; печать по проходу. Состояние после
 /// проверки — от eager-прохода (строка кеша перезаписана тем же значением).
 #[cfg(feature = "cuda")]
 fn draft_graph_check() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_MTP_GRAPH_CHECK").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("MTP_GRAPH_CHECK").as_deref() == Ok("1"))
 }
 
 impl Qwen35Mtp {
@@ -311,10 +311,10 @@ impl Qwen35Mtp {
         )?;
         let ids_t = Tensor::from_vec(ids.clone(), ids.len(), &self.device)?;
         let proj = QMatMul::from_qtensor(short)?;
-        // QWEN36_MTP_SHORTLIST_CHECK=1: логиты пересобранной головы против
+        // MTP_SHORTLIST_CHECK=1: логиты пересобранной головы против
         // исходной на одном случайном входе — строки должны совпасть побитово
         // (те же байты блоков, то же ядро). Расхождение = дефект пересборки.
-        if std::env::var("QWEN36_MTP_SHORTLIST_CHECK").as_deref() == Ok("1") {
+        if std::env::var("MTP_SHORTLIST_CHECK").as_deref() == Ok("1") {
             let x = Tensor::randn(0f32, 1f32, (1, hidden), &self.device)?;
             let full_logits = self.shared_head.forward(&x)?.flatten_all()?; // [vocab]
             let short_logits = proj.forward(&x)?.flatten_all()?; // [n]
@@ -492,7 +492,7 @@ impl Qwen35Mtp {
             let pre_head = mtp_hidden.i((.., 0, ..))?;
             // Разбор стоимости прохода головы: проекция на словарь против всего
             // остального. Синхронизация обязательна — иначе замеряем постановку
-            // в очередь, а не ядро. Только при QWEN36_MTP_TIMING=1.
+            // в очередь, а не ядро. Только при MTP_TIMING=1.
             // Device::synchronize() здесь не синхронизирует — первый замер дал
             // проекцию 0 мс, то есть время постановки в очередь. Ждать надо
             // именно стрим, как это делает sync_t в delta_rule_cuda.rs.

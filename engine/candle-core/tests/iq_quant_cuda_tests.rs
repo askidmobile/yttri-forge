@@ -629,7 +629,7 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
 
     let x = Tensor::ones((16,), DType::F32, &device)?;
     let out = Tensor::zeros((16,), DType::F32, &device)?; // внешний буфер (до захвата)
-    // Prime тех же ядер вне захвата; out = 1.0, чтобы отличить от результата графа.
+                                                          // Prime тех же ядер вне захвата; out = 1.0, чтобы отличить от результата графа.
     {
         let y = (x.clone() * 2.0)?;
         drop(y);
@@ -641,8 +641,13 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
 
     // Capture: y = x * 2 (alloc в graph pool) → D2D в out → drop(y) (free-нода).
     use cudarc::driver::{result as cres, sys as csys};
-    unsafe { cres::stream::begin_capture(stream.cu_stream(), csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED) }
-        .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
+    unsafe {
+        cres::stream::begin_capture(
+            stream.cu_stream(),
+            csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+        )
+    }
+    .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
     {
         let y = (x.clone() * 2.0)?;
         out.slice_set(&y, 0, 0)?;
@@ -655,7 +660,7 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
     unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
     assert!(!exec.is_null(), "instantiate failed");
     // WDDM probe: upload фиксирует graph pool перед первым launch.
-    if std::env::var("QWEN36_TEST_GRAPH_UPLOAD").as_deref() == Ok("1") {
+    if std::env::var("TEST_GRAPH_UPLOAD").as_deref() == Ok("1") {
         unsafe { csys::cuGraphUpload(exec, stream.cu_stream()) };
     }
     let res = unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
@@ -670,7 +675,11 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
         .synchronize()
         .map_err(|e| candle_core::Error::Msg(format!("sync2: {e}")))?;
     let y0 = out.to_vec1::<f32>()?;
-    assert!(y0.iter().all(|&v| v == 2.0), "graph replay wrong: {:?}", &y0[..4]);
+    assert!(
+        y0.iter().all(|&v| v == 2.0),
+        "graph replay wrong: {:?}",
+        &y0[..4]
+    );
     unsafe {
         csys::cuGraphExecDestroy(exec);
         csys::cuGraphDestroy(cu_graph);
@@ -692,8 +701,13 @@ fn cuda_graph_alloc_free_balanced_double_launch() -> Result<()> {
     // Prime.
     let _ = (x.clone() * 2.0)?;
 
-    unsafe { cres::stream::begin_capture(stream.cu_stream(), csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED) }
-        .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
+    unsafe {
+        cres::stream::begin_capture(
+            stream.cu_stream(),
+            csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+        )
+    }
+    .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
     {
         // alloc + free внутри захвата (y дропается до end_capture).
         let y = (x.clone() * 2.0)?;
@@ -708,7 +722,9 @@ fn cuda_graph_alloc_free_balanced_double_launch() -> Result<()> {
     for i in 0..3 {
         let res = unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
         assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "launch{i}: {res:?}");
-        stream.synchronize().map_err(|e| candle_core::Error::Msg(format!("sync{i}: {e}")))?;
+        stream
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("sync{i}: {e}")))?;
     }
     unsafe {
         csys::cuGraphExecDestroy(exec);
@@ -729,12 +745,19 @@ fn cuda_graph_no_alloc_nodes_double_launch() -> Result<()> {
 
     let x = Tensor::ones((16,), DType::F32, &device)?;
     let out = Tensor::zeros((16,), DType::F32, &device)?; // внешний буфер (pre-alloc)
-    // Prime: copy2d kernel load.
+                                                          // Prime: copy2d kernel load.
     out.slice_set(&x, 0, 0)?;
-    stream.synchronize().map_err(|e| candle_core::Error::Msg(format!("sync0: {e}")))?;
+    stream
+        .synchronize()
+        .map_err(|e| candle_core::Error::Msg(format!("sync0: {e}")))?;
 
-    unsafe { cres::stream::begin_capture(stream.cu_stream(), csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED) }
-        .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
+    unsafe {
+        cres::stream::begin_capture(
+            stream.cu_stream(),
+            csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+        )
+    }
+    .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
     // Внутри захвата: только device-side копия в pre-alloc буфер, НОЛЬ аллокаций.
     out.slice_set(&x, 0, 0)?;
     let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
@@ -746,10 +769,16 @@ fn cuda_graph_no_alloc_nodes_double_launch() -> Result<()> {
     for i in 0..3 {
         let res = unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
         assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "launch{i}: {res:?}");
-        stream.synchronize().map_err(|e| candle_core::Error::Msg(format!("sync{i}: {e}")))?;
+        stream
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("sync{i}: {e}")))?;
     }
     let y0 = out.to_vec1::<f32>()?;
-    assert!(y0.iter().all(|&v| v == 1.0), "no-alloc graph wrong: {:?}", &y0[..4]);
+    assert!(
+        y0.iter().all(|&v| v == 1.0),
+        "no-alloc graph wrong: {:?}",
+        &y0[..4]
+    );
     unsafe {
         csys::cuGraphExecDestroy(exec);
         csys::cuGraphDestroy(cu_graph);
@@ -789,7 +818,11 @@ fn cuda_graph_raw_ptr_kernel_capture() -> Result<()> {
         p
     };
     {
-        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut b = func.builder();
         b.arg(&kv_len);
         b.arg(&slots);
@@ -797,7 +830,9 @@ fn cuda_graph_raw_ptr_kernel_capture() -> Result<()> {
         b.arg(&4i32);
         unsafe { b.launch(cfg) }.map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
     }
-    stream.synchronize().map_err(|e| candle_core::Error::Msg(format!("sync: {e}")))?;
+    stream
+        .synchronize()
+        .map_err(|e| candle_core::Error::Msg(format!("sync: {e}")))?;
 
     unsafe {
         cres::stream::begin_capture(
@@ -807,7 +842,11 @@ fn cuda_graph_raw_ptr_kernel_capture() -> Result<()> {
     }
     .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
     {
-        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut b = func.builder();
         b.arg(&kv_len);
         b.arg(&slots);
@@ -823,7 +862,9 @@ fn cuda_graph_raw_ptr_kernel_capture() -> Result<()> {
     assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "instantiate: {res:?}");
     let res = unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
     assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "launch: {res:?}");
-    stream.synchronize().map_err(|e| candle_core::Error::Msg(format!("sync2: {e}")))?;
+    stream
+        .synchronize()
+        .map_err(|e| candle_core::Error::Msg(format!("sync2: {e}")))?;
     unsafe {
         csys::cuGraphExecDestroy(exec);
         csys::cuGraphDestroy(cu_graph);
@@ -990,10 +1031,10 @@ fn mmvq_perf_dense() -> Result<()> {
         _ => unreachable!(),
     };
 
-    // QWEN36_PERF_FILL_GB=N — занять N ГБ VRAM перед созданием весов
+    // PERF_FILL_GB=N — занять N ГБ VRAM перед созданием весов
     // (эмуляция размещения весов 27B после 10GB аллокаций).
     let _fill: Vec<cudarc::driver::CudaSlice<u8>> =
-        if let Ok(v) = std::env::var("QWEN36_PERF_FILL_GB") {
+        if let Ok(v) = std::env::var("PERF_FILL_GB") {
             let gb: usize = v.parse().unwrap_or(0);
             let mut keep = Vec::new();
             for _ in 0..gb {
@@ -1007,9 +1048,9 @@ fn mmvq_perf_dense() -> Result<()> {
 
     // 27B Q2_K_XL hot shapes: (n_rows, k)
     let shapes: &[(usize, usize)] = &[
-        (5120, 5120),    // delta qkv-ish / attn
-        (17408, 5120),   // ffn up/gate (27B ffn=17408)
-        (5120, 17408),   // ffn down (27B)
+        (5120, 5120),  // delta qkv-ish / attn
+        (17408, 5120), // ffn up/gate (27B ffn=17408)
+        (5120, 17408), // ffn down (27B)
     ];
 
     fn bench_quant<T: GgmlType + Send + Sync + 'static>(
@@ -1034,11 +1075,11 @@ fn mmvq_perf_dense() -> Result<()> {
         iters: usize,
     ) -> Result<()> {
         let total = n_rows * row_bytes;
-        // QWEN36_PERF_RANDOM=1: реалистичные байты весов. У IQ vec_dot
+        // PERF_RANDOM=1: реалистичные байты весов. У IQ vec_dot
         // grid-lookup идёт по байту веса: константный филл даёт один индекс
         // на весь варп (broadcast из L1) и завышает скорость ядра в разы
         // против реальных весов (в модели те же ядра шли в ~3x медленнее).
-        let raw: Vec<u8> = if std::env::var("QWEN36_PERF_RANDOM").as_deref() == Ok("1") {
+        let raw: Vec<u8> = if std::env::var("PERF_RANDOM").as_deref() == Ok("1") {
             (0..total)
                 .map(|i| ((i as u32).wrapping_mul(2654435761) >> 24) as u8)
                 .collect()
@@ -1053,12 +1094,16 @@ fn mmvq_perf_dense() -> Result<()> {
         for _ in 0..5 {
             let _ = qmatmul.forward(&y)?;
         }
-        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+        cuda.cuda_stream()
+            .synchronize()
+            .map_err(candle_core::Error::wrap)?;
         let t0 = Instant::now();
         for _ in 0..iters {
             let _ = qmatmul.forward(&y)?;
         }
-        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+        cuda.cuda_stream()
+            .synchronize()
+            .map_err(candle_core::Error::wrap)?;
         let el = t0.elapsed().as_secs_f64() / iters as f64;
         let gbs = total as f64 / el / 1e9;
         println!(
@@ -1108,7 +1153,8 @@ fn mmvq_perf_dense() -> Result<()> {
         let row_bytes = k / 256 * std::mem::size_of::<BlockQ2K>();
         let mk = |rows: usize| -> Result<Arc<QTensor>> {
             let raw = vec![0x5Au8; rows * row_bytes];
-            let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), &device, GgmlDType::Q2K)?;
+            let storage =
+                QStorage::from_data(std::borrow::Cow::Borrowed(&raw), &device, GgmlDType::Q2K)?;
             Ok(Arc::new(QTensor::new(storage, (rows, k))?))
         };
         // 48 пар (w1: [n,k], w3: [n,k], w2: [k,n]) — 48 слоёв как в 27B.
@@ -1117,7 +1163,8 @@ fn mmvq_perf_dense() -> Result<()> {
             let w1 = QMatMul::from_arc(mk(n)?)?;
             let w3 = QMatMul::from_arc(mk(n)?)?;
             let w2raw = vec![0x5Au8; k * (n / 256 * std::mem::size_of::<BlockQ2K>())];
-            let w2s = QStorage::from_data(std::borrow::Cow::Borrowed(&w2raw), &device, GgmlDType::Q2K)?;
+            let w2s =
+                QStorage::from_data(std::borrow::Cow::Borrowed(&w2raw), &device, GgmlDType::Q2K)?;
             let w2 = QMatMul::from_arc(Arc::new(QTensor::new(w2s, (k, n))?))?;
             layers.push((w1, w3, w2));
         }
@@ -1125,7 +1172,9 @@ fn mmvq_perf_dense() -> Result<()> {
         let run_chain = |x: &Tensor| -> Result<Tensor> {
             let mut h = x.clone();
             for (w1, w3, w2) in &layers {
-                let prequant = candle_core::quantized::QTensor::prequantize_q8_1(&h).ok().flatten();
+                let prequant = candle_core::quantized::QTensor::prequantize_q8_1(&h)
+                    .ok()
+                    .flatten();
                 let a = w1.forward_with_prequant(&h, prequant.as_ref())?;
                 let b = w3.forward_with_prequant(&h, prequant.as_ref())?;
                 let s = a.silu_mul_direct(&b)?;
@@ -1134,17 +1183,30 @@ fn mmvq_perf_dense() -> Result<()> {
             Ok(h)
         };
         // eager
-        for _ in 0..3 { let _ = run_chain(&x)?; }
-        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+        for _ in 0..3 {
+            let _ = run_chain(&x)?;
+        }
+        cuda.cuda_stream()
+            .synchronize()
+            .map_err(candle_core::Error::wrap)?;
         let t0 = Instant::now();
-        for _ in 0..5 { let _ = run_chain(&x)?; }
-        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+        for _ in 0..5 {
+            let _ = run_chain(&x)?;
+        }
+        cuda.cuda_stream()
+            .synchronize()
+            .map_err(candle_core::Error::wrap)?;
         let eager_ms = t0.elapsed().as_secs_f64() * 1000.0 / 5.0;
         println!("FFN-chain x48 EAGER: {eager_ms:.2}ms/step");
         // graph capture + replay
         let stream = cuda.cuda_stream();
-        unsafe { cres::stream::begin_capture(stream.cu_stream(), csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED) }
-            .map_err(candle_core::Error::wrap)?;
+        unsafe {
+            cres::stream::begin_capture(
+                stream.cu_stream(),
+                csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+            )
+        }
+        .map_err(candle_core::Error::wrap)?;
         let out = run_chain(&x);
         let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
             .map_err(candle_core::Error::wrap)?;
@@ -1153,11 +1215,19 @@ fn mmvq_perf_dense() -> Result<()> {
         let res = unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
         assert_eq!(res, csys::CUresult::CUDA_SUCCESS);
         // warm
-        for _ in 0..3 { unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) }; }
-        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+        for _ in 0..3 {
+            unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
+        }
+        cuda.cuda_stream()
+            .synchronize()
+            .map_err(candle_core::Error::wrap)?;
         let t0 = Instant::now();
-        for _ in 0..20 { unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) }; }
-        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+        for _ in 0..20 {
+            unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
+        }
+        cuda.cuda_stream()
+            .synchronize()
+            .map_err(candle_core::Error::wrap)?;
         let graph_ms = t0.elapsed().as_secs_f64() * 1000.0 / 20.0;
         println!("FFN-chain x48 GRAPH-REPLAY: {graph_ms:.2}ms/step");
     }
@@ -1453,15 +1523,20 @@ fn mmvq_perf_cold() -> Result<()> {
     let mut weights = Vec::new();
     for i in 0..16 {
         let raw = vec![(i as u8).wrapping_mul(37).wrapping_add(0x5A); n * row_bytes];
-        let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), &device, GgmlDType::Q4K)?;
+        let storage =
+            QStorage::from_data(std::borrow::Cow::Borrowed(&raw), &device, GgmlDType::Q4K)?;
         let qt = std::sync::Arc::new(QTensor::new(storage, (n, k))?);
         weights.push(QMatMul::from_arc(qt)?);
     }
     let y = Tensor::zeros((1, 1, k), DType::F32, &device)?;
 
     // Warmup
-    for w in &weights { let _ = w.forward(&y)?; }
-    cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+    for w in &weights {
+        let _ = w.forward(&y)?;
+    }
+    cuda.cuda_stream()
+        .synchronize()
+        .map_err(candle_core::Error::wrap)?;
 
     // Round-robin: каждый вызов — другой вес (L2-cold как в реальной модели)
     let t0 = Instant::now();
@@ -1469,18 +1544,30 @@ fn mmvq_perf_cold() -> Result<()> {
     for it in 0..iters {
         let _ = weights[it % weights.len()].forward(&y)?;
     }
-    cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+    cuda.cuda_stream()
+        .synchronize()
+        .map_err(candle_core::Error::wrap)?;
     let el = t0.elapsed().as_secs_f64() / iters as f64;
     let bytes = n * row_bytes;
-    println!("MMVQ-COLD Q4K [{n}x{k}] x16 round-robin: {:.3}ms {:.0} GB/s",
-        el * 1000.0, bytes as f64 / el / 1e9);
+    println!(
+        "MMVQ-COLD Q4K [{n}x{k}] x16 round-robin: {:.3}ms {:.0} GB/s",
+        el * 1000.0,
+        bytes as f64 / el / 1e9
+    );
 
     // Hot (тот же вес) для сравнения
     let t0 = Instant::now();
-    for _ in 0..iters { let _ = weights[0].forward(&y)?; }
-    cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+    for _ in 0..iters {
+        let _ = weights[0].forward(&y)?;
+    }
+    cuda.cuda_stream()
+        .synchronize()
+        .map_err(candle_core::Error::wrap)?;
     let el_h = t0.elapsed().as_secs_f64() / iters as f64;
-    println!("MMVQ-HOT  Q4K [{n}x{k}] x1  hot:       {:.3}ms {:.0} GB/s",
-        el_h * 1000.0, bytes as f64 / el_h / 1e9);
+    println!(
+        "MMVQ-HOT  Q4K [{n}x{k}] x1  hot:       {:.3}ms {:.0} GB/s",
+        el_h * 1000.0,
+        bytes as f64 / el_h / 1e9
+    );
     Ok(())
 }

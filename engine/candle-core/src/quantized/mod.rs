@@ -13,11 +13,11 @@ pub mod gguf_file;
 pub mod imatrix_file;
 pub mod iq1s;
 pub mod k_quants;
+#[cfg(feature = "metal")]
+pub mod metal;
 pub mod q4k_opt;
 pub mod q4k_v3;
 pub mod q4k_v4;
-#[cfg(feature = "metal")]
-pub mod metal;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tokenizer;
 #[cfg(not(feature = "metal"))]
@@ -144,27 +144,15 @@ impl QStorage {
                 GgmlDType::IQ3XXS => {
                     cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ3XXS)
                 }
-                GgmlDType::IQ2S => {
-                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ2S)
-                }
-                GgmlDType::IQ3S => {
-                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ3S)
-                }
-                GgmlDType::IQ2XS => {
-                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ2XS)
-                }
-                GgmlDType::IQ4XS => {
-                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ4XS)
-                }
+                GgmlDType::IQ2S => cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ2S),
+                GgmlDType::IQ3S => cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ3S),
+                GgmlDType::IQ2XS => cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ2XS),
+                GgmlDType::IQ4XS => cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ4XS),
                 GgmlDType::IQ2XXS => {
                     cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ2XXS)
                 }
-                GgmlDType::IQ1S => {
-                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ1S)
-                }
-                GgmlDType::IQ1M => {
-                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ1M)
-                }
+                GgmlDType::IQ1S => cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ1S),
+                GgmlDType::IQ1M => cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ1M),
                 GgmlDType::IQ4NL => {
                     crate::bail!("CUDA is not implemented for {:?}", dtype)
                 }
@@ -491,7 +479,10 @@ impl GgmlDType {
             | Self::IQ3S
             | Self::IQ2S
             | Self::IQ4XS
-            | Self::IQ1M => Box::new(RawQuantizedType::from_data(*self, std::borrow::Cow::Borrowed(data))),
+            | Self::IQ1M => Box::new(RawQuantizedType::from_data(
+                *self,
+                std::borrow::Cow::Borrowed(data),
+            )),
         }
     }
 
@@ -942,13 +933,8 @@ impl QTensor {
             crate::Storage::Cuda(c) => c,
             _ => crate::bail!("indexed_moe_forward_cuda: ids not on CUDA"),
         };
-        let (out, out_shape) = qs.indexed_moe_forward(
-            &self.shape,
-            in_cuda,
-            &in_l,
-            ids_cuda,
-            &ids_l,
-        )?;
+        let (out, out_shape) =
+            qs.indexed_moe_forward(&self.shape, in_cuda, &in_l, ids_cuda, &ids_l)?;
         Ok(Tensor::from((crate::Storage::Cuda(out), out_shape)))
     }
 
@@ -966,7 +952,11 @@ impl QTensor {
             _ => crate::bail!("indexed_moe_forward_dual_cuda: weights not on CUDA"),
         };
         if self.shape != other.shape {
-            crate::bail!("dual moe: shape mismatch {:?} vs {:?}", self.shape, other.shape);
+            crate::bail!(
+                "dual moe: shape mismatch {:?} vs {:?}",
+                self.shape,
+                other.shape
+            );
         }
         let (in_st, in_l) = input.storage_and_layout();
         let in_cuda = match &*in_st {
@@ -978,14 +968,8 @@ impl QTensor {
             crate::Storage::Cuda(c) => c,
             _ => crate::bail!("dual moe: ids not CUDA"),
         };
-        let (out1, out2, shape) = qs.indexed_moe_forward_dual(
-            qs_other,
-            &self.shape,
-            in_cuda,
-            &in_l,
-            ids_cuda,
-            &ids_l,
-        )?;
+        let (out1, out2, shape) =
+            qs.indexed_moe_forward_dual(qs_other, &self.shape, in_cuda, &in_l, ids_cuda, &ids_l)?;
         Ok((
             Tensor::from((crate::Storage::Cuda(out1), shape.clone())),
             Tensor::from((crate::Storage::Cuda(out2), shape)),
@@ -1008,9 +992,9 @@ impl QTensor {
         k: usize,
         device: &Device,
     ) -> Result<Tensor> {
-        let rows = row_end
-            .checked_sub(row_start)
-            .ok_or_else(|| crate::Error::Msg(format!("row_end < row_start ({row_end} < {row_start})")).bt())?;
+        let rows = row_end.checked_sub(row_start).ok_or_else(|| {
+            crate::Error::Msg(format!("row_end < row_start ({row_end} < {row_start})")).bt()
+        })?;
         if k == 0 {
             crate::bail!("dequantize_rowslice: k must be non-zero");
         }
@@ -1160,16 +1144,14 @@ impl QTensor {
                         false,
                     ))
                 }
-                _ => crate::bail!(
-                    "indexed_moe_forward requires CUDA tensors for input and ids"
-                ),
+                _ => crate::bail!("indexed_moe_forward requires CUDA tensors for input and ids"),
             },
-            QStorage::Metal(_) => crate::bail!(
-                "indexed_moe_forward is not implemented for the Metal backend"
-            ),
-            QStorage::Cpu(_) => crate::bail!(
-                "indexed_moe_forward is not implemented for the CPU backend"
-            ),
+            QStorage::Metal(_) => {
+                crate::bail!("indexed_moe_forward is not implemented for the Metal backend")
+            }
+            QStorage::Cpu(_) => {
+                crate::bail!("indexed_moe_forward is not implemented for the CPU backend")
+            }
         }
     }
 
@@ -1328,9 +1310,18 @@ impl QTensor {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn forward_with_prequant(&self, x: &Tensor, prequant: Option<&Q8_1Activation>) -> Result<Tensor> {
+    pub fn forward_with_prequant(
+        &self,
+        x: &Tensor,
+        prequant: Option<&Q8_1Activation>,
+    ) -> Result<Tensor> {
         if !cuda::FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some(Q8_1Activation::Cuda { slice, ncols, b_size }) = prequant {
+            if let Some(Q8_1Activation::Cuda {
+                slice,
+                ncols,
+                b_size,
+            }) = prequant
+            {
                 let (x_b_size, x_k) = match x.dims() {
                     [b, m, k] => (b * m, *k),
                     [b, k] => (*b, *k),
@@ -1341,12 +1332,23 @@ impl QTensor {
                         {
                             let (n, k) = self.shape.dims2()?;
                             if *ncols == k {
-                                let out = c.mul_mat_vec_with_prequant_q8_1(&self.shape, slice, *ncols, n, *b_size)?;
+                                let out = c.mul_mat_vec_with_prequant_q8_1(
+                                    &self.shape,
+                                    slice,
+                                    *ncols,
+                                    n,
+                                    *b_size,
+                                )?;
                                 let mut out_shape = x.dims().to_vec();
                                 out_shape.pop();
                                 out_shape.push(n);
                                 let none = crate::op::BackpropOp::none();
-                                return Ok(crate::tensor::from_storage(Storage::Cuda(out), out_shape, none, false));
+                                return Ok(crate::tensor::from_storage(
+                                    Storage::Cuda(out),
+                                    out_shape,
+                                    none,
+                                    false,
+                                ));
                             }
                         }
                     }
@@ -1487,7 +1489,11 @@ impl QMatMul {
     }
 
     #[allow(unused_variables)]
-    pub fn forward_with_prequant(&self, xs: &Tensor, prequant: Option<&Q8_1Activation>) -> Result<Tensor> {
+    pub fn forward_with_prequant(
+        &self,
+        xs: &Tensor,
+        prequant: Option<&Q8_1Activation>,
+    ) -> Result<Tensor> {
         use crate::Module;
         let xs = if !xs.device().same_device(&self.device()) {
             xs.to_device(&self.device())?
@@ -1509,7 +1515,7 @@ impl crate::Module for QMatMul {
         } else {
             xs.clone()
         };
-        if std::env::var_os("QWEN36_TRACE_MMQ").is_some() {
+        if std::env::var_os("TRACE_MMQ").is_some() {
             let variant = match self {
                 Self::QTensor(_) => "QTensor",
                 Self::Tensor(_) => "Tensor",

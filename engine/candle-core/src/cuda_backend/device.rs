@@ -370,7 +370,9 @@ impl CudaDevice {
         }
         if let Some(cuda_module) = ms.mdls[mdl.index()].as_ref() {
             let func = cuda_module.load_function(fn_name).map_err(|e| {
-                crate::Error::Msg(format!("failed to load function '{fn_name}' from loaded module: {e}"))
+                crate::Error::Msg(format!(
+                    "failed to load function '{fn_name}' from loaded module: {e}"
+                ))
             })?;
             drop(ms);
             let mut ms_w = self.modules.write().unwrap();
@@ -391,14 +393,17 @@ impl CudaDevice {
         let cuda_module = if let Some(cuda_module) = ms.mdls[mdl.index()].as_ref() {
             cuda_module.clone()
         } else {
-            let cuda_module = self.context.load_module(mdl.ptx().into()).map_err(|e| {
-                crate::Error::Msg(format!("failed to load PTX module: {e}"))
-            })?;
+            let cuda_module = self
+                .context
+                .load_module(mdl.ptx().into())
+                .map_err(|e| crate::Error::Msg(format!("failed to load PTX module: {e}")))?;
             ms.mdls[mdl.index()] = Some(cuda_module.clone());
             cuda_module
         };
         let func = cuda_module.load_function(fn_name).map_err(|e| {
-            crate::Error::Msg(format!("failed to load function '{fn_name}' from fresh module: {e}"))
+            crate::Error::Msg(format!(
+                "failed to load function '{fn_name}' from fresh module: {e}"
+            ))
         })?;
         ms.func_cache.insert(key, func.clone());
         Ok(CudaFunc {
@@ -474,7 +479,7 @@ impl BackendDevice for CudaDevice {
         // тензоров, пересекающих границу потоков, а per_thread_stream даёт свой
         // поток на каждый поток ОС. Совпадение выхода при включённом флаге
         // признаком безопасности НЕ является — гонка может не проявиться.
-        if std::env::var("QWEN36_NO_EVENT_TRACKING").as_deref() == Ok("1") {
+        if std::env::var("NO_EVENT_TRACKING").as_deref() == Ok("1") {
             unsafe { context.disable_event_tracking() };
             eprintln!("[cuda] event tracking: OFF (замер потолка)");
         }

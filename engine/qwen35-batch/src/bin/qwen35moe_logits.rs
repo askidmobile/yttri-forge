@@ -140,9 +140,9 @@ fn main() -> Result<()> {
         }
     }
 
-    // QWEN36_FORCE_DMMV=1: dequantize+cuBLAS вместо MMQ/MMVQ — референс для
+    // FORCE_DMMV=1: dequantize+cuBLAS вместо MMQ/MMVQ — референс для
     // A/B новых fused-путей (env-хука в candle-core нет, только setter).
-    if std::env::var("QWEN36_FORCE_DMMV").as_deref() == Ok("1") {
+    if std::env::var("FORCE_DMMV").as_deref() == Ok("1") {
         candle_core::quantized::cuda::set_force_dmmv(true);
         eprintln!("[logits] FORCE_DMMV=1: dequantize+cuBLAS path");
     }
@@ -167,12 +167,12 @@ fn main() -> Result<()> {
     };
     let prompt = tokenizer::build_chatml_text(&messages);
     let mut prompt_tokens = tokenizer::encode_no_think(&tokenizer, &prompt)?;
-    if let Ok(value) = std::env::var("QWEN36_LOGITS_PROMPT_TOKENS") {
+    if let Ok(value) = std::env::var("LOGITS_PROMPT_TOKENS") {
         let target = value
             .parse::<usize>()
-            .context("QWEN36_LOGITS_PROMPT_TOKENS must be a positive integer")?;
+            .context("LOGITS_PROMPT_TOKENS must be a positive integer")?;
         if target == 0 {
-            bail!("QWEN36_LOGITS_PROMPT_TOKENS must be a positive integer")
+            bail!("LOGITS_PROMPT_TOKENS must be a positive integer")
         }
         let fixture = prompt_tokens.clone();
         prompt_tokens = fixture.iter().copied().cycle().take(target).collect();
@@ -184,7 +184,7 @@ fn main() -> Result<()> {
     {
         bail!("forced token {token} is outside vocab size {vocab_size}")
     }
-    let backend = std::env::var("QWEN36_MOE_BACKEND").unwrap_or_else(|_| "auto".into());
+    let backend = std::env::var("MOE_BACKEND").unwrap_or_else(|_| "auto".into());
     println!(
         "{}",
         json!({
@@ -213,9 +213,9 @@ fn main() -> Result<()> {
     let prefill = prefill_started.elapsed();
 
     // Двойной prefill в одном процессе: детекция гонки ядер против
-    // межпроцессного состояния. QWEN36_LOGITS_DOUBLE=1 печатает второй
+    // межпроцессного состояния. LOGITS_DOUBLE=1 печатает второй
     // prefill той же кучи токенов (state reset), checksum сравним вручную.
-    if std::env::var("QWEN36_LOGITS_DOUBLE").as_deref() == Ok("1") {
+    if std::env::var("LOGITS_DOUBLE").as_deref() == Ok("1") {
         let logits2 = adapter.prefill_chunk(&PrefillChunk {
             slot_idx: 0,
             reset_first: true,
@@ -231,28 +231,28 @@ fn main() -> Result<()> {
     }
 
     let mut full_steps = BTreeSet::new();
-    if let Ok(value) = std::env::var("QWEN36_LOGITS_FULL_STEP") {
+    if let Ok(value) = std::env::var("LOGITS_FULL_STEP") {
         full_steps.insert(
             value
                 .parse::<usize>()
-                .context("QWEN36_LOGITS_FULL_STEP must be an integer")?,
+                .context("LOGITS_FULL_STEP must be an integer")?,
         );
     }
-    if let Ok(value) = std::env::var("QWEN36_LOGITS_FULL_STEPS") {
+    if let Ok(value) = std::env::var("LOGITS_FULL_STEPS") {
         for step in value.split(',') {
             if step.is_empty() {
-                bail!("QWEN36_LOGITS_FULL_STEPS contains an empty step")
+                bail!("LOGITS_FULL_STEPS contains an empty step")
             }
             full_steps.insert(
                 step.parse::<usize>()
-                    .context("QWEN36_LOGITS_FULL_STEPS must be comma-separated integers")?,
+                    .context("LOGITS_FULL_STEPS must be comma-separated integers")?,
             );
         }
     }
     if let Some(step) = full_steps.iter().find(|&&step| step >= steps) {
         bail!("full logits step {step} is outside requested {steps} steps")
     }
-    let include_all_values = std::env::var_os("QWEN36_LOGITS_FULL").is_some();
+    let include_all_values = std::env::var_os("LOGITS_FULL").is_some();
     let mut predicted = Vec::with_capacity(steps);
     let mut fed = Vec::with_capacity(steps);
     let mut decode_time = Duration::ZERO;
@@ -273,12 +273,12 @@ fn main() -> Result<()> {
             .unwrap_or(prediction);
         predicted.push(prediction);
         fed.push(token);
-        // QWEN36_LOGITS_IGNORE_EOS=1 (только с forced.jsonl): не останавливаться
+        // LOGITS_IGNORE_EOS=1 (только с forced.jsonl): не останавливаться
         // на EOS. Greedy-цепочка референса упирается в EOS за несколько сотен
         // шагов, а длинный teacher-forced гейт (8K) должен прогнать KV/state
         // пути на всю глубину - референс тоже форсит сквозь EOS.
         let ignore_eos = forced_tokens.is_some()
-            && std::env::var("QWEN36_LOGITS_IGNORE_EOS").as_deref() == Ok("1");
+            && std::env::var("LOGITS_IGNORE_EOS").as_deref() == Ok("1");
         if (token == adapter.eos() && !ignore_eos) || step + 1 == steps {
             break;
         }

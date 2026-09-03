@@ -32,7 +32,7 @@ pub struct PagedModelCtx {
     pub seqlens_k_t: Tensor,
     /// Cumulative K-длины T позиций одного слота: [MAX_VERIFY_ROWS + 1].
     pub seqlens_k_verify_t: Tensor,
-    /// Однопроходная проверка (QWEN36_VERIFY_ONEPASS): seqlens_k = [0, kv0+k]
+    /// Однопроходная проверка (VERIFY_ONEPASS): seqlens_k = [0, kv0+k]
     /// для b=1 — device-cumsum из kv_len (capture-safe).
     pub seqlens_k_onepass_t: Tensor,
     /// Block table: [capacity_b, max_blocks] u32 (bidx → slot pages).
@@ -352,7 +352,7 @@ pub struct PagedKvPool {
 /// int8 на KV (0.75% по замеру round-trip) впятеро лучше, чем у весов Q4_K.
 pub fn kv_pool_is_q8() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_KV_POOL_Q8").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("KV_POOL_Q8").as_deref() == Ok("1"))
 }
 
 impl PagedKvPool {

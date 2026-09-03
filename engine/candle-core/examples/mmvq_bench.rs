@@ -112,11 +112,11 @@ fn main() -> Result<()> {
     }
 
     if matches!(dtype, GgmlDType::Q2K | GgmlDType::Q4K | GgmlDType::Q6K) {
-        let original_setting = std::env::var_os("QWEN36_MMVQ_HOISTED");
+        let original_setting = std::env::var_os("MMVQ_HOISTED");
         for (batch, input) in &inputs {
-            std::env::set_var("QWEN36_MMVQ_HOISTED", "0");
+            std::env::set_var("MMVQ_HOISTED", "0");
             let baseline = matmul.forward(input)?.flatten_all()?.to_vec1::<f32>()?;
-            std::env::set_var("QWEN36_MMVQ_HOISTED", "all");
+            std::env::set_var("MMVQ_HOISTED", "all");
             let hoisted = matmul.forward(input)?.flatten_all()?.to_vec1::<f32>()?;
 
             let bitwise_equal = baseline
@@ -134,8 +134,8 @@ fn main() -> Result<()> {
             );
         }
         match original_setting {
-            Some(value) => std::env::set_var("QWEN36_MMVQ_HOISTED", value),
-            None => std::env::remove_var("QWEN36_MMVQ_HOISTED"),
+            Some(value) => std::env::set_var("MMVQ_HOISTED", value),
+            None => std::env::remove_var("MMVQ_HOISTED"),
         }
     }
 

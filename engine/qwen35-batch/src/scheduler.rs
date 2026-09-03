@@ -70,12 +70,12 @@ impl SchedulerStats {
 /// state, decode работает по batched buffers — пересечений нет.
 pub const PREFILL_CHUNK: usize = 512;
 
-/// Размер чанка prefill с учётом env QWEN36_PREFILL_CHUNK (0/большое = целиком).
+/// Размер чанка prefill с учётом env PREFILL_CHUNK (0/большое = целиком).
 #[inline]
 pub fn prefill_chunk_size() -> usize {
     static SZ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SZ.get_or_init(|| {
-        std::env::var("QWEN36_PREFILL_CHUNK")
+        std::env::var("PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
@@ -83,7 +83,7 @@ pub fn prefill_chunk_size() -> usize {
     })
 }
 
-/// Ширина спекулятивного драфта K (env QWEN36_MTP_WIDTH, default 3, максимум 8 —
+/// Ширина спекулятивного драфта K (env MTP_WIDTH, default 3, максимум 8 —
 /// потолок mmvq b_size и verify temp-буферов). Тюнится по фактической
 /// принимаемости: при m == K re-run принятого префикса не нужен (state уже
 /// консистентен), поэтому K чуть НИЖЕ типичной длины всплеска принимаемости
@@ -93,7 +93,7 @@ pub fn prefill_chunk_size() -> usize {
 pub fn speculative_width() -> usize {
     static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *W.get_or_init(|| {
-        std::env::var("QWEN36_MTP_WIDTH")
+        std::env::var("MTP_WIDTH")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
@@ -102,20 +102,20 @@ pub fn speculative_width() -> usize {
     })
 }
 
-/// P0.5c adaptive width (default ON, откат QWEN36_MTP_ADAPTIVE=0):
+/// P0.5c adaptive width (default ON, откат MTP_ADAPTIVE=0):
 /// ширина драфта следует за фактической принимаемостью — см. спекулятивный
 /// раунд. Убирает плату draft+rollback ~65 мс за раунды, где модель не
 /// угадывает (m<=1), сохраняя длинные всплески при полном принятии.
 fn mtp_adaptive_on() -> bool {
     static ADAPTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ADAPTIVE.get_or_init(|| {
-        std::env::var("QWEN36_MTP_ADAPTIVE")
+        std::env::var("MTP_ADAPTIVE")
             .map(|v| v != "0")
             .unwrap_or(true)
     })
 }
 
-/// Диагностический trace шагов (QWEN36_TRACE=1) — для расследования зависаний
+/// Диагностический trace шагов (TRACE=1) — для расследования зависаний
 /// dispatch loop в qwen36-server. Дёшево: одна проверка env на шаг.
 fn trace_value_on(value: &str) -> bool {
     matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
@@ -124,15 +124,15 @@ fn trace_value_on(value: &str) -> bool {
 #[inline]
 pub fn trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_TRACE").map(|v| trace_value_on(&v)).unwrap_or(false))
+    *ON.get_or_init(|| std::env::var("TRACE").map(|v| trace_value_on(&v)).unwrap_or(false))
 }
 
-/// Фазовый тайминг MTP-раунда (env QWEN36_MTP_TIMING=1) — per-round eprintln.
+/// Фазовый тайминг MTP-раунда (env MTP_TIMING=1) — per-round eprintln.
 #[inline]
 pub(crate) fn mtp_timing_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("QWEN36_MTP_TIMING").map(|v| trace_value_on(&v)).unwrap_or(false)
+        std::env::var("MTP_TIMING").map(|v| trace_value_on(&v)).unwrap_or(false)
     })
 }
 
@@ -166,7 +166,7 @@ pub struct BatchScheduler<M: BatchModel> {
     /// раунда. Проверяем гипотезу: раунд, начинающийся там, где модель
     /// колеблется, чаще оказывается холостым — а значит его дешевле не
     /// начинать вовсе (пропуск стоит 25 мс за токен против 41.6 за раунд).
-    /// Считается только при QWEN36_MTP_PREDICT=1.
+    /// Считается только при MTP_PREDICT=1.
     slot_prev_gap: Vec<f32>,
     /// Когда закончился прошлый раунд спекуляции слота. Нужно только для
     /// тайминга: фазы покрывают раунд от begin до commit, а между раундами
@@ -205,10 +205,10 @@ fn top2_gap(logits: &[f32]) -> f32 {
     a - b
 }
 
-/// Диагностика предиктора холостых раундов (QWEN36_MTP_PREDICT=1).
+/// Диагностика предиктора холостых раундов (MTP_PREDICT=1).
 fn mtp_predict_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_MTP_PREDICT").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("MTP_PREDICT").as_deref() == Ok("1"))
 }
 
 impl<M: BatchModel> BatchScheduler<M> {
@@ -432,12 +432,12 @@ impl<M: BatchModel> BatchScheduler<M> {
         slot: usize,
         should_stop: &mut dyn FnMut(usize, &[u32]) -> bool,
     ) -> Result<Option<SpeculativeFallback>> {
-        // Фазовый тайминг раунда (env QWEN36_MTP_TIMING=1) — host-bound decode
+        // Фазовый тайминг раунда (env MTP_TIMING=1) — host-bound decode
         // требует знать, куда уходит время, прежде чем что-то оптимизировать.
         let timing = mtp_timing_on();
         let t_begin = Instant::now();
         self.speculative[slot].enabled = true;
-        // P0.5c adaptive width (QWEN36_MTP_ADAPTIVE=0 для отката): ширина
+        // P0.5c adaptive width (MTP_ADAPTIVE=0 для отката): ширина
         // следующего раунда следует за фактической принимаемостью. Полный
         // успех (m>=K) наращивает K; провал (m<=1) срезает к 1 → раунд
         // пропускается (дешёвый baseline decode вместо draft+rollback ~65мс).

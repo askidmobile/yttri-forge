@@ -23,13 +23,13 @@
 //!
 //! Тот же gate для Q8-пула (снимок переносит байты и масштабы без потерь):
 //! ```sh
-//! QWEN36_KV_POOL_Q8=1 QWEN36_PGRAPH=on \
+//! KV_POOL_Q8=1 PGRAPH=on \
 //! cargo test -p qwen35-batch --features real-model,cuda \
 //!     --test prefix_snapshot_parity --release -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! Длины префикса: `QWEN36_PCP_SHORT` (дефолт 512), `QWEN36_PCP_LONG`
-//! (дефолт 16384). Размер чанка: `QWEN36_PCP_CHUNK` (дефолт 512 — как
+//! Длины префикса: `PCP_SHORT` (дефолт 512), `PCP_LONG`
+//! (дефолт 16384). Размер чанка: `PCP_CHUNK` (дефолт 512 — как
 //! `prefill_chunk_size`). На paged-пути (CUDA, графы включены — дефолт)
 //! длинный префикс exercising пул и постраничные копии снимка.
 
@@ -103,7 +103,7 @@ fn prefill_chunked(
     slot: usize,
     tokens: &[u32],
 ) -> anyhow::Result<Vec<f32>> {
-    let chunk_size = env_len("QWEN36_PCP_CHUNK", 512);
+    let chunk_size = env_len("PCP_CHUNK", 512);
     let mut logits = Vec::new();
     let mut start = 0usize;
     while start < tokens.len() {
@@ -142,7 +142,7 @@ fn assert_snapshot_coverage(snap: &StateSnapshot, label: &str) {
         .iter()
         .filter(|b| matches!(b, BlockStateSnap::Attention(Some(kv)) if kv.is_q8()))
         .count();
-    let q8_requested = std::env::var("QWEN36_KV_POOL_Q8").as_deref() == Ok("1");
+    let q8_requested = std::env::var("KV_POOL_Q8").as_deref() == Ok("1");
     eprintln!(
         "[{label}] снимок: pos={} blocks={} deltanet={dn} attention_с_kv={attn_some} attention_q8={attn_q8} attention_пустых={attn_none}",
         snap.position,
@@ -162,7 +162,7 @@ fn assert_snapshot_coverage(snap: &StateSnapshot, label: &str) {
         // создаёт: снимки приходят из single-slot кэша и всегда F16. Поэтому
         // при attn_q8 == 0 виноват харнесс, а не код снимка, и говорить надо
         // об этом — иначе сообщение уводит в неверную сторону (уже увело).
-        // Q8-ветка проверена боевым путём: сервер с QWEN36_KV_POOL_Q8=1 и
+        // Q8-ветка проверена боевым путём: сервер с KV_POOL_Q8=1 и
         // кешем префикса даёт ответы, совпадающие с прогоном без кеша.
         assert!(
             attn_q8 == attn_some || attn_q8 == 0,
@@ -170,13 +170,13 @@ fn assert_snapshot_coverage(snap: &StateSnapshot, label: &str) {
         );
         if attn_q8 == 0 {
             eprintln!(
-                "[{label}] ВНИМАНИЕ: QWEN36_KV_POOL_Q8=1, но снимки F16 — страничный пул в этом тесте не создаётся, Q8-ветка снимка им не покрыта"
+                "[{label}] ВНИМАНИЕ: KV_POOL_Q8=1, но снимки F16 — страничный пул в этом тесте не создаётся, Q8-ветка снимка им не покрыта"
             );
         }
     } else {
         assert_eq!(
             attn_q8, 0,
-            "{label}: без QWEN36_KV_POOL_Q8 снимок неожиданно оказался Q8"
+            "{label}: без KV_POOL_Q8 снимок неожиданно оказался Q8"
         );
     }
 }
@@ -290,11 +290,11 @@ fn argmax_of(v: &[f32]) -> usize {
 #[test]
 #[ignore = "требует GGUF на диске + GPU; короткий префикс (сотни токенов)"]
 fn prefix_snapshot_parity_short() {
-    run_parity(env_len("QWEN36_PCP_SHORT", 512), "short");
+    run_parity(env_len("PCP_SHORT", 512), "short");
 }
 
 #[test]
 #[ignore = "требует GGUF на диске + GPU; длинный префикс (десятки тысяч токенов, paged-путь)"]
 fn prefix_snapshot_parity_long() {
-    run_parity(env_len("QWEN36_PCP_LONG", 16384), "long");
+    run_parity(env_len("PCP_LONG", 16384), "long");
 }

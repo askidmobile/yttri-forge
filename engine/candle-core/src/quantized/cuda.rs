@@ -19,23 +19,23 @@ pub struct QCudaStorage {
     device: CudaDevice,
     /// Кэш полной F16-деквантизации весов (IQ-типы). Один раз при первом
     /// matmul; дальше чистый HGEMM вместо dequant-всей-матрицы-на-шаг.
-    /// Включается env QWEN36_DEQUANT_CACHE=1 (смысл: карты с большим VRAM,
+    /// Включается env DEQUANT_CACHE=1 (смысл: карты с большим VRAM,
     /// A100 80GB; на 12GB не влезает — там tiled fallback как было).
     dequant_cache: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<CudaStorage>>>>,
 }
 
 fn dequant_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("QWEN36_DEQUANT_CACHE").is_some())
+    *ON.get_or_init(|| std::env::var_os("DEQUANT_CACHE").is_some())
 }
 
 pub(crate) static FORCE_DMMV: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// QWEN36_FORCE_MMQ=1: MMQ kernels даже для m=1 (decode). Эксперимент.
+/// FORCE_MMQ=1: MMQ kernels даже для m=1 (decode). Эксперимент.
 fn force_mmq() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("QWEN36_FORCE_MMQ").is_some())
+    *ON.get_or_init(|| std::env::var_os("FORCE_MMQ").is_some())
 }
 
 pub fn set_force_dmmv(f: bool) {
@@ -738,7 +738,7 @@ fn mul_mat_vec_via_q8_1(
         GgmlDType::IQ1M => "mul_mat_vec_iq1_m_q8_1_cuda",
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
-    let hoisted_mode = std::env::var("QWEN36_MMVQ_HOISTED");
+    let hoisted_mode = std::env::var("MMVQ_HOISTED");
     let use_hoisted = (2..=8).contains(&b_size)
         && match dtype {
             GgmlDType::Q2K => hoisted_mode.as_deref() == Ok("all"),
@@ -923,7 +923,7 @@ fn indexed_moe_forward_dispatch(
     let out = unsafe { dev.alloc::<f32>(outsize)? };
 
     let use_grouped = batch > 1
-        && std::env::var_os("QWEN36_ENABLE_MOE_GROUPED").is_some()  // OFF by default — measured slower (2026-08-24)
+        && std::env::var_os("ENABLE_MOE_GROUPED").is_some()  // OFF by default — measured slower (2026-08-24)
         && matches!(
             w_dtype,
             GgmlDType::IQ2XXS
@@ -994,7 +994,7 @@ fn indexed_moe_forward_dispatch(
     );
     let t0 = std::time::Instant::now();
     unsafe { builder.launch(cfg) }.w()?;
-    let trace_mmq = std::env::var_os("QWEN36_TRACE_MMQ").is_some();
+    let trace_mmq = std::env::var_os("TRACE_MMQ").is_some();
     if trace_mmq {
         let _ = dev.cuda_stream().synchronize();
         eprintln!(
@@ -1103,7 +1103,7 @@ impl QCudaStorage {
         barg!(b, input_dim1 as i32);
         let t0 = std::time::Instant::now();
         unsafe { b.launch(cfg) }.w()?;
-        let trace_mmq = std::env::var_os("QWEN36_TRACE_MMQ").is_some();
+        let trace_mmq = std::env::var_os("TRACE_MMQ").is_some();
         if trace_mmq {
             let _ = dev.cuda_stream().synchronize();
             eprintln!(
@@ -1221,12 +1221,12 @@ impl QCudaStorage {
         &self.device
     }
 
-    /// Деквантизация всей матрицы с кэшем (IQ-типы, QWEN36_DEQUANT_CACHE=1):
+    /// Деквантизация всей матрицы с кэшем (IQ-типы, DEQUANT_CACHE=1):
     /// один раз dequant в F32, дальше cuBLAS SGEMM по кэшу.
     fn cached_dequant_f32(&self, elem_count: usize) -> Result<std::sync::Arc<CudaStorage>> {
         let mut g = self.dequant_cache.lock().unwrap();
         if g.is_none() {
-            if std::env::var("QWEN36_TRACE")
+            if std::env::var("TRACE")
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false)
             {
@@ -1470,7 +1470,7 @@ impl QCudaStorage {
             if let Some(result) = super::fast_mmvq::try_fwd(self, self_shape, storage, layout)? {
                 return Ok(result);
             }
-            if std::env::var_os("QWEN36_TRACE_MMQ").is_some() {
+            if std::env::var_os("TRACE_MMQ").is_some() {
                 let m = match layout.shape().dims() {
                     [b, m, _] => b * m,
                     [m, _] => *m,
@@ -1482,7 +1482,7 @@ impl QCudaStorage {
             if let Some(result) = super::fast_mmq::try_fwd(self, self_shape, storage, layout)? {
                 return Ok(result);
             }
-            if std::env::var_os("QWEN36_TRACE_MMQ").is_some() {
+            if std::env::var_os("TRACE_MMQ").is_some() {
                 let (n, k) = self_shape.dims2()?;
                 let m = match layout.shape().dims() {
                     [b, m, _] => b * m,
@@ -1655,14 +1655,14 @@ impl QCudaStorage {
             unsafe { mb.launch(cfg) }.w()?;
         }
 
-        if std::env::var_os("QWEN36_TRACE_MMQ").is_some() {
+        if std::env::var_os("TRACE_MMQ").is_some() {
             eprintln!(
                 "[mmq] dtype={:?} m={} n={} k={} mmq_x={} nbs={} tiles={}x{}",
                 self.dtype, m_total, n, k, mmq_x, nbs, nty, ntx,
             );
         }
         let t_mmq = std::time::Instant::now();
-        let trace_mmq = std::env::var_os("QWEN36_TRACE_MMQ").is_some();
+        let trace_mmq = std::env::var_os("TRACE_MMQ").is_some();
         if trace_mmq {
             let _ = dev.cuda_stream().synchronize();
         }

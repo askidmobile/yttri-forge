@@ -22,11 +22,11 @@ use std::path::Path;
 
 use crate::model::{BatchModel, DecodeBatch, MultimodalPrefill, PrefillChunk};
 use crate::real::model_profile::ModelProfile;
+#[cfg(feature = "cuda")]
+use crate::real::model_weights::GRAPH_MIN_FREE_BYTES;
 use crate::real::model_weights::{
     BatchedStateCheckpoint, BlockStateSnap, ModelWeights, StateSnapshot, DECODE_BATCH_CAPACITY,
 };
-#[cfg(feature = "cuda")]
-use crate::real::model_weights::GRAPH_MIN_FREE_BYTES;
 use crate::real::mtp::Qwen35Mtp;
 use crate::real::multimodal::{GridThw, PositionPlan};
 use crate::real::vision::Qwen35Vision;
@@ -99,9 +99,7 @@ struct DecodeGraphState {
 #[cfg(feature = "cuda")]
 impl DecodeGraphState {
     fn launch(&self) -> Result<()> {
-        let res = unsafe {
-            cudarc::driver::sys::cuGraphLaunch(self.exec, self.stream.cu_stream())
-        };
+        let res = unsafe { cudarc::driver::sys::cuGraphLaunch(self.exec, self.stream.cu_stream()) };
         if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             return Err(anyhow!("cuGraphLaunch failed: {res:?}"));
         }
@@ -133,9 +131,7 @@ struct PrefillGraphState {
 #[cfg(feature = "cuda")]
 impl PrefillGraphState {
     fn launch(&self) -> Result<()> {
-        let res = unsafe {
-            cudarc::driver::sys::cuGraphLaunch(self.exec, self.stream.cu_stream())
-        };
+        let res = unsafe { cudarc::driver::sys::cuGraphLaunch(self.exec, self.stream.cu_stream()) };
         if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             return Err(anyhow!("cuGraphLaunch (prefill) failed: {res:?}"));
         }
@@ -160,12 +156,12 @@ impl Drop for PrefillGraphState {
 }
 
 /// Сколько графов префилла держим одновременно (PD-A5). Умолчание 8,
-/// переопределяется QWEN36_PGRAPH_LRU.
+/// переопределяется PGRAPH_LRU.
 #[cfg(feature = "cuda")]
 fn pgraph_lru() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("QWEN36_PGRAPH_LRU")
+        std::env::var("PGRAPH_LRU")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
@@ -179,13 +175,13 @@ fn pgraph_lru() -> usize {
 /// (2026-08-28, T=45 при lru=8 — первое вытеснение роняло следующий шаг).
 /// Выигрыш графа на хвосте — десятки мс один раз на запрос, терять нечего;
 /// а пул, забитый хвостами, не принял бы полный чанк. Умолчание — размер
-/// чанка (захватываются только полные чанки); QWEN36_PGRAPH_MIN_T
+/// чанка (захватываются только полные чанки); PGRAPH_MIN_T
 /// переопределяет, 0 — захватывать всё (диагностика).
 #[cfg(feature = "cuda")]
 fn pgraph_min_capture_t() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("QWEN36_PGRAPH_MIN_T")
+        std::env::var("PGRAPH_MIN_T")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| match crate::scheduler::prefill_chunk_size() {
@@ -202,7 +198,7 @@ fn pgraph_min_capture_t() -> usize {
 fn prefix_cache_max_tokens() -> usize {
     static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| {
-        std::env::var("QWEN36_PREFIX_CACHE_MAX_TOKENS")
+        std::env::var("PREFIX_CACHE_MAX_TOKENS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|v| *v > 0)
@@ -211,7 +207,7 @@ fn prefix_cache_max_tokens() -> usize {
 }
 /// Размер пула декодных графов. Ключ — только ширина батча b (состав слотов
 /// ядра читают из стейджинга PagedModelCtx::slots_dev), так что различных
-/// форм не больше числа слотов; сверх пула не захватываем (QWEN36_DGRAPH_LRU).
+/// форм не больше числа слотов; сверх пула не захватываем (DGRAPH_LRU).
 const DGRAPH_LRU: usize = 8;
 
 /// Максимальный размер батча, на котором ещё используются графы декода.
@@ -232,7 +228,7 @@ const DGRAPH_LRU: usize = 8;
 fn graph_max_b() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("QWEN36_GRAPH_MAX_B")
+        std::env::var("GRAPH_MAX_B")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|n| *n > 0)
@@ -243,7 +239,7 @@ fn graph_max_b() -> usize {
 fn dgraph_lru() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("QWEN36_DGRAPH_LRU")
+        std::env::var("DGRAPH_LRU")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|n| *n > 0)
@@ -253,11 +249,11 @@ fn dgraph_lru() -> usize {
 
 /// Потолок сбоев графового пути на процесс (OQ-8): до него графы возвращаются
 /// при следующем приёме запроса, после — выключены до перезапуска.
-/// QWEN36_GRAPH_FAIL_CAP, умолчание 3.
+/// GRAPH_FAIL_CAP, умолчание 3.
 fn graph_fail_cap() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("QWEN36_GRAPH_FAIL_CAP")
+        std::env::var("GRAPH_FAIL_CAP")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|n| *n > 0)
@@ -265,7 +261,7 @@ fn graph_fail_cap() -> u32 {
     })
 }
 
-/// Диагностика OQ-8: QWEN36_GRAPH_FAIL_INJECT=K — первые K захватов декодного
+/// Диагностика OQ-8: GRAPH_FAIL_INJECT=K — первые K захватов декодного
 /// графа завершаются искусственным сбоем ещё до начала захвата (шаг уже
 /// посчитан прогревочным проходом, состояние консистентно). Нет/0 — выключено.
 fn graph_fail_inject() -> bool {
@@ -273,7 +269,7 @@ fn graph_fail_inject() -> bool {
     static LEFT: std::sync::OnceLock<AtomicU32> = std::sync::OnceLock::new();
     let left = LEFT.get_or_init(|| {
         AtomicU32::new(
-            std::env::var("QWEN36_GRAPH_FAIL_INJECT")
+            std::env::var("GRAPH_FAIL_INJECT")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
@@ -283,9 +279,14 @@ fn graph_fail_inject() -> bool {
         .is_ok()
 }
 
-/// Режим graph-prefill: `QWEN36_PGRAPH` = off (умолчание) | on | check.
-/// `check` — прогнать граф, откатить state и посчитать чанк ещё раз eager'ом,
-/// сравнив логиты (гейт Phase 2). Продакшн-путь — `on`.
+/// Режим paged/graph-prefill: `PGRAPH` = off | on | check.
+///
+/// По умолчанию выключен ради корректности. Exact-session A/B на Ornith-1.5-9B
+/// показал, что paged-prefill портит состояние модели: при `check` уже на
+/// 512-токенных чанках max |Δlogit| достигает 16.4, а argmax меняется. Это
+/// воспроизводится и с F16 paged KV, то есть не является погрешностью Q8-пула.
+/// `on` остаётся только явным экспериментальным opt-in; `check` прогоняет
+/// paged-путь, откатывает state и отдаёт результат eager-пересчёта.
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PgraphMode {
@@ -297,16 +298,46 @@ enum PgraphMode {
 #[cfg(feature = "cuda")]
 fn pgraph_mode() -> PgraphMode {
     static MODE: std::sync::OnceLock<PgraphMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("QWEN36_PGRAPH").as_deref() {
-        Ok("0") | Ok("off") => PgraphMode::Off,
-        Ok("check") => PgraphMode::Check,
-        // Умолчание — включено. Graph-префилл пишет KV прямо в paged-пул,
-        // минуя batched-кэш и его миграцию: замер 2026-08-26 на 9B при
-        // ctx=65536 дал VRAM 10393 -> 8016 МБ, окно пула 14016 -> 65536
-        // (то есть скольжение окна прекратилось) и декод 18.8 -> 39.1 ток/с.
-        // Перплексия совпадает до знака. Откат — QWEN36_PGRAPH=off.
-        _ => PgraphMode::On,
-    })
+    *MODE.get_or_init(|| parse_pgraph_mode(std::env::var("PGRAPH").ok().as_deref()))
+}
+
+#[cfg(feature = "cuda")]
+fn parse_pgraph_mode(value: Option<&str>) -> PgraphMode {
+    match value {
+        Some("1" | "on") => PgraphMode::On,
+        Some("check") => PgraphMode::Check,
+        _ => PgraphMode::Off,
+    }
+}
+
+/// Каким путём считается префил текущего промпта в слоте. Выбирается один раз
+/// и до конца промпта не меняется.
+///
+/// Смешивание путей внутри одного промпта тихо теряет историю внимания в ОБЕ
+/// стороны. Eager-чанк после paged: `forward_attn_with_rope` считает внимание
+/// по single-slot кэшу, а тот после графовых чанков пуст — `kv_cache_len`
+/// становится равен длине чанка, хотя позиции RoPE говорят `start_pos..`, и
+/// весь префикс из внимания исчезает. Paged-чанк после eager: строки
+/// eager-чанка в пул не попали, и append оставляет там дыру.
+///
+/// Ни то, ни другое ничем не диагностировалось: поле `pg_paged_only`, которое
+/// по комментарию «закрывало путь явной ошибкой», ни разу не читалось.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PrefillPath {
+    /// Первый чанк промпта ещё не посчитан — путь определят гейты.
+    Undecided,
+    /// KV промпта лежит ТОЛЬКО в страничном пуле.
+    Paged,
+    /// KV промпта лежит в single-slot кэше; в пуле его нет.
+    Eager,
+}
+
+/// Можно ли увести очередной чанк на eager. Нельзя ровно в одном случае —
+/// когда хотя бы один чанк этого промпта уже лёг в страничный пул.
+#[cfg(feature = "cuda")]
+fn eager_fallback_allowed(path: PrefillPath) -> bool {
+    !matches!(path, PrefillPath::Paged)
 }
 
 #[cfg(feature = "cuda")]
@@ -341,7 +372,7 @@ pub struct Qwen35BatchAdapter {
     /// Признак того, что слот уже засеян в batched buffers (после prefill).
     /// True = batched decode может использовать этот slot без повторного seed.
     slot_seeded: Vec<bool>,
-    /// CUDA-graph replay состояние (env QWEN36_CUDA_GRAPHS=1).
+    /// CUDA-graph replay состояние (env CUDA_GRAPHS=1).
     #[cfg(feature = "cuda")]
     /// Пул декодных графов по ключу (b, slots). Раньше хранился единственный
     /// экземпляр, и чередование обычного декода (b = число слотов) с проверкой
@@ -355,7 +386,7 @@ pub struct Qwen35BatchAdapter {
     /// графовой функции приводил к тому, что MTP переставал приниматься.
     #[cfg(feature = "cuda")]
     pg_last_hidden: Option<Tensor>,
-    /// LRU графов префилла (QWEN36_PGRAPH), ключ — (T, slot); хвост = свежий.
+    /// LRU графов префилла (PGRAPH), ключ — (T, slot); хвост = свежий.
     #[cfg(feature = "cuda")]
     prefill_graphs: Vec<PrefillGraphState>,
     /// Графы проверки спекуляции: k строк одного слота на страничном пути,
@@ -369,10 +400,10 @@ pub struct Qwen35BatchAdapter {
     /// декод работает по batched-буферам и single-slot state не трогает.
     /// Замер 2026-08-25: снимок+восстановление стоили ~25 мс на чанк.
     state_owner: Option<(usize, usize)>,
-    /// Слот, KV которого лежит ТОЛЬКО в paged pool (graph-prefill режим on):
-    /// eager-decode по batched-кэшу дал бы мусор — путь закрыт явной ошибкой.
+    /// Путь префила текущего промпта в каждом слоте (см. `PrefillPath`):
+    /// решается на первом чанке и до конца промпта не меняется.
     #[cfg(feature = "cuda")]
-    pg_paged_only: Vec<bool>,
+    prefill_path: Vec<PrefillPath>,
     /// Per-slot: KV данные изменились (prefill/seed) и paged pool устарел.
     #[cfg(feature = "cuda")]
     paged_dirty: Vec<bool>,
@@ -384,7 +415,7 @@ pub struct Qwen35BatchAdapter {
     graph_gate_warned: Vec<bool>,
     #[cfg(feature = "cuda")]
     graphs_enabled: bool,
-    /// Графы разрешены конфигурацией (QWEN36_CUDA_GRAPHS=1 и запас VRAM). После
+    /// Графы разрешены конфигурацией (CUDA_GRAPHS=1 и запас VRAM). После
     /// сбоя `graphs_enabled` гаснет до следующего приёма запроса и
     /// возвращается, пока сбоев меньше потолка `graph_fail_cap()` (OQ-8).
     #[cfg(feature = "cuda")]
@@ -401,7 +432,7 @@ pub struct Qwen35BatchAdapter {
     /// Speculation must stay disabled for that request until MTP snapshots are
     /// added to the cache format.
     mtp_slot_aligned: Vec<bool>,
-    /// Диагностический буфер (QWEN36_DEBUG_ALLOC_MB), см. load_mtp.
+    /// Диагностический буфер (DEBUG_ALLOC_MB), см. load_mtp.
     debug_alloc: Option<Tensor>,
     target_transactions: Vec<Option<BatchedStateCheckpoint>>,
     verified_target_hidden: Vec<Vec<Tensor>>,
@@ -426,7 +457,7 @@ impl Qwen35BatchAdapter {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(cuda_dev) = &device {
             static RETAIN_ONCE: std::sync::Once = std::sync::Once::new();
-            let disabled = std::env::var("QWEN36_NO_MEMPOOL_RETAIN").as_deref() == Ok("1");
+            let disabled = std::env::var("NO_MEMPOOL_RETAIN").as_deref() == Ok("1");
             if !disabled {
                 RETAIN_ONCE.call_once(|| {
                     // Ограниченный release threshold вместо u64::MAX:
@@ -434,12 +465,16 @@ impl Qwen35BatchAdapter {
                     // навсегда → VRAM 97%+ → WDDM spill → decode коллапс.
                     // 512 MiBthreshold: decode-аллокации переиспользуют пул,
                     // префилл-пики освобождаются на sync-точках.
-                    let thresh_mib = std::env::var("QWEN36_MEMPOOL_THRESHOLD_MIB")
+                    let thresh_mib = std::env::var("MEMPOOL_THRESHOLD_MIB")
                         .ok()
                         .and_then(|v| v.parse::<u64>().ok())
                         .unwrap_or(256); // 256 MiB — баланс: decode reuse работает, префилл-пики >256 освобождаются
-                    if let Err(e) = candle_core::cuda_backend::mem_pool::set_release_threshold_mib(cuda_dev, thresh_mib) {
-                        log::warn!("[qwen35-batch] set_release_threshold_mib({thresh_mib}) failed: {e}");
+                    if let Err(e) = candle_core::cuda_backend::mem_pool::set_release_threshold_mib(
+                        cuda_dev, thresh_mib,
+                    ) {
+                        log::warn!(
+                            "[qwen35-batch] set_release_threshold_mib({thresh_mib}) failed: {e}"
+                        );
                     }
                 });
             }
@@ -516,18 +551,18 @@ impl Qwen35BatchAdapter {
         }
 
         // F16-GEMM сайдкара по умолчанию аккумулирует в F32 (как в pytorch).
-        // На Ampere это вдвое медленнее F16-аккумуляции. QWEN36_F16_FAST_ACC=1
+        // На Ampere это вдвое медленнее F16-аккумуляции. F16_FAST_ACC=1
         // включает CUBLAS_COMPUTE_16F — быстрее, но копит ошибку по K=2560;
         // сторож [pfa] WARN non-finite logits ловит срыв.
         #[cfg(feature = "cuda")]
-        if std::env::var("QWEN36_F16_FAST_ACC").as_deref() == Ok("1") {
+        if std::env::var("F16_FAST_ACC").as_deref() == Ok("1") {
             candle_core::cuda_backend::set_gemm_reduced_precision_f16(true);
             log::info!("[ytf] F16 GEMM: аккумуляция F16 (fast)");
         }
 
         #[cfg(feature = "cuda")]
         let graphs_on = {
-            let want = std::env::var("QWEN36_CUDA_GRAPHS").as_deref() == Ok("1");
+            let want = std::env::var("CUDA_GRAPHS").as_deref() == Ok("1");
             if !want {
                 false
             } else if let Device::Cuda(c) = &device {
@@ -536,7 +571,12 @@ impl Qwen35BatchAdapter {
                 // 12GB) лишние ~0.5 GiB уходят в sysmem и душат decode сильнее,
                 // чем экономия на launch overhead. Порог общий с гейтом
                 // эмбеддинга — см. GRAPH_MIN_FREE_BYTES в model_weights.rs.
-                let free = c.cuda_stream().context().mem_get_info().map(|(f, _)| f).unwrap_or(0);
+                let free = c
+                    .cuda_stream()
+                    .context()
+                    .mem_get_info()
+                    .map(|(f, _)| f)
+                    .unwrap_or(0);
                 if free < GRAPH_MIN_FREE_BYTES {
                     log::info!(
                         "[graphs] disabled: VRAM headroom {:.0} MiB < {} MiB",
@@ -574,7 +614,7 @@ impl Qwen35BatchAdapter {
             #[cfg(feature = "cuda")]
             verify_graphs: Vec::new(),
             #[cfg(feature = "cuda")]
-            pg_paged_only: vec![false; num_slots],
+            prefill_path: vec![PrefillPath::Undecided; num_slots],
             #[cfg(feature = "cuda")]
             graphs_enabled: graphs_on,
             #[cfg(feature = "cuda")]
@@ -595,12 +635,12 @@ impl Qwen35BatchAdapter {
             vocab,
         };
         let mut a = a; // keep mut for prepare below
-        // Упреждающее f16-зеркало слота 0 (фикс WDDM-коллапса 2026-08-23):
-        // выделяем сразу после загрузки весов, пока dedicated VRAM свободна,
-        // иначе страницы уходят в WDDM shared и декод падает на PCIe.
-        // yttri-forge stage1: F16-сайдкар тяжёлых проекций (dual-read prefill)
-        // Сайдкар нужен только GGUF-пути: у самостоятельного контейнера веса
-        // уже нашего формата, вторая копия в VRAM была бы бессмысленной.
+                       // Упреждающее f16-зеркало слота 0 (фикс WDDM-коллапса 2026-08-23):
+                       // выделяем сразу после загрузки весов, пока dedicated VRAM свободна,
+                       // иначе страницы уходят в WDDM shared и декод падает на PCIe.
+                       // yttri-forge stage1: F16-сайдкар тяжёлых проекций (dual-read prefill)
+                       // Сайдкар нужен только GGUF-пути: у самостоятельного контейнера веса
+                       // уже нашего формата, вторая копия в VRAM была бы бессмысленной.
         if !standalone {
             a.model
                 .attach_ytf16(gguf_path, &a.device)
@@ -614,12 +654,13 @@ impl Qwen35BatchAdapter {
             let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
         }
 
-        if let Some(tokens) = std::env::var("QWEN36_KV_MIRROR_PREPARE")
+        if let Some(tokens) = std::env::var("KV_MIRROR_PREPARE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
         {
             if tokens > 0 {
-                a.model.prepare_kv_mirror(tokens.min(a.model.context_length));
+                a.model
+                    .prepare_kv_mirror(tokens.min(a.model.context_length));
             }
         }
         Ok(a)
@@ -720,24 +761,27 @@ impl Qwen35BatchAdapter {
             self.model.shared_output(),
         )
         .map_err(|error| anyhow!("load MTP component: {error}"))?;
-        // Шортлист словаря черновика: QWEN36_MTP_VOCAB_SHORTLIST=<файл, id по
-        // строке> либо QWEN36_MTP_VOCAB_TOP=N (первые N id — у BPE это
+        // Шортлист словаря черновика: MTP_VOCAB_SHORTLIST=<файл, id по
+        // строке> либо MTP_VOCAB_TOP=N (первые N id — у BPE это
         // примерно порядок частоты слияний). Не задано — полный словарь.
         // Пустое значение переменной — «нет шортлиста», а не путь: иначе
         // загрузка MTP молча падала, и контрольные замеры шли без MTP.
-        let shortlist_path = std::env::var("QWEN36_MTP_VOCAB_SHORTLIST")
+        let shortlist_path = std::env::var("MTP_VOCAB_SHORTLIST")
             .ok()
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty());
         let shortlist: Vec<u32> = if let Some(path) = shortlist_path {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| anyhow!("MTP shortlist {path}: {e}"))?;
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| anyhow!("MTP shortlist {path}: {e}"))?;
             text.lines()
                 .map(str::trim)
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(|l| l.parse::<u32>().map_err(|e| anyhow!("MTP shortlist {path}: «{l}»: {e}")))
+                .map(|l| {
+                    l.parse::<u32>()
+                        .map_err(|e| anyhow!("MTP shortlist {path}: «{l}»: {e}"))
+                })
                 .collect::<Result<Vec<u32>>>()?
-        } else if let Some(v) = std::env::var("QWEN36_MTP_VOCAB_TOP")
+        } else if let Some(v) = std::env::var("MTP_VOCAB_TOP")
             .ok()
             .filter(|v| !v.trim().is_empty())
         {
@@ -746,7 +790,7 @@ impl Qwen35BatchAdapter {
             let n: u32 = v
                 .trim()
                 .parse()
-                .map_err(|e| anyhow!("QWEN36_MTP_VOCAB_TOP=«{v}»: {e}"))?;
+                .map_err(|e| anyhow!("MTP_VOCAB_TOP=«{v}»: {e}"))?;
             (0..n).collect()
         } else {
             Vec::new()
@@ -757,11 +801,11 @@ impl Qwen35BatchAdapter {
                 .map_err(|e| anyhow!("MTP vocab shortlist: {e}"))?;
             eprintln!("[mtp] словарь черновика ограничен шортлистом из {n} токенов");
         }
-        // Диагностика раскладки памяти: QWEN36_DEBUG_ALLOC_MB=N держит лишний
+        // Диагностика раскладки памяти: DEBUG_ALLOC_MB=N держит лишний
         // буфер N МБ с момента загрузки MTP. Если один он меняет вывод при
         // полном словаре — где-то читается неинициализированная память, и
         // шортлист лишь сдвигал раскладку.
-        if let Some(mb) = std::env::var("QWEN36_DEBUG_ALLOC_MB")
+        if let Some(mb) = std::env::var("DEBUG_ALLOC_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
@@ -828,8 +872,7 @@ impl Qwen35BatchAdapter {
                 let rope_position = i64::try_from(cache_position)?
                     .checked_add(self.rope_deltas[slot])
                     .ok_or_else(|| anyhow!("decode RoPE position overflow"))?;
-                usize::try_from(rope_position)
-                    .map_err(|_| anyhow!("negative decode RoPE position"))
+                usize::try_from(rope_position).map_err(|_| anyhow!("negative decode RoPE position"))
             })
             .collect()
     }
@@ -859,7 +902,9 @@ impl BatchModel for Qwen35BatchAdapter {
             || payload.mm_token_types.iter().all(|kind| *kind == 0)
             || payload.mm_token_types.iter().any(|kind| *kind > 2)
         {
-            return Err(anyhow!("multimodal token/position lengths differ or contain no media"));
+            return Err(anyhow!(
+                "multimodal token/position lengths differ or contain no media"
+            ));
         }
         if payload.patch_values.len()
             != payload
@@ -945,7 +990,7 @@ impl BatchModel for Qwen35BatchAdapter {
             #[cfg(feature = "cuda")]
             {
                 self.paged_dirty[sidx] = true;
-                self.pg_paged_only[sidx] = false;
+                self.prefill_path[sidx] = PrefillPath::Undecided;
                 self.graph_gate_warned[sidx] = false;
             }
             if self.multimodal[sidx].is_none() {
@@ -960,7 +1005,9 @@ impl BatchModel for Qwen35BatchAdapter {
                 let snap = self
                     .model
                     .snapshot_slot_state(&self.device, prev, prev_pos)
-                    .map_err(|e| anyhow!("prefill snapshot (передача владения слоту {sidx}): {e}"))?;
+                    .map_err(|e| {
+                        anyhow!("prefill snapshot (передача владения слоту {sidx}): {e}")
+                    })?;
                 self.slot_snaps[prev] = Some(snap);
             }
             let snap = self.slot_snaps[sidx].as_ref().unwrap();
@@ -1033,7 +1080,7 @@ impl BatchModel for Qwen35BatchAdapter {
             &self.device,
         )
         .map_err(|e| anyhow!("prefill ids from_vec T={}: {e}", chunk.tokens.len()))?;
-        // yttri-forge: CUDA-graph prefill (QWEN36_PGRAPH=on|check).
+        // yttri-forge: CUDA-graph prefill (PGRAPH=on|check).
         #[cfg(feature = "cuda")]
         let (pg_logits, pg_used) = self.prefill_try_graphed(chunk)?;
         #[cfg(not(feature = "cuda"))]
@@ -1047,9 +1094,7 @@ impl BatchModel for Qwen35BatchAdapter {
             // адаптивная ширина молча выключает спекуляцию (drafted=2 accepted=0).
             #[cfg(feature = "cuda")]
             let mi = match self.pg_last_hidden.take() {
-                Some(hidden)
-                    if self.multimodal[sidx].is_none() && self.mtp_slot_aligned[sidx] =>
-                {
+                Some(hidden) if self.multimodal[sidx].is_none() && self.mtp_slot_aligned[sidx] => {
                     // Именно embed_for_graph, а не embed_tokens: при GPU_ONLY=1
                     // хостовая таблица намеренно опустошается ради освобождения
                     // mmap на весь GGUF, и её forward обязан не вызываться. Этот
@@ -1180,7 +1225,11 @@ impl BatchModel for Qwen35BatchAdapter {
             if top.len() >= 2 {
                 eprintln!(
                     "[pfa] top1={} ({:.4}) top2={} ({:.4}) отрыв={:.4}",
-                    top[0].0, top[0].1, top[1].0, top[1].1, top[0].1 - top[1].1
+                    top[0].0,
+                    top[0].1,
+                    top[1].0,
+                    top[1].1,
+                    top[0].1 - top[1].1
                 );
             }
         }
@@ -1220,8 +1269,14 @@ impl BatchModel for Qwen35BatchAdapter {
                     .0
             };
             let (ag, ae) = (argmax(g), argmax(&logits_f32));
+            // pos обязателен: без него по логу не отличить чанк 0 (чистое
+            // сравнение одного шага) от чанка 49 (накопленный дрейф двух
+            // независимых историй — графовой в пуле и eager в single-slot
+            // кэше). Ровно эта переменная решает «баг или дрейф», а печаталось
+            // только T, и разбор 2026-09-04 упёрся в её отсутствие.
             eprintln!(
-                "[pg] parity T={} len={n} mae={:.3e} max={max:.3e} argmax g={ag}({:.2}/{:.2}) e={ae}({:.2}/{:.2}) {}",
+                "[pg] parity pos={} T={} len={n} mae={:.3e} max={max:.3e} argmax g={ag}({:.2}/{:.2}) e={ae}({:.2}/{:.2}) {}",
+                chunk.start_pos,
                 chunk.tokens.len(),
                 sum / n.max(1) as f64,
                 g[ag],
@@ -1274,7 +1329,7 @@ impl BatchModel for Qwen35BatchAdapter {
             // Single-slot F16 KV больше не нужен (decode через batched q8):
             // освобождаем ~480 MiB @24K, иначе карта уходит в 97%+ и декод
             // падает в WDDM shared (обрыв 6K→12K, 2026-08-23).
-            if std::env::var("QWEN36_KEEP_SINGLE_KV").as_deref() != Ok("1") {
+            if std::env::var("KEEP_SINGLE_KV").as_deref() != Ok("1") {
                 self.model.clear_single_slot_kv();
             }
             // Trim CUDA memory pool: prefill оставил пиковые F16/KV транзиенты
@@ -1294,7 +1349,7 @@ impl BatchModel for Qwen35BatchAdapter {
             // KV чанка записан прямо в paged pool: миграция из batched-кэша
             // (он пуст после graph-префилла) затёрла бы его.
             self.paged_dirty[sidx] = false;
-            self.pg_paged_only[sidx] = true;
+            self.prefill_path[sidx] = PrefillPath::Paged;
             // Отмечаем длину: batched-кэша нет, но пул её знает, и обратная
             // миграция должна знать, сколько восстанавливать, если понадобится
             // eager-путь.
@@ -1328,7 +1383,11 @@ impl BatchModel for Qwen35BatchAdapter {
     /// Возвращает Ok(None) — если шаг не графable (окно, состав, MTP) → eager fallback.
     fn decode_batch(&mut self, batch: &DecodeBatch) -> Result<Vec<Vec<f32>>> {
         let b = batch.items.len();
-        if batch.items.iter().any(|item| item.slot_idx >= self.slot_snaps.len()) {
+        if batch
+            .items
+            .iter()
+            .any(|item| item.slot_idx >= self.slot_snaps.len())
+        {
             return Err(anyhow!("decode slot is out of range"));
         }
         if b == 0 {
@@ -1436,7 +1495,7 @@ impl BatchModel for Qwen35BatchAdapter {
             self.model
                 .rehydrate_kv_from_paged(it.slot_idx)
                 .map_err(|e| anyhow!("rehydrate KV slot {}: {e}", it.slot_idx))?;
-            self.pg_paged_only[it.slot_idx] = false;
+            self.prefill_path[it.slot_idx] = PrefillPath::Eager;
         }
         let logits = self
             .model
@@ -1504,11 +1563,14 @@ impl BatchModel for Qwen35BatchAdapter {
         if let Err(error) = mtp.begin(slot) {
             self.model
                 .restore_slot_batched(&self.device, &checkpoint)
-                .map_err(|restore| anyhow!("MTP begin failed: {error}; target restore: {restore}"))?;
+                .map_err(|restore| {
+                    anyhow!("MTP begin failed: {error}; target restore: {restore}")
+                })?;
             return Err(anyhow!("MTP begin: {error}"));
         }
-        self.transaction_snapshot_positions[slot] =
-            self.slot_snaps[slot].as_ref().map(|snapshot| snapshot.position);
+        self.transaction_snapshot_positions[slot] = self.slot_snaps[slot]
+            .as_ref()
+            .map(|snapshot| snapshot.position);
         self.target_transactions[slot] = Some(checkpoint);
         self.verified_target_hidden[slot].clear();
         Ok(())
@@ -1613,7 +1675,9 @@ impl BatchModel for Qwen35BatchAdapter {
             .ok_or_else(|| anyhow!("speculative accept without verify for slot {slot}"))?;
         let k = pending.inputs.len();
         if consumed > k {
-            return Err(anyhow!("speculative accept {consumed} exceeds verified {k}"));
+            return Err(anyhow!(
+                "speculative accept {consumed} exceeds verified {k}"
+            ));
         }
         #[cfg(feature = "cuda")]
         let paged = self.paged_authority(slot);
@@ -1796,12 +1860,14 @@ impl BatchModel for Qwen35BatchAdapter {
 
 impl Qwen35BatchAdapter {
     /// Обёртка над `prefill_chunk_graphed`: снимает snapshot для check-режима,
-    /// глотает ошибку графа (PD-205 — чанк уходит в eager, графы остаются).
+    /// глотает ошибку графа (PD-205 — чанк уходит в eager, графы остаются), но
+    /// только пока промпт ещё не пошёл по пулу.
     /// Возвращает (логиты графа, использовать_ли_их_как_результат).
     #[cfg(feature = "cuda")]
     fn prefill_try_graphed(&mut self, chunk: &PrefillChunk) -> Result<(Option<Vec<f32>>, bool)> {
         let mode = pgraph_mode();
         if mode == PgraphMode::Off {
+            self.prefill_path[chunk.slot_idx] = PrefillPath::Eager;
             return Ok((None, false));
         }
         let pre = if mode == PgraphMode::Check {
@@ -1815,9 +1881,19 @@ impl Qwen35BatchAdapter {
         };
         let logits = match self.prefill_chunk_graphed(chunk) {
             Ok(v) => v,
-            Err(e) => {
+            // PD-205 действует, пока откат на eager безопасен. После первого
+            // paged-чанка он уже не безопасен: префикс лежит только в пуле,
+            // и eager досчитал бы промпт без него.
+            Err(e) if self.prefill_path[chunk.slot_idx] != PrefillPath::Paged => {
                 eprintln!("[pg] ошибка, чанк уходит в eager: {e}");
+                self.prefill_path[chunk.slot_idx] = PrefillPath::Eager;
                 None
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "paged prefill слота {} прервался, когда промпт уже шёл по пулу: {e}",
+                    chunk.slot_idx
+                ))
             }
         };
         if logits.is_none() {
@@ -1835,6 +1911,29 @@ impl Qwen35BatchAdapter {
         }
     }
 
+    /// Гейт увёл чанк с графового пути на eager.
+    ///
+    /// До первого paged-чанка это законно: весь промпт пойдёт eager. После —
+    /// нет: строки предыдущих чанков лежат только в пуле, single-slot кэш пуст,
+    /// и eager посчитал бы внимание вообще без префикса. Раньше здесь был
+    /// молчаливый `Ok(None)`, и такой промпт досчитывался мусором.
+    #[cfg(feature = "cuda")]
+    fn prefill_gate(&mut self, slot: usize, reason: &str) -> Result<Option<Vec<f32>>> {
+        if !eager_fallback_allowed(self.prefill_path[slot]) {
+            return Err(anyhow!(
+                "paged prefill: слот {slot} уже считает промпт по страничному пулу, \
+                 а этот чанк уходит на eager ({reason}). Single-slot кэш пуст — \
+                 eager потерял бы весь префикс промпта. Для этой конфигурации \
+                 задайте PGRAPH=off: весь префил пойдёт eager с первого чанка"
+            ));
+        }
+        if self.prefill_path[slot] == PrefillPath::Undecided {
+            eprintln!("[pg] слот {slot}: префил идёт eager ({reason})");
+        }
+        self.prefill_path[slot] = PrefillPath::Eager;
+        Ok(None)
+    }
+
     /// CUDA-graph prefill одного чанка: один cuGraphLaunch вместо ~1000 мс
     /// хостовых launch'ей. `Ok(None)` — чанк не graphable (гейты), вызывающий
     /// идёт eager. Ошибка внутри → eager этот чанк, графы НЕ выключаются
@@ -1844,28 +1943,46 @@ impl Qwen35BatchAdapter {
     /// seqlens_q=[0,T], block_table. Внутри — только device-операции.
     #[cfg(feature = "cuda")]
     fn prefill_chunk_graphed(&mut self, chunk: &PrefillChunk) -> Result<Option<Vec<f32>>> {
+        let slot = chunk.slot_idx;
         if pgraph_mode() == PgraphMode::Off {
+            self.prefill_path[slot] = PrefillPath::Eager;
             return Ok(None);
         }
         let Device::Cuda(cuda_dev) = &self.device else {
             return Ok(None);
         };
-        let slot = chunk.slot_idx;
         let t = chunk.tokens.len();
+        // Промпт уже пошёл по eager — назад дороги нет: строки посчитанных
+        // чанков в пул не попали, и append оставил бы там дыру.
+        if self.prefill_path[slot] == PrefillPath::Eager {
+            return Ok(None);
+        }
         // PD-204: MTP из гейта снят 2026-08-27 — проверка спекуляции идёт по
         // страничному пулу (`speculative_verify` → `paged_graph_run`), поэтому
         // загруженные веса MTP больше не отключают графовый префил всему
         // движку. Vision остаётся: mrope требует своих позиций, которых у
         // графа нет.
-        if self.multimodal[slot].is_some() || !self.graphs_enabled {
-            return Ok(None);
+        if self.multimodal[slot].is_some() {
+            return self.prefill_gate(slot, "multimodal");
+        }
+        // graphs_enabled гаснет при сбое графа в любом слоте (OQ-8) — то есть
+        // ровно посреди чужого промпта.
+        if !self.graphs_enabled {
+            return self.prefill_gate(slot, "графы выключены после сбоя");
         }
         self.model
             .init_paged_decode(&self.device)
             .map_err(|e| anyhow!("pgraph init paged: {e}"))?;
         let window = self.model.paged_window();
-        if window == 0 || chunk.start_pos + t > window {
-            return Ok(None);
+        if window == 0 {
+            return self.prefill_gate(slot, "страничный пул не создан");
+        }
+        // Окно пула = min(VRAM, окно модели, CTX). Когда оно меньше промпта,
+        // слоту физически некуда писать хвост: его страницы — ровно `window`
+        // токенов. Это конфигурация, а не сбой — движок уже печатает
+        // «WARN: окно меньше контекста» при создании пула.
+        if chunk.start_pos + t > window {
+            return self.prefill_gate(slot, &format!("чанк за окном пула ({window})"));
         }
 
         let t_run = std::time::Instant::now();
@@ -1923,8 +2040,8 @@ impl Qwen35BatchAdapter {
         //
         // Цена: k запусков вместо одного. Веса всё равно читаются из кеша L2,
         // а спекуляция выигрывает на пропущенных шагах декода, не на батче
-        // проверки. Откат — QWEN36_VERIFY_BATCHED=1.
-        let batched = std::env::var("QWEN36_VERIFY_BATCHED").as_deref() == Ok("1");
+        // проверки. Откат — VERIFY_BATCHED=1.
+        let batched = std::env::var("VERIFY_BATCHED").as_deref() == Ok("1");
         if batched || inputs.len() == 1 {
             let ids = Tensor::from_vec(inputs.to_vec(), (inputs.len(), 1usize), &self.device)?;
             let (logits, hidden) = self
@@ -2020,12 +2137,16 @@ impl Qwen35BatchAdapter {
             (0..mb).map(|j| slot as u32 * mb + j).collect::<Vec<u32>>()
         };
         let slot_u = slot as u32;
-        // Однопроходная проверка (QWEN36_VERIFY_ONEPASS) читает seqlens_q
+        // Однопроходная проверка (VERIFY_ONEPASS) читает seqlens_q
         // как [0, k*ngroups] (строки запроса свёрнуты по GQA-группам);
         // построчный и слитый пути этот буфер не читают, префилльный —
         // читает, но у него verify=false и стейджится обычное t.
         // (Считается до блока с ctx: там paged_ctx занят mut-заёмом.)
-        let q_rows = if verify { t * self.model.attn_kv_groups() } else { t };
+        let q_rows = if verify {
+            t * self.model.attn_kv_groups()
+        } else {
+            t
+        };
         {
             let ctx = self.model.paged_ctx.as_mut().unwrap();
             // rope_pos_t декода здесь не используется (позиции идут своим
@@ -2039,7 +2160,11 @@ impl Qwen35BatchAdapter {
             ctx.set_prefill_seqlens_q(q_rows)
                 .map_err(|e| anyhow!("pgraph {kind} seqlens_q: {e}"))?;
         }
-        let emb_shape = if verify { (t, 1usize, self.model.hidden_size()) } else { (1usize, t, self.model.hidden_size()) };
+        let emb_shape = if verify {
+            (t, 1usize, self.model.hidden_size())
+        } else {
+            (1usize, t, self.model.hidden_size())
+        };
         let fwd = |m: &mut ModelWeights, emb: &Tensor, rope: &Tensor| -> Result<(Tensor, Tensor)> {
             let r = if verify {
                 m.forward_verify_graphed(emb, rope, t, slot_u)
@@ -2075,7 +2200,8 @@ impl Qwen35BatchAdapter {
                     g.rope_pos_t
                         .slice_set(&rope_staging, 0, 0)
                         .map_err(|e| anyhow!("pgraph {kind} rope slice_set: {e}"))?;
-                    g.launch().map_err(|e| anyhow!("pgraph {kind} launch T={t} slot={slot}: {e}"))?;
+                    g.launch()
+                        .map_err(|e| anyhow!("pgraph {kind} launch T={t} slot={slot}: {e}"))?;
                 }
                 // LRU: свежий — в хвост.
                 let g = pool.remove(i);
@@ -2100,7 +2226,10 @@ impl Qwen35BatchAdapter {
                 // htod-кэш: промах параметров при захвате → явная ошибка вместо
                 // pageable memcpy внутри графа.
                 // Эмбеддинги — до guard: буфер больше порога кэша htod.
-                let emb_t = self.model.embed_for_graph(tokens, &self.device)?.reshape(emb_shape)?;
+                let emb_t = self
+                    .model
+                    .embed_for_graph(tokens, &self.device)?
+                    .reshape(emb_shape)?;
                 let _htod_guard = cuda_dev.enable_cuda_graph_htod_cache();
                 let rope_pos_t = Tensor::from_vec(rope_host, t, &self.device)?;
                 // 1) Eager-прогон: это и есть результат (захват ядра не
@@ -2186,7 +2315,9 @@ impl Qwen35BatchAdapter {
                     }
                     // Захват не удался — результат уже посчитан eager-прогоном,
                     // состояние консистентно; графы остаются включёнными.
-                    Err(e) => eprintln!("[pg] {kind} capture failed (результат отдан eager-прогоном): {e}"),
+                    Err(e) => eprintln!(
+                        "[pg] {kind} capture failed (результат отдан eager-прогоном): {e}"
+                    ),
                 }
                 // При захвате операции записываются, а не исполняются, поэтому
                 // буфер графа пуст: настоящие hidden даёт прогревочный проход.
@@ -2316,7 +2447,7 @@ impl Qwen35BatchAdapter {
                     if !self.graph_gate_warned[s as usize] {
                         self.graph_gate_warned[s as usize] = true;
                         eprintln!(
-                            "[graphs] slot {s}: декод уходит на eager — позиция {} против kv_len {cur}, окно пула {window} (QWEN36_GRAPH_WINDOW / served_ctx); дальше по этому запросу молчу",
+                            "[graphs] slot {s}: декод уходит на eager — позиция {} против kv_len {cur}, окно пула {window} (GRAPH_WINDOW / served_ctx); дальше по этому запросу молчу",
                             positions[i]
                         );
                     }
@@ -2339,10 +2470,7 @@ impl Qwen35BatchAdapter {
         };
         let _ = max_blocks;
 
-        let hit = self
-            .decode_graphs
-            .iter()
-            .position(|g| g.b == b);
+        let hit = self.decode_graphs.iter().position(|g| g.b == b);
         let need_capture = match hit {
             Some(_) => {
                 let why = String::new();
@@ -2379,7 +2507,9 @@ impl Qwen35BatchAdapter {
             {
                 let ctx = self.model.paged_ctx.as_mut().unwrap();
                 ctx.stage_inputs(slots, rope_positions, &block_table)
-                    .map_err(|e| anyhow!("graph capture stage_inputs b={b} slots={slots:?}: {e}"))?;
+                    .map_err(|e| {
+                        anyhow!("graph capture stage_inputs b={b} slots={slots:?}: {e}")
+                    })?;
             }
             let (logits, hidden) = self
                 .model
@@ -2448,11 +2578,21 @@ impl Qwen35BatchAdapter {
                     if let Ok(t) = unsafe { cres::event::elapsed(bevs[i], bevs[i + 1]) } {
                         times.push((i, t));
                         let is_delta = self.model.blocks[i].is_deltanet();
-                        if is_delta { dsum += t; dcount += 1; } else { asum += t; acount += 1; }
+                        if is_delta {
+                            dsum += t;
+                            dcount += 1;
+                        } else {
+                            asum += t;
+                            acount += 1;
+                        }
                     }
                 }
                 times.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                let top: Vec<String> = times.iter().take(8).map(|(i, t)| format!("b{i}={t:.2}")).collect();
+                let top: Vec<String> = times
+                    .iter()
+                    .take(8)
+                    .map(|(i, t)| format!("b{i}={t:.2}"))
+                    .collect();
                 eprintln!("[gGPU-blocks] delta_sum={dsum:.1}ms/{dcount} attn_sum={asum:.1}ms/{acount} top: {}", top.join(" "));
             }
             // host mirror kv_len после инкремента
@@ -2483,15 +2623,14 @@ impl Qwen35BatchAdapter {
             let capture_result = (|| -> Result<DecodeGraphState> {
                 use cudarc::driver::{result as cres, sys as csys};
                 if graph_fail_inject() {
-                    return Err(anyhow!("искусственный сбой захвата (QWEN36_GRAPH_FAIL_INJECT)"));
+                    return Err(anyhow!("искусственный сбой захвата (GRAPH_FAIL_INJECT)"));
                 }
                 // ВНИМАНИЕ: память, выделенная ВНУТРИ захвата, принадлежит graph pool —
                 // её адреса валидны только внутри graph launch. Внешний D2H по ним →
                 // illegal address. Поэтому выход копируем во ВНЕШНИЙ (default pool,
                 // выделен ДО захвата) буфер D2D-нодой внутри графа.
                 let logits_out = Tensor::zeros((b, self.vocab), DType::F32, &self.device)?;
-                let hidden_out =
-                    Tensor::zeros(hid_shape.clone(), hid_dtype, &self.device)?;
+                let hidden_out = Tensor::zeros(hid_shape.clone(), hid_dtype, &self.device)?;
                 unsafe {
                     cres::stream::begin_capture(
                         stream.cu_stream(),
@@ -2499,9 +2638,7 @@ impl Qwen35BatchAdapter {
                     )
                 }
                 .map_err(|e| anyhow!("begin_capture: {e}"))?;
-                let forward_result = self
-                    .model
-                    .forward_decode_batch_graphed(&emb_eager, slots);
+                let forward_result = self.model.forward_decode_batch_graphed(&emb_eager, slots);
                 let (logits_t, hidden_t) = match forward_result {
                     Ok(v) => v,
                     Err(e) => {
@@ -2531,11 +2668,12 @@ impl Qwen35BatchAdapter {
                         csys::cuGraphGetNodes(cu_graph, std::ptr::null_mut(), &mut nodes)
                     };
                     eprintln!("[graphs] captured nodes={nodes} res={res:?}");
-                    if std::env::var("QWEN36_GRAPH_DOT").as_deref() == Ok("1") {
-                        let path = std::ffi::CString::new("D:\\Projects\\yttri-build\\decode-graph.dot").unwrap();
-                        let res = unsafe {
-                            csys::cuGraphDebugDotPrint(cu_graph, path.as_ptr(), 1u32)
-                        };
+                    if std::env::var("GRAPH_DOT").as_deref() == Ok("1") {
+                        let path =
+                            std::ffi::CString::new("D:\\Projects\\yttri-build\\decode-graph.dot")
+                                .unwrap();
+                        let res =
+                            unsafe { csys::cuGraphDebugDotPrint(cu_graph, path.as_ptr(), 1u32) };
                         eprintln!("[graphs] dot dump res={res:?}");
                     }
                 }
@@ -2600,7 +2738,9 @@ impl Qwen35BatchAdapter {
             .emb_t
             .slice_set(&emb_staging, 0, 0)
             .map_err(|e| anyhow!("graph replay emb slice_set: {e}"))?;
-        state.launch().map_err(|e| anyhow!("graph launch b={b} slots={slots:?}: {e}"))?;
+        state
+            .launch()
+            .map_err(|e| anyhow!("graph launch b={b} slots={slots:?}: {e}"))?;
         // Диагностика: sync сразу после launch, чтобы async-ошибка графа
         // привязывалась к этому шагу, а не всплывала sticky на следующем.
         if crate::scheduler::trace_on() || self.model.gprof_events.is_some() {
@@ -2637,7 +2777,9 @@ impl Qwen35BatchAdapter {
         let flat = state
             .logits_t
             .to_dtype(DType::F32)
-            .map_err(|e| anyhow!("graph logits to_dtype (первая синхронная точка после launch): {e}"))?
+            .map_err(|e| {
+                anyhow!("graph logits to_dtype (первая синхронная точка после launch): {e}")
+            })?
             .flatten_all()
             .map_err(|e| anyhow!("graph logits flatten: {e}"))?
             .to_vec1()
@@ -2682,6 +2824,31 @@ impl Qwen35BatchAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Смешивание paged- и eager-чанков внутри одного промпта теряет префикс:
+    /// после первого чанка в пуле откат на eager обязан быть ошибкой, а не
+    /// молчаливым `Ok(None)`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn eager_fallback_blocked_once_prompt_is_paged() {
+        assert!(eager_fallback_allowed(PrefillPath::Undecided));
+        assert!(eager_fallback_allowed(PrefillPath::Eager));
+        assert!(!eager_fallback_allowed(PrefillPath::Paged));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn paged_prefill_is_fail_closed_by_default() {
+        assert!(matches!(parse_pgraph_mode(None), PgraphMode::Off));
+        assert!(matches!(parse_pgraph_mode(Some("off")), PgraphMode::Off));
+        assert!(matches!(parse_pgraph_mode(Some("0")), PgraphMode::Off));
+        assert!(matches!(parse_pgraph_mode(Some("on")), PgraphMode::On));
+        assert!(matches!(parse_pgraph_mode(Some("1")), PgraphMode::On));
+        assert!(matches!(
+            parse_pgraph_mode(Some("check")),
+            PgraphMode::Check
+        ));
+    }
 
     #[test]
     fn multimodal_position_plan_slices_fail_closed() {

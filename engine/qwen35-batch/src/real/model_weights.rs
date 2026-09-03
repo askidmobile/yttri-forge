@@ -605,13 +605,13 @@ thread_local! {
 }
 
 /// Макрос для удобного добавления к аккумулятору
-/// QWEN36_PHASE_PROF=1 — синхронизировать устройство на границах фаз
+/// PHASE_PROF=1 — синхронизировать устройство на границах фаз
 /// DeltaNet::forward, чтобы тайминги в GEN_TIMINGS были временем исполнения,
 /// а не постановки в очередь. Без флага печать `[Qwen3.5/forward]` показывает
 /// честной только сумму.
 fn phase_prof_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN36_PHASE_PROF").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("PHASE_PROF").as_deref() == Ok("1"))
 }
 
 macro_rules! acc_us {
@@ -1119,7 +1119,7 @@ impl Module for DenseMlp {
             let prequant = candle_core::quantized::QTensor::prequantize_q8_1(xs)
                 .ok()
                 .flatten();
-            let g2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2") && xs.device().is_cuda();
+            let g2 = std::env::var("GPROF").as_deref() == Ok("2") && xs.device().is_cuda();
             let sync = || {
                 if g2 {
                     if let Ok(c) = xs.device().as_cuda_device() {
@@ -1814,7 +1814,7 @@ impl DeltaNetLayer {
         // (и на асинхронном CUDA) без синхронизации фаза до первого ожидания
         // показывает время постановки в очередь, а фаза с ожиданием вбирает
         // всё, что стояло перед ней (ловушка 28.08, сессия yttri-66).
-        // Синхронизируем только под QWEN36_PHASE_PROF=1 — иначе ломает конвейер.
+        // Синхронизируем только под PHASE_PROF=1 — иначе ломает конвейер.
         let prof = phase_prof_on();
         let tick = || {
             if prof {
@@ -2169,7 +2169,7 @@ impl DeltaNetLayer {
         #[cfg(feature = "cuda")]
         if let Some(ctx) = self.cuda_ctx_batched.as_mut() {
             ctx.params.batch_size = if serial_rows { 1 } else { b as u32 };
-            let gprof2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2");
+            let gprof2 = std::env::var("GPROF").as_deref() == Ok("2");
             let sync = || {
                 if gprof2 {
                     let _ = ctx.dev.cuda_stream().synchronize();
@@ -2421,7 +2421,7 @@ impl DeltaNetLayer {
         #[cfg(target_os = "macos")]
         let alpha_t = dispatch_q4k_matmul(&self.w_alpha, self.w_alpha_opt.as_ref(), x)?;
         #[cfg(not(target_os = "macos"))]
-        let dn_gpf3 = std::env::var("QWEN36_GPROF").as_deref() == Ok("3");
+        let dn_gpf3 = std::env::var("GPROF").as_deref() == Ok("3");
         #[cfg(not(target_os = "macos"))]
         let dn_tp = std::time::Instant::now();
         // yttri-forge stage1 (dual-read): prefill-проекции через F16-сайдкар.
@@ -2512,12 +2512,12 @@ impl DeltaNetLayer {
         if let Some(ctx) = &mut self.cuda_ctx {
             // Fused prefill: 4 launch'а на всю последовательность (рекуррентность
             // циклом внутри delta_rule_prefill). Fallback на token-by-token —
-            // env QWEN36_DISABLE_FUSED_PREFILL=1 (откат при регрессии).
-            let disable_fused = std::env::var("QWEN36_DISABLE_FUSED_PREFILL")
+            // env DISABLE_FUSED_PREFILL=1 (откат при регрессии).
+            let disable_fused = std::env::var("DISABLE_FUSED_PREFILL")
                 .map(|v| v == "1")
                 .unwrap_or(false);
             if !disable_fused {
-                let gprof2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2");
+                let gprof2 = std::env::var("GPROF").as_deref() == Ok("2");
                 let t0 = std::time::Instant::now();
                 if gprof2 {
                     let _ = ctx.dev.cuda_stream().synchronize();
@@ -3203,7 +3203,7 @@ pub(crate) struct GatedAttentionLayer {
     /// single-slot `forward_attn` использует `kv_cache` выше (shared path).
     kv_cache_batched: Vec<Option<BatchedKvCache>>,
     /// Q8-rounded F16 cache dequantizes each new row once, then feeds FA2 directly.
-    /// Default remains compact Q8; opt-in is `QWEN36_KV_CACHE_DTYPE=q8_f16`.
+    /// Default remains compact Q8; opt-in is `KV_CACHE_DTYPE=q8_f16`.
     use_q8_f16_kv_cache: bool,
     /// Per-slot длина заполненного KV-cache (для batched path).
     kv_cache_len_batched: Vec<usize>,
@@ -3216,7 +3216,7 @@ pub(crate) struct GatedAttentionLayer {
     /// shared scratch / f16_prefix (Stage-1 fallback).
     kv_mirror: Vec<Option<KvMirror>>,
 
-    /// Paged KV pool для CUDA-graph decode (опция, env QWEN36_CUDA_GRAPHS=1).
+    /// Paged KV pool для CUDA-graph decode (опция, env CUDA_GRAPHS=1).
     #[cfg(feature = "cuda")]
     paged_pool: Option<crate::real::paged_kv_cuda::PagedKvPool>,
 }
@@ -3300,20 +3300,20 @@ fn audit_ytf16(name: &str, gguf: &QMatMul, sidecar: &QMatMul) {
 /// KV декода: круговой прогон через q8 (квантование и сразу обратно) стоит
 /// точности и ничего не экономит — кэш всё равно хранится в f16. Он остался
 /// ради численного паритета между батчевым кэшем и paged-пулом.
-/// QWEN36_KV_Q8_ROUNDTRIP=1 возвращает старое поведение.
+/// KV_Q8_ROUNDTRIP=1 возвращает старое поведение.
 #[cfg(feature = "cuda")]
 fn kv_exact_f16() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("QWEN36_KV_Q8_ROUNDTRIP").as_deref() != Ok("1"))
+    *V.get_or_init(|| std::env::var("KV_Q8_ROUNDTRIP").as_deref() != Ok("1"))
 }
 
 /// Graph-префилл пишет в paged pool чистый F16 (пул и так F16) — с q8
 /// round-trip логиты расходились с eager на MAE 0.42, без него — бит-в-бит.
-/// QWEN36_PGRAPH_Q8KV=1 возвращает round-trip (точность как у батчевого q8-кэша).
+/// PGRAPH_Q8KV=1 возвращает round-trip (точность как у батчевого q8-кэша).
 #[cfg(feature = "cuda")]
 fn pgraph_f16_kv() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("QWEN36_PGRAPH_Q8KV").as_deref() != Ok("1"))
+    *V.get_or_init(|| std::env::var("PGRAPH_Q8KV").as_deref() != Ok("1"))
 }
 
 impl GatedAttentionLayer {
@@ -3337,7 +3337,7 @@ impl GatedAttentionLayer {
         if m.is_none() {
             // Ёмкость: точная из env (упреждающее выделение при загрузке)
             // либо с запасом до границы 4096. Бюджет списывается элементами.
-            let cap_tok = match std::env::var("QWEN36_KV_MIRROR_TOKENS")
+            let cap_tok = match std::env::var("KV_MIRROR_TOKENS")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
             {
@@ -3698,12 +3698,12 @@ impl GatedAttentionLayer {
         } else {
             // Prefill. CUDA: flash-attn v2 (causal, GQA нативно, F16 входы /
             // F32 аккумулятор внутри FA2 — это НЕ F16-matmul из T-422,
-            // численно близко к F32). Откат: QWEN36_DISABLE_FLASH_PREFILL=1.
+            // численно близко к F32). Откат: DISABLE_FLASH_PREFILL=1.
             // Маска на CPU (Vec<f32> seq×kv на чанк на блок) и F32 matmul
             // уходят — это была основная цена prefill attention.
             #[cfg(feature = "cuda")]
-            if q.device().is_cuda() && std::env::var("QWEN36_DISABLE_FLASH_PREFILL").is_err() {
-                let at_gpf3 = std::env::var("QWEN36_GPROF").as_deref() == Ok("3");
+            if q.device().is_cuda() && std::env::var("DISABLE_FLASH_PREFILL").is_err() {
+                let at_gpf3 = std::env::var("GPROF").as_deref() == Ok("3");
                 let t_fa = std::time::Instant::now();
                 let q_f = q.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
                 let k_f = k.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
@@ -4000,7 +4000,7 @@ impl GatedAttentionLayer {
         let k_rope = self.apply_partial_rotary_emb_devpos(&k_all, &rope_pos)?;
 
         // 4. head-last строки. Пул хранит f16, поэтому круговой q8 здесь только
-        //    терял точность (оставлен под QWEN36_KV_Q8_ROUNDTRIP=1).
+        //    терял точность (оставлен под KV_Q8_ROUNDTRIP=1).
         if crate::scheduler::trace_on() {
             eprintln!("[attn-paged] 4. rows");
             let _ = std::io::stderr().flush();
@@ -4182,7 +4182,7 @@ impl GatedAttentionLayer {
         let k_rope = self.apply_partial_rotary_emb_with(&k_all, &cos_t, &sin_t)?;
 
         // 4. head-last + q8 round-trip: пул F16, но decode держит KV в q8 —
-        //    По умолчанию пишем F16 (бит-в-бит с eager); QWEN36_PGRAPH_Q8KV=1
+        //    По умолчанию пишем F16 (бит-в-бит с eager); PGRAPH_Q8KV=1
         //    возвращает round-trip — точность как у батчевого q8-кэша.
         let k_hl = k_rope.transpose(1, 2)?.contiguous()?; // [B, T, n_kv, hd]
         let v_hl = v_all.transpose(1, 2)?.contiguous()?;
@@ -4242,12 +4242,12 @@ impl GatedAttentionLayer {
         let mut out_onepass: Option<Tensor> = None;
         let verify_fused = per_row_gqa
             && seq_len > 1
-            && std::env::var("QWEN36_VERIFY_FUSED").ok().as_deref() == Some("1");
+            && std::env::var("VERIFY_FUSED").ok().as_deref() == Some("1");
         // Однопроходный путь приоритетнее слитого: при обоих переменных
         // работает ONEPASS (KV читается один раз, а не k раз).
         let verify_onepass = per_row_gqa
             && seq_len > 1
-            && std::env::var("QWEN36_VERIFY_ONEPASS").ok().as_deref() == Some("1");
+            && std::env::var("VERIFY_ONEPASS").ok().as_deref() == Some("1");
         if per_row_gqa && !verify_fused && !verify_onepass {
             // Построчно: строка i — декодный вызов (seqlen_q = 1, маска noop),
             // ключи 0..kv0+i задаются через seqlens_k = kv0+i+1. Строки уже
@@ -4681,7 +4681,7 @@ impl GatedAttentionLayer {
                 const CHUNK: usize = 4096;
                 let row_elems = self.n_kv_head * self.head_dim;
                 if scratch.is_none() {
-                    let cap = std::env::var("QWEN36_KV_SCRATCH_TOKENS")
+                    let cap = std::env::var("KV_SCRATCH_TOKENS")
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(0) // Default 0: отключить избыточный глобальный F16 скретч на 32K токенов (130+ MiB), который выталкивал WDDM за 95%
@@ -4745,7 +4745,7 @@ impl GatedAttentionLayer {
                 #[cfg(feature = "cuda")]
                 {
                     let splitk_ok = kv_len >= 2048
-                        && std::env::var("QWEN36_ENABLE_SPLITK_DECODE").as_deref() == Ok("1");
+                        && std::env::var("ENABLE_SPLITK_DECODE").as_deref() == Ok("1");
                     if splitk_ok {
                         super::flash_decode_cuda::dispatch_flash_decode(
                             device.as_cuda_device()?,
@@ -5529,14 +5529,14 @@ impl HybridBlock {
 
         let layer_out = match &mut self.layer {
             HybridLayerType::DeltaNet(delta) => {
-                if std::env::var("QWEN36_GRAPH_SKIP_DELTA").as_deref() == Ok("1") {
+                if std::env::var("GRAPH_SKIP_DELTA").as_deref() == Ok("1") {
                     normed.clone()
                 } else {
                     delta.forward_decode_batch_rows(&normed, slots, false, Some(&ctx.slots_dev))?
                 }
             }
             HybridLayerType::Attention(attn) => {
-                if std::env::var("QWEN36_GRAPH_SKIP_ATTN").as_deref() == Ok("1") {
+                if std::env::var("GRAPH_SKIP_ATTN").as_deref() == Ok("1") {
                     normed.clone()
                 } else {
                     if crate::scheduler::trace_on() {
@@ -5563,7 +5563,7 @@ impl HybridBlock {
             eprintln!("[fdbp] 5. ffn");
             let _ = std::io::stderr().flush();
         }
-        let ffn_out = if std::env::var("QWEN36_GRAPH_SKIP_FFN").as_deref() == Ok("1") {
+        let ffn_out = if std::env::var("GRAPH_SKIP_FFN").as_deref() == Ok("1") {
             normed
         } else {
             self.ff.forward_decode_batch(&normed)?
@@ -5697,7 +5697,7 @@ pub struct ModelWeights {
     /// Полная интеграция в следующей сессии (MetalStorage offset field).
     #[cfg(target_os = "macos")]
     pub(crate) unified_arena: Option<Arc<candle_metal_kernels::metal::UnifiedScratchArena>>,
-    /// Paged decode контекст для CUDA-графов (env QWEN36_CUDA_GRAPHS=1).
+    /// Paged decode контекст для CUDA-графов (env CUDA_GRAPHS=1).
     #[cfg(feature = "cuda")]
     pub(crate) paged_ctx: Option<crate::real::paged_kv_cuda::PagedModelCtx>,
     /// Признак, что хотя бы один decode уже подготовил paged pools у attention слоёв.
@@ -5706,7 +5706,7 @@ pub struct ModelWeights {
     /// GPU-профайлер graphed decode: 4 CUDA events (start / после emb / после блоков / после head).
     #[cfg(feature = "cuda")]
     pub(crate) gprof_events: Option<[cudarc::driver::sys::CUevent; 4]>,
-    /// Per-block GPU events: [n_blocks+1] событий (QWEN36_GPROF=1).
+    /// Per-block GPU events: [n_blocks+1] событий (GPROF=1).
     #[cfg(feature = "cuda")]
     pub(crate) gprof_block_events: Option<Vec<cudarc::driver::sys::CUevent>>,
 }
@@ -5723,14 +5723,14 @@ impl ModelWeights {
     ) -> Result<Self> {
         let data: &[u8] = &mmap;
         let gpu_only = std::env::var("GPU_ONLY")
-            .or_else(|_| std::env::var("QWEN36_GPU_ONLY"))
+            .or_else(|_| std::env::var("GPU_ONLY"))
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if gpu_only && !device.is_cuda() {
             candle_core::bail!("GPU_ONLY=1 requires CUDA device")
         }
         let max_gpu_layers: usize = std::env::var("GPU_LAYERS")
-            .or_else(|_| std::env::var("QWEN36_GPU_LAYERS"))
+            .or_else(|_| std::env::var("GPU_LAYERS"))
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(usize::MAX);
@@ -6044,7 +6044,7 @@ impl ModelWeights {
         };
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
         let gpu_only = std::env::var("GPU_ONLY")
-            .or_else(|_| std::env::var("QWEN36_GPU_ONLY"))
+            .or_else(|_| std::env::var("GPU_ONLY"))
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
@@ -6193,12 +6193,9 @@ impl ModelWeights {
         // с ModelSpec.context_window и official Best Practices Qwen3.5-4B,
         // покрывает все facultative tasks (mail digest, треды писем, длинные
         // транскрипции до 60 мин, summarization больших документов).
-        // Имя без префикса — основное; YTTRI_/QWEN36_ приняты для старых
-        // конфигов. Умолчание 81920 не поднимаем: оно про VRAM, а не про
-        // модель, и на маленькой карте защищает от неподъёмного пула.
+        // Умолчание 81920 не поднимаем: оно про VRAM, а не про модель, и на
+        // маленькой карте защищает от неподъёмного пула.
         let env_limit = std::env::var("CONTEXT_LIMIT")
-            .or_else(|_| std::env::var("YTTRI_CONTEXT_LIMIT"))
-            .or_else(|_| std::env::var("QWEN36_CONTEXT_LIMIT"))
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(81920);
@@ -6261,7 +6258,7 @@ impl ModelWeights {
                     // равно отключались по своему порогу — худшее из двух.
                     let has_vram_headroom = if let Ok(cuda_dev) = device.as_cuda_device() {
                         let force_graphs =
-                            std::env::var("QWEN36_CUDA_GRAPHS").as_deref() == Ok("1");
+                            std::env::var("CUDA_GRAPHS").as_deref() == Ok("1");
                         // Фактический размер тензора из GGUF-заголовка (флэтовая
                         // планка 1 GiB пропускала ~0.8 GiB эмбеддинг на 27B при
                         // free 2.5 GiB — и модель переставала помещаться в prefill).
@@ -6292,8 +6289,8 @@ impl ModelWeights {
                     // Копия token_embd на GPU больше не нужна графам: их вход —
                     // готовый вектор эмбеддингов, деквант строк идёт на хосте из
                     // mmap (как у llama.cpp). Копия (0.8–1.3 ГБ на 27B) остаётся
-                    // только под QWEN36_EMB_GPU=1 для A/B.
-                    let emb_gpu_requested = std::env::var("QWEN36_EMB_GPU").as_deref() == Ok("1");
+                    // только под EMB_GPU=1 для A/B.
+                    let emb_gpu_requested = std::env::var("EMB_GPU").as_deref() == Ok("1");
                     if emb_gpu_requested && (has_vram_headroom || gpu_only) {
                         Some(QMatMul::from_qtensor(load_heavy("token_embd.weight")?)?)
                     } else {
@@ -6566,8 +6563,8 @@ impl ModelWeights {
         };
 
         // ── Загрузка слоёв ──
-        let requested_moe_backend = std::env::var("QWEN36_MOE_BACKEND").ok();
-        let kv_cache_dtype = std::env::var("QWEN36_KV_CACHE_DTYPE").unwrap_or_else(|_| {
+        let requested_moe_backend = std::env::var("MOE_BACKEND").ok();
+        let kv_cache_dtype = std::env::var("KV_CACHE_DTYPE").unwrap_or_else(|_| {
             if is_moe {
                 "q8".into()
             } else {
@@ -6576,7 +6573,7 @@ impl ModelWeights {
         });
         if !matches!(kv_cache_dtype.as_str(), "q8" | "q8_f16") {
             candle_core::bail!(
-                "QWEN36_KV_CACHE_DTYPE must be q8 or q8_f16, got {kv_cache_dtype:?}"
+                "KV_CACHE_DTYPE must be q8 or q8_f16, got {kv_cache_dtype:?}"
             );
         }
         let use_q8_f16_kv_cache = kv_cache_dtype == "q8_f16";
@@ -6698,9 +6695,9 @@ impl ModelWeights {
             let layer = if is_deltanet {
                 // ── DeltaNet Layer ──
                 // Слитая проекция qkv+z+b+a — опциональна: контейнер .ytf её
-                // несёт, GGUF нет. Отключается QWEN36_NO_FUSED_IN_PROJ=1.
+                // несёт, GGUF нет. Отключается NO_FUSED_IN_PROJ=1.
                 let in_proj_fused =
-                    if std::env::var("QWEN36_NO_FUSED_IN_PROJ").as_deref() == Ok("1") {
+                    if std::env::var("NO_FUSED_IN_PROJ").as_deref() == Ok("1") {
                         None
                     } else {
                         match load_heavy(&format!("{prefix}.attn_in_proj.weight")) {
@@ -7116,7 +7113,7 @@ impl ModelWeights {
             blocks,
             f16_scratch: None,
             kv_mirror_budget: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
-                std::env::var("QWEN36_KV_MIRROR_MIB")
+                std::env::var("KV_MIRROR_MIB")
                     .ok()
                     .and_then(|v| v.parse::<i64>().ok())
                     .unwrap_or(0) // Отключаем F16 mirror по умолчанию (было 640): экономия 96 MiB на attention слое при 24K контексте
@@ -7709,7 +7706,7 @@ impl ModelWeights {
     /// [1, n_kv, cap, hd]; после seed_slot_batched decode идёт через
     /// batched q8-кэш, а F16-оригинал (~480 MiB @24K на 35B-A3B) оставался
     /// в VRAM навсегда → 97%+ занятости → WDDM shared → коллапс декода.
-    /// Откат: QWEN36_KEEP_SINGLE_KV=1.
+    /// Откат: KEEP_SINGLE_KV=1.
     pub fn clear_single_slot_kv(&mut self) {
         for block in &mut self.blocks {
             if let HybridLayerType::Attention(a) = &mut block.layer {
@@ -8251,11 +8248,11 @@ impl ModelWeights {
                         layer_in = layer_in.to_device(&block_dev)?;
                     }
                     layer_in = block.forward_prefill(&layer_in, index_pos)?;
-                    // Бисекция недетерминизма: QWEN36_BISECT_HIDDEN=N — после
+                    // Бисекция недетерминизма: BISECT_HIDDEN=N — после
                     // слоя N печатать FNV-1a checksum hidden (первые 4 строки
                     // каждого чанка). Два прогона в одном процессе покажут
                     // слой, с которого расходятся биты.
-                    if let Ok(stop) = std::env::var("QWEN36_BISECT_HIDDEN") {
+                    if let Ok(stop) = std::env::var("BISECT_HIDDEN") {
                         if stop.as_str() == "all"
                             || stop.parse::<usize>().map(|v| v == bi).unwrap_or(false)
                         {
@@ -8304,7 +8301,7 @@ impl ModelWeights {
                     layer_in = layer_in.to_device(&block_dev)?;
                 }
                 layer_in = block.forward(&layer_in, index_pos)?;
-                if let Ok(stop) = std::env::var("QWEN36_BISECT_HIDDEN") {
+                if let Ok(stop) = std::env::var("BISECT_HIDDEN") {
                     if stop.as_str() == "all"
                         || stop.parse::<usize>().map(|v| v == bi).unwrap_or(false)
                     {
@@ -8680,11 +8677,11 @@ impl ModelWeights {
             }
         }
 
-        // QWEN36_GRAPH_BLOCKS=N — perf-бисект: ограничить число блоков в графе
+        // GRAPH_BLOCKS=N — perf-бисект: ограничить число блоков в графе
         // (логиты мусорные, но replay-time валидно).
         static BLOCK_LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         let limit = *BLOCK_LIMIT.get_or_init(|| {
-            std::env::var("QWEN36_GRAPH_BLOCKS")
+            std::env::var("GRAPH_BLOCKS")
                 .ok()
                 .and_then(|v| v.parse().ok())
         });
@@ -8780,7 +8777,7 @@ impl ModelWeights {
         // а молча уводит память в системную, и префил замедляется втрое — то
         // есть переполнение выглядит как «модель не отвечает», а не как ошибка.
         // Отсюда правило: лучше окно поменьше, но гарантированно в видеопамяти.
-        let reserved_headroom = std::env::var("QWEN36_VRAM_HEADROOM_MIB")
+        let reserved_headroom = std::env::var("VRAM_HEADROOM_MIB")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(1024)
@@ -8823,8 +8820,8 @@ impl ModelWeights {
         let ps = crate::real::paged_kv_cuda::PAGE_SIZE;
         let auto_window_aligned = (auto_window / ps) * ps;
 
-        // Ручной оверрайд через QWEN36_GRAPH_WINDOW остаётся доступен только при явном указании
-        let window = std::env::var("QWEN36_GRAPH_WINDOW")
+        // Ручной оверрайд через GRAPH_WINDOW остаётся доступен только при явном указании
+        let window = std::env::var("GRAPH_WINDOW")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(auto_window_aligned);
@@ -8857,7 +8854,7 @@ impl ModelWeights {
             }
         }
         self.paged_ready = true;
-        if std::env::var("QWEN36_GPROF").as_deref() == Ok("1") {
+        if std::env::var("GPROF").as_deref() == Ok("1") {
             use cudarc::driver::sys as csys;
             let mut evs = [std::ptr::null_mut(); 4];
             let mut ok = true;
@@ -8905,14 +8902,14 @@ impl ModelWeights {
     /// yttri-forge stage1: подключить F16-сайдкар тяжёлых проекций.
     ///
     /// `gguf_path` — путь GGUF (для sha256 против манифеста сайдкара); sidecar
-    /// ожидается в `<stem>.ytf16`. Откат: QWEN36_DISABLE_YTF16=1.
+    /// ожидается в `<stem>.ytf16`. Откат: DISABLE_YTF16=1.
     /// Dual-read (R-DUAL): F16 ТОЛЬКО в forward_prefill; decode читает GGUF-квант.
     pub fn attach_ytf16(
         &mut self,
         gguf_path: &std::path::Path,
         device: &candle_core::Device,
     ) -> Result<()> {
-        if std::env::var("QWEN36_DISABLE_YTF16").as_deref() == Ok("1") {
+        if std::env::var("DISABLE_YTF16").as_deref() == Ok("1") {
             return Ok(());
         }
         // ВАЖНО: with_extension ломает имена с точками (Qwen3.5-...→Qwen3.ytf16)
@@ -8987,11 +8984,11 @@ impl ModelWeights {
                     }
                 };
             }
-            // Формат сайдкара в VRAM: Q8_0 (умолчание) или F16 (QWEN36_YTF16_F16=1).
+            // Формат сайдкара в VRAM: Q8_0 (умолчание) или F16 (YTF16_F16=1).
             // Q8_0 вдвое компактнее F16, ошибка весов 0.58% против 3.9% у Q4_K
             // из GGUF, и матмуль идёт через готовое fused MMQ-ядро, а не через
             // F16-GEMM с F32-аккумуляцией (на Ampere он вдвое ниже пика).
-            if std::env::var("QWEN36_YTF16_F16").as_deref() == Ok("1") {
+            if std::env::var("YTF16_F16").as_deref() == Ok("1") {
                 return match t.to_device(device) {
                     Ok(t) => Some(QMatMul::TensorF16(t)),
                     Err(e) => {
@@ -9015,12 +9012,12 @@ impl ModelWeights {
             }
         }
 
-        // QWEN36_YTF16_MASK=all|attn|delta|none — бисект групп проекций.
-        let mask = std::env::var("QWEN36_YTF16_MASK").unwrap_or_else(|_| "all".into());
+        // YTF16_MASK=all|attn|delta|none — бисект групп проекций.
+        let mask = std::env::var("YTF16_MASK").unwrap_or_else(|_| "all".into());
         let want_attn = mask == "all" || mask == "attn";
         let want_delta = mask == "all" || mask == "delta";
-        // QWEN36_YTF16_AUDIT=1 — сверка сайдкара с деквантованным GGUF по blk.0.
-        let audit = std::env::var("QWEN36_YTF16_AUDIT").as_deref() == Ok("1");
+        // YTF16_AUDIT=1 — сверка сайдкара с деквантованным GGUF по blk.0.
+        let audit = std::env::var("YTF16_AUDIT").as_deref() == Ok("1");
 
         let mut mapped = 0usize;
         let mut total_bytes = 0u64;
@@ -9100,7 +9097,7 @@ impl ModelWeights {
                     Ok(rel) if rel > 0.25 => eprintln!(
                         "[ytf] WARN сайдкар расходится с GGUF: относительная ошибка {:.0}% \
                          (ожидается ~ошибка квантования). Веса блока 0 не совпадают — \
-                         проверьте конвертер; QWEN36_DISABLE_YTF16=1 отключает сайдкар.",
+                         проверьте конвертер; DISABLE_YTF16=1 отключает сайдкар.",
                         rel * 100.0
                     ),
                     Ok(rel) => eprintln!(
@@ -9182,7 +9179,7 @@ impl ModelWeights {
                     // миграции не бывает — KV пишется в пул сразу.
                     candle_core::bail!(
                         "int8-пул несовместим с миграцией из batched-кэша: \
-                         нужен graph-префилл (QWEN36_PGRAPH=on, это умолчание)"
+                         нужен graph-префилл (PGRAPH=on, это умолчание)"
                     );
                 }
                 let n_kv = a.n_kv_head;
@@ -9423,7 +9420,7 @@ impl ModelWeights {
 
     /// Эмбеддинги для входа графа: [1, n, H] F32 на `device`. Деквант строк на
     /// хосте из mmap + один H2D (как get_rows у llama.cpp); при копии на GPU
-    /// (QWEN36_EMB_GPU=1, A/B) — lookup на устройстве. Вызывать ВНЕ захвата.
+    /// (EMB_GPU=1, A/B) — lookup на устройстве. Вызывать ВНЕ захвата.
     #[cfg(feature = "cuda")]
     pub fn embed_for_graph(&self, tokens: &[u32], device: &Device) -> Result<Tensor> {
         let n = tokens.len();

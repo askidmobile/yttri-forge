@@ -4,12 +4,12 @@
 //! Запуск:
 //!   qwen35_mtp_gate TEXT.gguf MTP.gguf [--prompt N] [--new M] [--slots S] [--control]
 //!
-//! Ширина драфта берётся из env `QWEN36_MTP_WIDTH` (в scheduler она кэшируется
+//! Ширина драфта берётся из env `MTP_WIDTH` (в scheduler она кэшируется
 //! в OnceLock — одно значение на процесс, поэтому матрица прогоняется по
-//! процессу на сочетание). Адаптивная ширина гасится `QWEN36_MTP_ADAPTIVE=0`,
+//! процессу на сочетание). Адаптивная ширина гасится `MTP_ADAPTIVE=0`,
 //! иначе она меняет ширину под собой и замер перестаёт отвечать на вопрос.
 //!
-//! Промпт нужной длины набирается из корпуса `QWEN36_GATE_CORPUS`
+//! Промпт нужной длины набирается из корпуса `GATE_CORPUS`
 //! (по умолчанию /root/ppl-corpus.txt), зациклённого до N токенов, — важно,
 //! чтобы логиты имели реалистичные зазоры между кандидатами.
 //!
@@ -140,7 +140,7 @@ fn first_diff(a: &[u32], b: &[u32]) -> Option<usize> {
 /// Промпт длиной ровно `n` токенов из зациклённого корпуса.
 fn build_prompt(model: &Path, n: usize, offset: usize) -> Result<Vec<u32>> {
     let tok = tokenizer::load_from_gguf_path(model)?;
-    let path = std::env::var("QWEN36_GATE_CORPUS")
+    let path = std::env::var("GATE_CORPUS")
         .unwrap_or_else(|_| "/root/ppl-corpus.txt".to_string());
     let text = std::fs::read_to_string(&path).with_context(|| format!("корпус {path}"))?;
     let ids = tok
@@ -214,11 +214,11 @@ fn main() -> Result<()> {
         }
     }
 
-    let width: usize = std::env::var("QWEN36_MTP_WIDTH")
+    let width: usize = std::env::var("MTP_WIDTH")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    let adaptive = std::env::var("QWEN36_MTP_ADAPTIVE").map(|v| v != "0").unwrap_or(true);
+    let adaptive = std::env::var("MTP_ADAPTIVE").map(|v| v != "0").unwrap_or(true);
 
     let prompt = build_prompt(Path::new(&text), prompt_len, offset)?;
     let device = Device::new_cuda(0)?;

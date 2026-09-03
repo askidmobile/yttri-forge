@@ -407,9 +407,9 @@ pub fn dispatch_delta_rule_batched(
         // Split-вариант (умолчание): столбец состояния делится между четырьмя
         // потоками — 512 потоков на блок вместо 128. Прежняя сетка давала
         // 32 блока × 128 = 4096 потоков на карту, чего мало для насыщения
-        // памяти. QWEN36_DELTA_DECODE=single возвращает однопоточный столбец.
+        // памяти. DELTA_DECODE=single возвращает однопоточный столбец.
         const ROWGRP: u32 = 4;
-        let single = std::env::var("QWEN36_DELTA_DECODE").as_deref() == Ok("single");
+        let single = std::env::var("DELTA_DECODE").as_deref() == Ok("single");
         let split_ok = !single && hvd % ROWGRP == 0 && (hvd / ROWGRP) <= 32;
         let (name, cfg) = if split_ok {
             (

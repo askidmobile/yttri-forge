@@ -1,5 +1,5 @@
 //! Diagnostic split-K flash-decoding dispatch (CUDA). Long-KV parity still
-//! differs from FA2, so production requires explicit `QWEN36_ENABLE_SPLITK_DECODE=1`.
+//! differs from FA2, so production requires explicit `ENABLE_SPLITK_DECODE=1`.
 
 use candle_core::{CudaDevice, Result, Storage, Tensor};
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};

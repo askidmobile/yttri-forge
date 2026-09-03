@@ -63,7 +63,7 @@ fn top2_gap(v: &[f32]) -> f32 {
 
 fn build_prompt(model: &Path, n: usize, offset: usize) -> Result<Vec<u32>> {
     let tok = tokenizer::load_from_gguf_path(model)?;
-    let path = std::env::var("QWEN36_GATE_CORPUS")
+    let path = std::env::var("GATE_CORPUS")
         .unwrap_or_else(|_| "/root/ppl-corpus.txt".to_string());
     let text = std::fs::read_to_string(&path).with_context(|| format!("корпус {path}"))?;
     let ids = tok

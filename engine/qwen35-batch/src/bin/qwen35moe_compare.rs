@@ -5,22 +5,22 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 // Дефолты исторического 128-шагового гейта. Для длинных прогонов (8K)
-// переопределяются через QWEN36_GATE_STEPS / QWEN36_GATE_FULL_STEPS /
-// QWEN36_GATE_MAX_ARGMAX_DIVERGENCES — числовые пороги (cosine/nRMSE/max_abs/
+// переопределяются через GATE_STEPS / GATE_FULL_STEPS /
+// GATE_MAX_ARGMAX_DIVERGENCES — числовые пороги (cosine/nRMSE/max_abs/
 // margin) при этом НЕ трогаются: они per-step и от длины не зависят.
 const GATE_STEPS_DEFAULT: usize = 128;
 const GATE_FULL_STEPS_DEFAULT: [usize; 5] = [16, 45, 50, 92, 111];
 const GATE_MAX_ARGMAX_DIVERGENCES_DEFAULT: usize = 5;
 
 fn gate_steps() -> usize {
-    std::env::var("QWEN36_GATE_STEPS")
+    std::env::var("GATE_STEPS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(GATE_STEPS_DEFAULT)
 }
 
 fn gate_full_steps() -> Vec<usize> {
-    match std::env::var("QWEN36_GATE_FULL_STEPS") {
+    match std::env::var("GATE_FULL_STEPS") {
         Ok(v) => v
             .split(',')
             .filter_map(|s| s.trim().parse().ok())
@@ -30,7 +30,7 @@ fn gate_full_steps() -> Vec<usize> {
 }
 
 fn gate_max_argmax_divergences() -> usize {
-    std::env::var("QWEN36_GATE_MAX_ARGMAX_DIVERGENCES")
+    std::env::var("GATE_MAX_ARGMAX_DIVERGENCES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| {

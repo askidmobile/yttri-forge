@@ -363,7 +363,7 @@ pub fn dispatch_delta_rule_prefill(
     let gated = unsafe { dev.alloc::<f32>(t_len * value_dim)? };
 
     let p = *params;
-    let gprof2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2");
+    let gprof2 = std::env::var("GPROF").as_deref() == Ok("2");
     let sync_t = |dev: &CudaDevice| -> std::time::Instant {
         if gprof2 {
             let _ = dev.cuda_stream().synchronize();
@@ -422,8 +422,8 @@ pub fn dispatch_delta_rule_prefill(
 
     // P3: рекуррентный delta rule, state в регистрах (warp-per-column).
     // grid = (n_v, hd/4), block = (32, 4).
-    // FR-002: tile-size sweep через QWEN36_DELTA_WARPS (1/2/4/8, default 4).
-    let delta_warps: u32 = std::env::var("QWEN36_DELTA_WARPS")
+    // FR-002: tile-size sweep через DELTA_WARPS (1/2/4/8, default 4).
+    let delta_warps: u32 = std::env::var("DELTA_WARPS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&v: &u32| matches!(v, 1 | 2 | 4 | 8))
@@ -435,11 +435,11 @@ pub fn dispatch_delta_rule_prefill(
         // двух warp-редукций на каждый токен. Замер на стенде bench_delta:
         // 1.977 против 2.287 мс у v1 при T=512, расхождение с последовательным
         // эталоном 5.5e-7 (у v1 — 4.5e-7). Требует hkd=128 и hvd, кратного 64;
-        // иначе и по QWEN36_DELTA_KERNEL=v1 — старое ядро.
+        // иначе и по DELTA_KERNEL=v1 — старое ядро.
         const CHUNK_C: usize = 8;
         const CHUNK_COLS: usize = 64;
         const CHUNK_ROWGRP: usize = 4;
-        let want_v1 = std::env::var("QWEN36_DELTA_KERNEL").as_deref() == Ok("v1");
+        let want_v1 = std::env::var("DELTA_KERNEL").as_deref() == Ok("v1");
         let chunked_ok = hkd == 128 && hvd % CHUNK_COLS == 0 && !want_v1;
         if chunked_ok {
             let smem = (2 * CHUNK_C * hkd
@@ -473,13 +473,13 @@ pub fn dispatch_delta_rule_prefill(
             b.arg(&t_u32);
             unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
         } else {
-        // v2 (QWEN36_DELTA_V2=1) — блок 1024 потока на 32 колонки, k/q через
+        // v2 (DELTA_V2=1) — блок 1024 потока на 32 колонки, k/q через
         // shared. Замер 2026-08-25: МЕДЛЕННЕЕ v1 (1.23 против 1.14 с на
         // 1910 токенах). Гипотеза про «2 ГБ лишних чтений» неверна: 128 варпов
         // читают одни и те же 512 байт k/q, это попадания в L2 (~2 ТБ/с), а не
         // DRAM. Зато v2 платит 1024 блочными синхронизациями на токен и
         // занятостью (блок 1024 потока). Дефолт — v1.
-        let v2 = std::env::var("QWEN36_DELTA_V2").as_deref() == Ok("1");
+        let v2 = std::env::var("DELTA_V2").as_deref() == Ok("1");
         let (name, cfg) = if !v2 {
             (
                 "delta_rule_prefill",

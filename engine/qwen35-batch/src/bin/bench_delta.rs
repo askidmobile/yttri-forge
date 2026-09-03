@@ -415,7 +415,7 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
     let out_c = dev.alloc_zeros::<f32>(t * n_v * hvd)?;
     let mut state_c = dev.clone_htod(&s0)?;
     {
-        let winner = std::env::var("QWEN36_CHUNK_KERNEL").unwrap_or_else(|_| "delta_rule_prefill_chunked_c8".into());
+        let winner = std::env::var("CHUNK_KERNEL").unwrap_or_else(|_| "delta_rule_prefill_chunked_c8".into());
         let (c, cols) = chunked_shape(&winner).unwrap();
         const ROWGRP: usize = 4;
         let smem = (2 * c * hkd + 3 * c * cols + 2 * c * c + 2 * c + cols * ROWGRP + 2 * c * cols * ROWGRP) * 4;
