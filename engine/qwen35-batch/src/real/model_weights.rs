@@ -1121,6 +1121,10 @@ impl Module for DenseMlp {
                 .flatten();
             let g2 = std::env::var("GPROF").as_deref() == Ok("2") && xs.device().is_cuda();
             let sync = || {
+                // Гейт по feature, а не по target_os: блок снаружи закрыт
+                // `not(target_os = "macos")`, и без CUDA на Windows/Linux
+                // `cuda_stream` просто не существует.
+                #[cfg(feature = "cuda")]
                 if g2 {
                     if let Ok(c) = xs.device().as_cuda_device() {
                         let _ = c.cuda_stream().synchronize();
@@ -2443,6 +2447,9 @@ impl DeltaNetLayer {
         };
         #[cfg(not(target_os = "macos"))]
         let dn_proj_ms = {
+            // Гейт по feature, а не по target_os: без CUDA на Windows/Linux
+            // `cuda_stream` не существует, и сборка падала именно здесь.
+            #[cfg(feature = "cuda")]
             if dn_gpf3 {
                 if let Device::Cuda(c) = &device {
                     let _ = c.cuda_stream().synchronize();

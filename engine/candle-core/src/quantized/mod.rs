@@ -1282,6 +1282,14 @@ pub enum Q8_1Activation {
 }
 
 impl QTensor {
+    /// Без CUDA предквантованных активаций не бывает — вызывающие уже умеют
+    /// `None` и идут обычным путём. Заглушка нужна, чтобы им не пришлось
+    /// обрастать `#[cfg]`: сборка без CUDA ломалась именно на них.
+    #[cfg(not(feature = "cuda"))]
+    pub fn prequantize_q8_1(_x: &Tensor) -> Result<Option<Q8_1Activation>> {
+        Ok(None)
+    }
+
     #[cfg(feature = "cuda")]
     pub fn prequantize_q8_1(x: &Tensor) -> Result<Option<Q8_1Activation>> {
         let (b_size, k) = match x.dims() {
