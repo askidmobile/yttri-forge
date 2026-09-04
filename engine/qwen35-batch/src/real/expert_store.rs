@@ -611,40 +611,56 @@ impl MoeRuntime {
 
 // ─── Решение auto (FR-021) ────────────────────────────────────────────────────
 
-/// Эксперты уходят в RAM, только если ствол+эксперты не помещаются в свободную
-/// VRAM, но ствол помещается. Возвращает (ram, reason).
-pub fn resolve_auto(free_vram: u64, trunk_bytes: u64, experts_bytes: u64) -> (bool, String) {
+/// Эксперты уходят в RAM, только если ствол+эксперты+пул KV на объявленный
+/// CTX+запас не помещаются в свободную VRAM (FR-021: «та же формула пула, что
+/// у движка»), а ствол+пул помещаются. Возвращает (ram, reason).
+pub fn resolve_auto_needs(
+    free_vram: u64,
+    need_resident: u64,
+    need_ram: u64,
+    experts_bytes: u64,
+) -> (bool, String) {
     let mib = |b: u64| b as f64 / 1024.0 / 1024.0;
-    let need_with = trunk_bytes.saturating_add(experts_bytes);
-    if free_vram >= need_with {
+    if free_vram >= need_resident {
         (
             false,
             format!(
-                "ствол+эксперты {:.0} МиБ <= свободных {:.0} МиБ — резидентно",
-                mib(need_with),
+                "всё (ствол+эксперты+пул+запас = {:.0} МиБ) помещается в свободных {:.0} МиБ — резидентно",
+                mib(need_resident),
                 mib(free_vram)
             ),
         )
-    } else if free_vram >= trunk_bytes {
+    } else if free_vram >= need_ram {
         (
             true,
             format!(
-                "ствол+эксперты {:.0} МиБ > свободных {:.0} МиБ, ствол {:.0} МиБ <= свободных — эксперты в RAM",
-                mib(need_with),
+                "нужно {:.0} МиБ резидентно (эксперты {:.0}), свободных {:.0} МиБ — при выгрузке нужно {:.0} МиБ, помещается — эксперты в RAM",
+                mib(need_resident),
+                mib(experts_bytes),
                 mib(free_vram),
-                mib(trunk_bytes)
+                mib(need_ram)
             ),
         )
     } else {
         (
             true,
             format!(
-                "свободных {:.0} МиБ < ствола {:.0} МиБ — тесно и без экспертов",
+                "свободных {:.0} МиБ мало даже при выгрузке ({:.0} МиБ) — тесно, эксперты всё равно в RAM",
                 mib(free_vram),
-                mib(trunk_bytes)
+                mib(need_ram)
             ),
         )
     }
+}
+
+/// Упрощённое решение (без пула KV) — для тестов.
+pub fn resolve_auto(free_vram: u64, trunk_bytes: u64, experts_bytes: u64) -> (bool, String) {
+    resolve_auto_needs(
+        free_vram,
+        trunk_bytes.saturating_add(experts_bytes),
+        trunk_bytes,
+        experts_bytes,
+    )
 }
 
 /// Проверка свободной физической памяти под pinned-хранилище (§6): свободной
@@ -706,6 +722,16 @@ fn windows_available_phys() -> Option<u64> {
 #[cfg(not(windows))]
 fn windows_available_phys() -> Option<u64> {
     None
+}
+
+// ─── Сводка для наблюдаемости (FR-020) ───────────────────────────────────────
+
+/// Снимок состояния выгрузки для /v1/models (сервер маппит в MoeInfo).
+#[derive(Debug, Clone, Copy)]
+pub struct MoeRuntimeSummary {
+    pub experts_ram: bool,
+    pub pinned_bytes: u64,
+    pub staging_bytes: u64,
 }
 
 // ─── Клон-безопасный хэндл хранилища слоя для `Qwen35MoeBlock` ────────────────

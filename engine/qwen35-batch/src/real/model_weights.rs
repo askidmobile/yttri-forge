@@ -6427,13 +6427,40 @@ impl ModelWeights {
                         .context()
                         .mem_get_info()
                         .map_err(|e| candle_core::Error::Msg(format!("cuMemGetInfo: {e}")))?;
-                    let (ram, why) = super::expert_store::resolve_auto(
-                        free_vram as u64, trunk_bytes, experts_bytes,
+                    // FR-021: потребность = веса + пул KV на объявленный CTX
+                    // (та же формула, что у движка) + стейджинг + запас.
+                    let attn_layers = (0..block_count)
+                        .filter(|i| (i + 1) % full_attention_interval == 0)
+                        .count() as u64;
+                    let b = decode_capacity() as u64;
+                    let ctx_req = std::env::var("CTX")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .unwrap_or(131072)
+                        .min(model_context_length as u64)
+                        .max(2048);
+                    let q8 = crate::real::paged_kv_cuda::kv_pool_is_q8();
+                    let kv_bytes_per_head = if q8 { attn_head_dim + 2 } else { attn_head_dim * 2 };
+                    let pool_bytes = attn_layers * b * 2 * attn_head_count_kv as u64 * kv_bytes_per_head as u64 * ctx_req;
+                    let staging_bytes = if n_moe_layers > 0 { experts_bytes / n_moe_layers as u64 } else { 0 };
+                    let headroom = std::env::var("VRAM_HEADROOM_MIB")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .unwrap_or(1024)
+                        * 1024
+                        * 1024;
+                    let need_resident = trunk_bytes + experts_bytes + pool_bytes + headroom;
+                    let need_ram = trunk_bytes + pool_bytes + staging_bytes + headroom;
+                    let (ram, why) = super::expert_store::resolve_auto_needs(
+                        free_vram as u64, need_resident, need_ram, experts_bytes,
                     );
                     if ram {
                         super::expert_store::check_host_ram_free(experts_bytes, prefix_cache_mib)?;
                     }
-                    (ram, format!("auto ({why})"))
+                    (ram, format!("auto: need_resident={:.0} need_ram={:.0} free={:.0} МиБ — {why}",
+                        need_resident as f64 / 1024.0 / 1024.0,
+                        need_ram as f64 / 1024.0 / 1024.0,
+                        free_vram as f64 / 1024.0 / 1024.0))
                 }
             };
             log::info!(

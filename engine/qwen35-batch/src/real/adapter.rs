@@ -467,6 +467,18 @@ pub struct Qwen35BatchAdapter {
 
 impl Qwen35BatchAdapter {
     /// Загрузить модель из GGUF (zero-copy на Metal) и подготовить N слотов.
+    /// FR-020: состояние выгрузки экспертов для /v1/models (capabilities.moe).
+    /// None — модель без MoE или эксперты резидентны (vram).
+    #[cfg(feature = "cuda")]
+    pub fn moe_summary(&self) -> Option<super::expert_store::MoeRuntimeSummary> {
+        let rt = self.model.moe_runtime()?;
+        Some(super::expert_store::MoeRuntimeSummary {
+            experts_ram: true,
+            pinned_bytes: rt.pinned_bytes,
+            staging_bytes: rt.staging_bytes() as u64,
+        })
+    }
+
     pub fn load(gguf_path: &Path, device: Device, num_slots: usize) -> Result<Self> {
         if num_slots > DECODE_BATCH_CAPACITY as usize {
             return Err(anyhow!(
@@ -580,6 +592,7 @@ impl Qwen35BatchAdapter {
                 .prepare_expert_offload(&device)
                 .map_err(|e| anyhow!("prepare expert offload: {e}"))?;
         }
+
 
         // F16-GEMM сайдкара по умолчанию аккумулирует в F32 (как в pytorch).
         // На Ampere это вдвое медленнее F16-аккумуляции. F16_FAST_ACC=1
