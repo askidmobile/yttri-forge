@@ -16,6 +16,7 @@
 
 use candle_core::quantized::GgmlDType;
 use candle_core::Result;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 // ─── Размещение (FR-009) ──────────────────────────────────────────────────────
@@ -259,6 +260,20 @@ impl ExpertMatrix {
         &self.table
     }
 
+    pub fn table_mut(&mut self) -> &mut cudarc::driver::CudaSlice<u64> {
+        &mut self.table
+    }
+
+    /// Pinned-байты эксперта (источник подъёма в кэш).
+    pub fn expert_host_slice(&self, expert: usize) -> &[u8] {
+        self.host.expert_slice(expert, self.expert_bytes)
+    }
+
+    /// Табличная запись host-размещения эксперта (zero-copy адрес).
+    pub fn host_entry(&self, expert: usize) -> u64 {
+        self.host.dev_ptr() + expert as u64 * self.expert_bytes as u64
+    }
+
     /// Таблица по умолчанию: все эксперты читаются из pinned host-памяти
     /// (zero-copy декод, FR-004).
     fn fill_host_table(&mut self, dev: &candle_core::CudaDevice) -> Result<()> {
@@ -366,6 +381,8 @@ pub struct TraceBuf {
     /// Токенов на слой: B слотов × (ширина драфта + 1).
     cap_tokens: usize,
     k: usize,
+    /// Токенов последнего скопированного шага (для before_step).
+    last_tokens: std::sync::atomic::AtomicUsize,
 }
 
 impl TraceBuf {
@@ -389,6 +406,7 @@ impl TraceBuf {
             n_layers,
             cap_tokens,
             k,
+            last_tokens: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -425,7 +443,22 @@ impl TraceBuf {
         dev.cuda_stream()
             .memcpy_dtod(src, &mut dst)
             .map_err(candle_core::Error::wrap)?;
+        self.last_tokens.store(tokens, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Сколько токенов в следе после последнего шага.
+    pub fn last_copied(&self) -> usize {
+        self.last_tokens.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// FR-004/PD-004: D2H всего следа (одна синхронизация на before_step —
+    /// она и так есть: сэмплер читает логиты после каждого шага).
+    pub fn read_all(&self, dev: &candle_core::CudaDevice) -> Result<Vec<u32>> {
+        let ids = self.ids.lock().expect("trace mutex");
+        dev.cuda_stream()
+            .clone_dtoh(&*ids)
+            .map_err(candle_core::Error::wrap)
     }
 }
 
@@ -543,6 +576,8 @@ pub struct MoeRuntime {
     pub trace: TraceBuf,
     /// Стейджинг выделяется после paged-пула (PD-010: пул → стейджинг → кэш).
     staging: std::sync::OnceLock<Staging>,
+    /// Кэш горячих экспертов (фаза 4) — выделяется после стейджинга.
+    pub cache: std::sync::OnceLock<CacheSystem>,
     /// Суммарный размер pinned-хранилища (для лога/наблюдаемости).
     pub pinned_bytes: u64,
 }
@@ -561,6 +596,7 @@ impl MoeRuntime {
             k,
             trace,
             staging: std::sync::OnceLock::new(),
+            cache: std::sync::OnceLock::new(),
             pinned_bytes,
         }))
     }
@@ -724,7 +760,548 @@ fn windows_available_phys() -> Option<u64> {
     None
 }
 
-// ─── Сводка для наблюдаемости (FR-020) ───────────────────────────────────────
+
+// ─── Кэш горячих экспертов (FR-006, фаза 4) ──────────────────────────────────
+
+/// VRAM-кэш одного MoE-слоя (D-009): равное число слотов на слой, слот =
+/// gate+up+down одного эксперта. Пулы пишет только боковой поток.
+pub struct SlotPool {
+    pub gate: std::sync::Mutex<cudarc::driver::CudaSlice<u8>>,
+    pub up: std::sync::Mutex<cudarc::driver::CudaSlice<u8>>,
+    pub down: std::sync::Mutex<cudarc::driver::CudaSlice<u8>>,
+    /// Слотов в этом пуле.
+    pub capacity: usize,
+    /// [gate, up, down] — байты одного эксперта этого слоя.
+    pub expert_bytes: [usize; 3],
+}
+
+impl SlotPool {
+    pub fn total_bytes(&self) -> usize {
+        self.gate.lock().expect("pool gate").len()
+            + self.up.lock().expect("pool up").len()
+            + self.down.lock().expect("pool down").len()
+    }
+}
+
+/// Статистика кэша: атомарные счётчики (читаются из /v1/models без блокировок).
+#[derive(Default)]
+pub struct CacheStats {
+    pub hits: std::sync::atomic::AtomicU64,
+    pub misses: std::sync::atomic::AtomicU64,
+    /// Окно лога: попадания/промахи с последнего вывода.
+    pub hits_window: std::sync::atomic::AtomicU64,
+    pub misses_window: std::sync::atomic::AtomicU64,
+    /// Подъёмы префила за окно (МиБ).
+    pub prefill_promoted_mib_window: std::sync::atomic::AtomicU64,
+}
+
+/// Директория кэша слоя: резидентные эксперты (expert → slot) + LRU-порядок.
+/// Поля открыты для host-тестов; мутирует только dispatch-поток.
+pub struct CacheDirectory {
+    pub resident: std::collections::HashMap<usize, usize>,
+    /// LRU: голова = самый старый, хвост = последний использованный.
+    pub lru: std::collections::VecDeque<usize>,
+    /// Свободные слоты.
+    pub free: std::collections::VecDeque<usize>,
+}
+
+impl CacheDirectory {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            resident: std::collections::HashMap::new(),
+            lru: std::collections::VecDeque::new(),
+            free: (0..capacity).collect(),
+        }
+    }
+
+    pub fn is_resident(&self, expert: usize) -> bool {
+        self.resident.contains_key(&expert)
+    }
+
+    /// LRU-touch: эксперт использован — в хвост.
+    pub fn touch(&mut self, expert: usize) {
+        if let Some(pos) = self.lru.iter().position(|&e| e == expert) {
+            self.lru.remove(pos);
+            self.lru.push_back(expert);
+        }
+    }
+
+    /// Классификация выбора шага: (hits, misses в порядке первого выбора).
+    pub fn classify(&mut self, ids: &[u32], n_experts: usize) -> (u64, Vec<usize>) {
+        let mut hits = 0u64;
+        let mut misses: Vec<usize> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for &id in ids {
+            let e = id as usize;
+            if e >= n_experts || !seen.insert(e) {
+                continue;
+            }
+            if self.resident.contains_key(&e) {
+                hits += 1;
+                self.touch(e);
+            } else {
+                misses.push(e);
+            }
+        }
+        (hits, misses)
+    }
+
+    /// Жертва LRU: голова очереди (не переиспользуется никак — sync после
+    /// шага гарантирует, что (1) уже исполнен на основном потоке).
+    pub fn lru_victim(&mut self) -> Option<(usize, usize)> {
+        let victim = *self.lru.front()?;
+        let slot = *self.resident.get(&victim)?;
+        Some((victim, slot))
+    }
+
+    /// Свободный слот без вытеснения (префил, FR-005): None — кэш полон
+    /// или эксперт уже резидентен.
+    pub fn free_slot_no_evict(&mut self, expert: usize) -> Option<usize> {
+        if self.resident.contains_key(&expert) {
+            self.touch(expert);
+            return None;
+        }
+        let slot = self.free.pop_front()?;
+        self.resident.insert(expert, slot);
+        self.lru.push_back(expert);
+        Some(slot)
+    }
+}
+
+/// Целевая доля резидентных экспертов (§6/D-014): f ≥ 1 − B×10 мс / трафик.
+/// `bandwidth_gb_s` — полоса zero-copy из ворот 0; `miss_traffic_mib` — байты
+/// экспертов на токен (все слои).
+pub fn f_target(bandwidth_gb_s: f64, miss_traffic_mib: f64) -> f64 {
+    if miss_traffic_mib <= 0.0 {
+        return 0.0;
+    }
+    let budget_mib = bandwidth_gb_s * 10.0 / 1.048576; // 10 мс × ГБ/с → МиБ
+    (1.0 - budget_mib / miss_traffic_mib).clamp(0.0, 1.0)
+}
+
+/// Кэш-система модели: пулы по слоям, директории, боковой поток, статистика.
+/// Живёт в MoeRuntime.cache (OnceLock); мутирует только dispatch-поток.
+pub struct CacheSystem {
+    pub pools: Vec<SlotPool>,
+    pub dirs: Vec<std::sync::Mutex<CacheDirectory>>,
+    /// Боковой поток подъёмов (FR-006) — тот же контекст.
+    pub side: Arc<cudarc::driver::CudaStream>,
+    /// Потолок подъёмов за шаг (EXPERT_PROMOTE_PER_STEP, default 64).
+    pub promote_per_step: usize,
+    /// Слотов на слой (одинаково, D-009).
+    pub capacity: usize,
+    /// Фактический бюджет (МиБ).
+    pub cache_mib: usize,
+    pub experts: usize,
+    pub k: usize,
+    pub layers: usize,
+    pub stats: CacheStats,
+    pub steps_since_log: std::sync::atomic::AtomicUsize,
+    /// Подъёмы прошлого шага: (layer, expert, slot) — таблицы (3) пишутся
+    /// на основном потоке следующего before_step.
+    pub pending: std::sync::Mutex<Vec<(usize, usize, usize)>>,
+}
+
+impl CacheSystem {
+    const LOG_EVERY: usize = 200;
+
+    /// FR-006: before_step декода. D2H следа прошлого шага → hits/misses →
+    /// до EXPERT_PROMOTE_PER_STEP подъёмов. Порядок:
+    /// (1) таблица «жертва → host» — основной поток (медленно и надёжно);
+    /// (2) копия в слот — боковой поток, перекрывается со следующим графом;
+    /// (3) таблица «новый → слот» — основной поток СЛЕДУЮЩЕГО before_step
+    /// (после side.synchronize: копия давно завершена). Пока (3) не случился,
+    /// ядра читают промах zero-copy из pinned — байты те же. Всё на основном
+    /// потоке для таблиц ⇒ нет cross-stream зависимостей внутри захвата.
+    pub fn before_step(
+        &self,
+        dev: &candle_core::CudaDevice,
+        stores: &[SharedLayerStore],
+        trace: &TraceBuf,
+    ) -> Result<()> {
+        // (3) прошлого шага: копии завершены (side sync ниже), фиксируем
+        // таблицы «новый эксперт → слот» на основном потоке.
+        self.side.synchronize().map_err(candle_core::Error::wrap)?;
+        let pending: Vec<(usize, usize, usize)> = {
+            let mut p = self.pending.lock().expect("pending lock");
+            std::mem::take(&mut *p)
+        };
+        let main = main_of(dev);
+        for (layer, expert, slot) in &pending {
+            let Some(store) = stores.get(*layer) else { continue };
+            let pool = &self.pools[*layer];
+            let mut st = store.lock().expect("expert store");
+            // БАЗОВЫЕ указатели пулов (не sub-view!) + смещение slot×bytes.
+            let mut slot_g = pool.gate.lock().expect("pool gate");
+            let mut slot_u = pool.up.lock().expect("pool up");
+            let mut slot_d = pool.down.lock().expect("pool down");
+            let (g_base, rec_g) = DevicePtr::device_ptr(&*slot_g, &main);
+            let (u_base, rec_u) = DevicePtr::device_ptr(&*slot_u, &main);
+            let (d_base, rec_d) = DevicePtr::device_ptr(&*slot_d, &main);
+            let g_entry = g_base + *slot as u64 * st.gate.expert_bytes as u64;
+            let u_entry = u_base + *slot as u64 * st.up.expert_bytes as u64;
+            let d_entry = d_base + *slot as u64 * st.down.expert_bytes as u64;
+            {
+                let t = st.gate.table_mut();
+                dev.memcpy_htod(&[g_entry], &mut t.slice_mut(*expert..*expert + 1))?;
+            }
+            {
+                let t = st.up.table_mut();
+                dev.memcpy_htod(&[u_entry], &mut t.slice_mut(*expert..*expert + 1))?;
+            }
+            {
+                let t = st.down.table_mut();
+                dev.memcpy_htod(&[d_entry], &mut t.slice_mut(*expert..*expert + 1))?;
+            }
+            drop(rec_d);
+            drop(rec_u);
+            drop(rec_g);
+        }
+
+        let tokens = trace.last_copied();
+        if tokens == 0 {
+            return Ok(());
+        }
+        let ids = trace.read_all(dev)?;
+        let k = trace.k;
+        let main = dev.cuda_stream();
+        let mut promoted = 0usize;
+        let mut new_pending: Vec<(usize, usize, usize)> = Vec::new();
+
+        for layer in 0..self.layers {
+            let Some(store) = stores.get(layer) else { continue };
+            let start = layer * tokens * k;
+            if start + tokens * k > ids.len() {
+                break;
+            }
+            let ids_l = &ids[start..start + tokens * k];
+            let pool = &self.pools[layer];
+            let mut dir = self.dirs[layer].lock().expect("cache dir");
+            let (hits, misses) = dir.classify(ids_l, self.experts);
+            self.stats.hits.fetch_add(hits, Ordering::Relaxed);
+            self.stats.hits_window.fetch_add(hits, Ordering::Relaxed);
+            self.stats
+                .misses
+                .fetch_add(misses.len() as u64, Ordering::Relaxed);
+            self.stats
+                .misses_window
+                .fetch_add(misses.len() as u64, Ordering::Relaxed);
+
+            for &e in &misses {
+                if promoted >= self.promote_per_step {
+                    break;
+                }
+                let Some((victim, slot)) = dir.lru_victim() else { break };
+                // Директория: жертва уходит, новый резидентен (слот тот же).
+                // Таблица пока указывает жертву на host — байты те же.
+                dir.resident.remove(&victim);
+                if let Some(pos) = dir.lru.iter().position(|&x| x == victim) {
+                    dir.lru.remove(pos);
+                }
+                dir.resident.insert(e, slot);
+                dir.lru.push_back(e);
+                let mut st = store.lock().expect("expert store");
+                let gate_bytes = st.gate.expert_bytes;
+                let up_bytes = st.up.expert_bytes;
+                let down_bytes = st.down.expert_bytes;
+
+                // (1) main: таблицы жертвы → host.
+                {
+                    let entry = st.gate.host_entry(victim);
+                    let mut t = st.gate.table_mut();
+                    dev.memcpy_htod(&[entry], &mut t.slice_mut(victim..victim + 1))?;
+                }
+                {
+                    let entry = st.up.host_entry(victim);
+                    let mut t = st.up.table_mut();
+                    dev.memcpy_htod(&[entry], &mut t.slice_mut(victim..victim + 1))?;
+                }
+                {
+                    let entry = st.down.host_entry(victim);
+                    let mut t = st.down.table_mut();
+                    dev.memcpy_htod(&[entry], &mut t.slice_mut(victim..victim + 1))?;
+                }
+                drop(st);
+                // (2) боковой поток: копия в слот (перекрывается со следующим
+                // графом). Записи пула — только здесь.
+                let side = &self.side;
+                {
+                    let mut slot_g = pool.gate.lock().expect("pool gate");
+                    let st2 = store.lock().expect("expert store");
+                    side.memcpy_htod(
+                        st2.gate.expert_host_slice(e),
+                        &mut slot_g.slice_mut(slot * gate_bytes..(slot + 1) * gate_bytes),
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+                }
+                {
+                    let mut slot_u = pool.up.lock().expect("pool up");
+                    let st2 = store.lock().expect("expert store");
+                    side.memcpy_htod(
+                        st2.up.expert_host_slice(e),
+                        &mut slot_u.slice_mut(slot * up_bytes..(slot + 1) * up_bytes),
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+                }
+                {
+                    let mut slot_d = pool.down.lock().expect("pool down");
+                    let st2 = store.lock().expect("expert store");
+                    side.memcpy_htod(
+                        st2.down.expert_host_slice(e),
+                        &mut slot_d.slice_mut(slot * down_bytes..(slot + 1) * down_bytes),
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+                }
+                new_pending.push((layer, e, slot));
+                promoted += 1;
+            }
+        }
+        if !new_pending.is_empty() {
+            self.pending.lock().expect("pending lock").extend(new_pending);
+        }
+
+        // Лог-окно.
+        let steps = self.steps_since_log.fetch_add(1, Ordering::Relaxed) + 1;
+        if steps >= Self::LOG_EVERY {
+            self.steps_since_log.store(0, Ordering::Relaxed);
+            let hw = self.stats.hits_window.swap(0, Ordering::Relaxed);
+            let mw = self.stats.misses_window.swap(0, Ordering::Relaxed);
+            let pf = self
+                .stats
+                .prefill_promoted_mib_window
+                .swap(0, Ordering::Relaxed);
+            let total = hw + mw;
+            let rate = if total > 0 { hw as f64 / total as f64 * 100.0 } else { 0.0 };
+            eprintln!(
+                "[moe] decode hit {rate:.1}% (последние {} шагов), префил поднял {pf} МиБ (окно)",
+                Self::LOG_EVERY
+            );
+        }
+        Ok(())
+    }
+
+    /// FR-005 (фаза 4): префил-подготовка слоя с кэшем. Union экспертов
+    /// чанка по убыванию частоты → свободные слоты (без вытеснения, FR-005),
+    /// переполнение → стейджинг; полная перезапись таблиц слоя (2 КиБ на
+    /// матрицу): resident → слот, staging → стейджинг, прочие → host.
+    /// Возвращает список staging-экспертов — их таблицы сбрасываются на host
+    /// после ядер слоя (prefill_release_staging), кэш-записи сохраняются.
+    pub fn prefill_prepare_layer(
+        &self,
+        dev: &candle_core::CudaDevice,
+        store: &SharedLayerStore,
+        layer: usize,
+        staging: &Staging,
+        ids: &[u32],
+    ) -> Result<Vec<usize>> {
+        use cudarc::driver::DevicePtr;
+        let main = dev.cuda_stream();
+        let pool = &self.pools[layer];
+        let mut st = store.lock().expect("expert store");
+        let gate_bytes = st.gate.expert_bytes;
+        let up_bytes = st.up.expert_bytes;
+        let down_bytes = st.down.expert_bytes;
+        let n_experts = st.gate.n_experts;
+
+        // Классификация + назначение слотов (директория обновляется здесь).
+        let mut counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for &id in ids {
+            let e = id as usize;
+            if e < n_experts {
+                *counts.entry(e).or_default() += 1;
+            }
+        }
+        let mut sorted: Vec<usize> = counts.keys().copied().collect();
+        sorted.sort_by(|a, b| counts[b].cmp(&counts[a]));
+        {
+            let mut dir = self.dirs[layer].lock().expect("cache dir");
+            let mut slot_assign: Vec<(usize, usize)> = Vec::new();
+            let mut to_staging: Vec<usize> = Vec::new();
+            for &e in &sorted {
+                if let Some(slot) = dir.free_slot_no_evict(e) {
+                    slot_assign.push((e, slot));
+                } else {
+                    to_staging.push(e);
+                }
+            }
+            // Статистика окна: объём подъёмов в слоты.
+            let mib = (slot_assign.len() as u64
+                * (gate_bytes + up_bytes + down_bytes) as u64)
+                / 1024
+                / 1024;
+            self.stats
+                .prefill_promoted_mib_window
+                .fetch_add(mib, Ordering::Relaxed);
+
+            // Копии в слоты + staging (main stream, до ядер слоя).
+            let (mut pg, mut pu, mut pd) = (
+                pool.gate.lock().expect("pool gate"),
+                pool.up.lock().expect("pool up"),
+                pool.down.lock().expect("pool down"),
+            );
+            let (mut sg, mut su, mut sd) = (
+                staging.gate.lock().expect("staging gate"),
+                staging.up.lock().expect("staging up"),
+                staging.down.lock().expect("staging down"),
+            );
+            for &(e, slot) in &slot_assign {
+                main
+                    .memcpy_htod(
+                        st.gate.expert_host_slice(e),
+                        &mut pg.slice_mut(slot * gate_bytes..(slot + 1) * gate_bytes),
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+                main
+                    .memcpy_htod(
+                        st.up.expert_host_slice(e),
+                        &mut pu.slice_mut(slot * up_bytes..(slot + 1) * up_bytes),
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+                main
+                    .memcpy_htod(
+                        st.down.expert_host_slice(e),
+                        &mut pd.slice_mut(slot * down_bytes..(slot + 1) * down_bytes),
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+            }
+            for &e in &to_staging {
+                main.memcpy_htod(st.gate.expert_host_slice(e), &mut sg.slice_mut(0..gate_bytes)).map_err(candle_core::Error::wrap)?;
+                main.memcpy_htod(st.up.expert_host_slice(e), &mut su.slice_mut(0..up_bytes)).map_err(candle_core::Error::wrap)?;
+                main.memcpy_htod(st.down.expert_host_slice(e), &mut sd.slice_mut(0..down_bytes)).map_err(candle_core::Error::wrap)?;
+            }
+            drop(sg);
+            drop(su);
+            drop(sd);
+            drop(pg);
+            drop(pu);
+            drop(pd);
+
+            // Полная перезапись таблиц: слоты/стейджинг/host.
+            let pg_ptr = {
+                let g = pool.gate.lock().expect("pool gate");
+                let (ptr, rec) = DevicePtr::device_ptr(&*g, &main);
+                drop(rec);
+                ptr
+            };
+            let pu_ptr = {
+                let u = pool.up.lock().expect("pool up");
+                let (ptr, rec) = DevicePtr::device_ptr(&*u, &main);
+                drop(rec);
+                ptr
+            };
+            let pd_ptr = {
+                let d = pool.down.lock().expect("pool down");
+                let (ptr, rec) = DevicePtr::device_ptr(&*d, &main);
+                drop(rec);
+                ptr
+            };
+            let sg_ptr = {
+                let sg = staging.gate.lock().expect("staging gate");
+                let (ptr, rec) = DevicePtr::device_ptr(&*sg, &main);
+                drop(rec);
+                ptr
+            };
+            let su_ptr = {
+                let su = staging.up.lock().expect("staging up");
+                let (ptr, rec) = DevicePtr::device_ptr(&*su, &main);
+                drop(rec);
+                ptr
+            };
+            let sd_ptr = {
+                let sd = staging.down.lock().expect("staging down");
+                let (ptr, rec) = DevicePtr::device_ptr(&*sd, &main);
+                drop(rec);
+                ptr
+            };
+            let cache_map: std::collections::HashMap<usize, usize> =
+                slot_assign.iter().copied().collect();
+            let host_base = st.gate.host_entry(0); // host-адреса плотные: base + e*bytes
+            let host_stride = if n_experts > 0 { st.gate.host_entry(1) - host_base } else { 0 };
+            let build = |pool_ptr: u64, staging_ptr: u64, bytes: u64| -> Vec<u64> {
+                (0..n_experts)
+                    .map(|e| {
+                        if let Some(&slot) = cache_map.get(&e) {
+                            pool_ptr + slot as u64 * bytes
+                        } else if to_staging.contains(&e) {
+                            staging_ptr // общий буфер: все staging-эксперты слоя на 0
+                        } else {
+                            host_base + e as u64 * host_stride
+                        }
+                    })
+                    .collect()
+            };
+            let tg = build(pg_ptr, sg_ptr, gate_bytes as u64);
+            dev.memcpy_htod(&tg, st.gate.table_mut())?;
+            let tu = build(pu_ptr, su_ptr, up_bytes as u64);
+            dev.memcpy_htod(&tu, st.up.table_mut())?;
+            let td = build(pd_ptr, sd_ptr, down_bytes as u64);
+            dev.memcpy_htod(&td, st.down.table_mut())?;
+            Ok(to_staging)
+        }
+    }
+
+    /// После ядер слоя: staging-эксперты возвращаются на host (их общий
+    /// staging-буфер перезапишет следующий слой); кэш-записи сохраняются.
+    pub fn prefill_release_staging(
+        &self,
+        dev: &candle_core::CudaDevice,
+        store: &SharedLayerStore,
+        staging_experts: &[usize],
+    ) -> Result<()> {
+        let mut st = store.lock().expect("expert store");
+        for &e in staging_experts {
+            let g = st.gate.host_entry(e);
+            {
+                let mut tg = st.gate.table_mut();
+                dev.memcpy_htod(&[g], &mut tg.slice_mut(e..e + 1))?;
+            }
+            let u = st.up.host_entry(e);
+            {
+                let mut tu = st.up.table_mut();
+                dev.memcpy_htod(&[u], &mut tu.slice_mut(e..e + 1))?;
+            }
+            let d = st.down.host_entry(e);
+            {
+                let mut td = st.down.table_mut();
+                dev.memcpy_htod(&[d], &mut td.slice_mut(e..e + 1))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Доля попаданий за всё время (FR-020).    /// Доля попаданий за всё время (FR-020).
+    pub fn hit_rate(&self) -> f32 {
+        let h = self.stats.hits.load(Ordering::Relaxed);
+        let m = self.stats.misses.load(Ordering::Relaxed);
+        let total = h + m;
+        if total == 0 {
+            0.0
+        } else {
+            h as f32 / total as f32
+        }
+    }
+}
+
+/// Arc основного потока устройства (для трейтов с приёмником &Arc).
+fn main_of(dev: &candle_core::CudaDevice) -> Arc<cudarc::driver::CudaStream> {
+    dev.cuda_stream()
+}
+
+/// Запись табличного входа на заданном потоке (приёмник — Arc).
+fn write_entry_on(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    table: &mut cudarc::driver::CudaSlice<u64>,
+    expert: usize,
+    entry: u64,
+) -> Result<()> {
+    stream
+        .memcpy_htod(&[entry], &mut table.slice_mut(expert..expert + 1))
+        .map_err(candle_core::Error::wrap)
+}
+
+use cudarc::driver::DevicePtr;
+
+/// ─── Сводка для наблюдаемости (FR-020) ───────────────────────────────────────
 
 /// Снимок состояния выгрузки для /v1/models (сервер маппит в MoeInfo).
 #[derive(Debug, Clone, Copy)]
@@ -732,6 +1309,10 @@ pub struct MoeRuntimeSummary {
     pub experts_ram: bool,
     pub pinned_bytes: u64,
     pub staging_bytes: u64,
+    /// Кэш горячих экспертов (фаза 4): МиБ, слотов/слой, доля попаданий.
+    pub cache_mib: usize,
+    pub cache_slots: usize,
+    pub hit_rate: f32,
 }
 
 // ─── Клон-безопасный хэндл хранилища слоя для `Qwen35MoeBlock` ────────────────

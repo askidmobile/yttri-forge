@@ -529,36 +529,61 @@ impl Qwen35MoeBlock {
                             .to_string(),
                     )
                 })?;
-                let mut store = store.lock().expect("expert layer store");
                 // FR-005: один D2H ids на слой на чанк.
                 let ids_host = ids_t
                     .to_device(&Device::Cpu)?
                     .flatten_all()?
                     .to_vec1::<u32>()?;
-                store.prefill_prepare_layer(cuda_dev, staging, &ids_host)?;
-                let (g_shape, d_shape) = store.shapes();
+                // Фаза 4: кэш (свободные слоты → стейджинг); таблицы
+                // полностью перезаписываются подготовкой.
+                let staging_experts = match runtime.cache.get() {
+                    (Some(cache), false) => {
+                        cache.prefill_prepare_layer(
+                            cuda_dev,
+                            store,
+                            self.layer_idx,
+                            staging,
+                            &ids_host,
+                        )?
+                    }
+                    None => {
+                        let mut store = store.lock().expect("expert layer store");
+                        store.prefill_prepare_layer(cuda_dev, staging, &ids_host)?;
+                        Vec::new()
+                    }
+                };
+                let mut st = store.lock().expect("expert layer store");
+                let (g_shape, d_shape) = st.shapes();
                 let (gate, up) = indexed_moe_forward_dual_table(
                     cuda_dev,
-                    store.gate.dtype,
+                    st.gate.dtype,
                     g_shape,
-                    store.gate.table(),
-                    store.up.table(),
+                    st.gate.table(),
+                    st.up.table(),
                     &x3,
                     &ids_t,
                 )?;
                 let act = gate.silu()?.mul(&up)?.contiguous()?;
                 let down = indexed_moe_forward_table(
                     cuda_dev,
-                    store.down.dtype,
+                    st.down.dtype,
                     d_shape,
-                    store.down.table(),
+                    st.down.table(),
                     &act,
                     &ids_t,
                 )?;
-                // Таблицы слоя возвращаются на host до следующих шагов —
-                // memcpy в том же stream, упорядочено после ядер.
-                store.prefill_release_layer(cuda_dev)?;
-                drop(store);
+                // После ядер слоя: staging-эксперты → host (буфер стейджинга
+                // перезапишет следующий слой); кэш-записи сохраняются.
+                drop(st);
+                match runtime.cache.get() {
+                    Some(cache) => {
+                        cache.prefill_release_staging(cuda_dev, &store, &staging_experts)?;
+                    }
+                    None => {
+                        let mut st = store.lock().expect("expert layer store");
+                        st.prefill_release_layer(cuda_dev)?;
+                    }
+                }
                 add_shared(weighted_sum(down, &w_t)?, xs)
             }
             (ExpertWeights::Packed(packed), _) => {

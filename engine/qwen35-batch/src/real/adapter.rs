@@ -472,10 +472,18 @@ impl Qwen35BatchAdapter {
     #[cfg(feature = "cuda")]
     pub fn moe_summary(&self) -> Option<super::expert_store::MoeRuntimeSummary> {
         let rt = self.model.moe_runtime()?;
+        let (cache_mib, cache_slots, hit_rate) = rt
+            .cache
+            .get()
+            .map(|c| (c.cache_mib, c.capacity, c.hit_rate()))
+            .unwrap_or((0, 0, 0.0));
         Some(super::expert_store::MoeRuntimeSummary {
             experts_ram: true,
             pinned_bytes: rt.pinned_bytes,
             staging_bytes: rt.staging_bytes() as u64,
+            cache_mib,
+            cache_slots,
+            hit_rate,
         })
     }
 
@@ -1502,6 +1510,12 @@ impl BatchModel for Qwen35BatchAdapter {
         let ids = Tensor::from_vec(tokens.clone(), (b, 1usize), &self.device)
             .map_err(|e| anyhow!("decode ids from_vec b={b}: {e}"))?;
 
+        // FR-006/PD-004: кэш горячих экспертов — D2H следа прошлого шага,
+        // LRU, подъёмы промахов на боковом потоке (перед графом шага).
+        #[cfg(feature = "cuda")]
+        self.model
+            .before_moe_step(&self.device)
+            .map_err(|e| anyhow!("moe before_step: {e}"))?;
         // CUDA-graph decode: один cuGraphLaunch на весь forward. None → eager.
         #[cfg(feature = "cuda")]
         {

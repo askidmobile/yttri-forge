@@ -415,6 +415,13 @@ impl CudaDevice {
     pub fn cublas_handle(&self) -> Arc<cudarc::cublas::CudaBlas> {
         self.blas.clone()
     }
+
+    /// Дополнительный поток ТОГО ЖЕ контекста (боковые подъёмы экспертов
+    /// MoE, план 2026-09-04-moe-expert-offload, FR-006): копии перекрываются
+    /// с графом декода, не задерживая его.
+    pub fn new_side_stream(&self) -> Result<Arc<cudarc::driver::CudaStream>> {
+        self.context.new_stream().w()
+    }
 }
 
 impl CudaDevice {

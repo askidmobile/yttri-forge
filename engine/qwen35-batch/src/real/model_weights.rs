@@ -5810,6 +5810,22 @@ impl ModelWeights {
         self.moe_runtime.is_some()
     }
 
+    /// FR-006/PD-004: before_step декода — D2H следа, LRU, подъёмы промахов.
+    #[cfg(feature = "cuda")]
+    pub fn before_moe_step(&self, device: &Device) -> Result<()> {
+        let Some(rt) = &self.moe_runtime else {
+            return Ok(());
+        };
+        let Some(cache) = rt.cache.get() else {
+            return Ok(());
+        };
+        let Device::Cuda(c) = device else {
+            return Ok(());
+        };
+        let stores = self.moe_stores();
+        cache.before_step(c, &stores, &rt.trace)
+    }
+
     /// PD-010: пул KV сразу при загрузке, затем стейджинг (пул → стейджинг →
     /// кэш фазы 4). Вызывается адаптером после загрузки при ram-размещении.
     #[cfg(feature = "cuda")]
@@ -5832,6 +5848,133 @@ impl ModelWeights {
             let _ = crate::real::paged_kv_cuda::kv_pool_is_q8(); // прогрев флага
             let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
             runtime.alloc_staging(c, max)?;
+            // ── Фаза 4: кэш горячих экспертов (FR-006/D-008) ──
+            // Бюджет: свободная VRAM после весов и пула − headroom − резерв
+            // графов; EXPERT_CACHE_MIB переопределяет (превышение — ошибка).
+            let stores = self.moe_stores();
+            let n_layers = stores.len();
+            let (n_experts, expert_bytes) = {
+                let st = stores[0].lock().expect("expert store");
+                let bytes = [
+                    st.gate.expert_bytes,
+                    st.up.expert_bytes,
+                    st.down.expert_bytes,
+                ];
+                (st.gate.n_experts, bytes)
+            };
+            // Байты кэш-слота на слой (gate+up+down) и на «слот по всем слоям».
+            let mut per_slot_total = 0u64;
+            for store in &stores {
+                let st = store.lock().expect("expert store");
+                per_slot_total += (st.gate.expert_bytes + st.up.expert_bytes + st.down.expert_bytes) as u64;
+            }
+            let topk = runtime.k as u64;
+            let experts_bytes_per_token_mib =
+                per_slot_total * topk as u64 / 1024 / 1024;
+            let (free_vram, _total) = c
+                .cuda_stream()
+                .context()
+                .mem_get_info()
+                .map_err(|e| candle_core::Error::Msg(format!("cuMemGetInfo: {e}")))?;
+            let headroom = std::env::var("VRAM_HEADROOM_MIB")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1024)
+                * 1024
+                * 1024;
+            let graph_reserve = 512u64 * 1024 * 1024;
+            let headroom = headroom as u64;
+            let available = (free_vram as u64).saturating_sub(headroom + graph_reserve);
+            let requested = std::env::var("EXPERT_CACHE_MIB")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .map(|mib| mib as u64 * 1024 * 1024);
+            let cache_bytes = match requested {
+                Some(req) if req > available => {
+                    candle_core::bail!(
+                        "EXPERT_CACHE_MIB={} > доступных {:.0} МиБ (free {:.0} − headroom − резерв графов) — fail-closed (FR-006)",
+                        req / 1024 / 1024,
+                        available as f64 / 1024.0 / 1024.0,
+                        free_vram as f64 / 1024.0 / 1024.0
+                    );
+                }
+                Some(req) => req,
+                None => available,
+            };
+            // Слотов на слой поровну (D-009): capacity = бюджет / Σ(3×слой),
+            // кламп к числу экспертов (cache > 256 экспертов бессмыслен).
+            let capacity = if per_slot_total > 0 {
+                ((cache_bytes / per_slot_total) as usize).min(n_experts)
+            } else {
+                0
+            };
+            let promote_per_step = std::env::var("EXPERT_PROMOTE_PER_STEP")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(64);
+            // f и целевое f (§6/D-014): WARN при f ниже целевого.
+            let f = if n_experts > 0 {
+                capacity as f64 / n_experts as f64
+            } else {
+                0.0
+            };
+            let f_target = super::expert_store::f_target(
+                10.6,
+                experts_bytes_per_token_mib as f64,
+            );
+            if f < f_target {
+                log::warn!(
+                    "[moe] cache f={f:.2} < target {f_target:.2} (B=10.6 ГБ/с, трафик {experts_bytes_per_token_mib} МиБ/ток) — декод может просесть, кэш прогреется LRU"
+                );
+            }
+            let mut pools = Vec::new();
+            let mut dirs = Vec::new();
+            for store in &stores {
+                let st = store.lock().expect("expert store");
+                let bytes = [
+                    st.gate.expert_bytes,
+                    st.up.expert_bytes,
+                    st.down.expert_bytes,
+                ];
+                let alloc = |n: usize, name: &str| -> Result<cudarc::driver::CudaSlice<u8>> {
+                    unsafe { c.alloc::<u8>(n) }.map_err(|e| {
+                        candle_core::Error::Msg(format!(
+                            "кэш экспертов {name}: не хватило {n} байт VRAM: {e} (fail-closed, FR-006)"
+                        ))
+                    })
+                };
+                pools.push(super::expert_store::SlotPool {
+                    gate: std::sync::Mutex::new(alloc(bytes[0] * capacity, "gate")?),
+                    up: std::sync::Mutex::new(alloc(bytes[1] * capacity, "up")?),
+                    down: std::sync::Mutex::new(alloc(bytes[2] * capacity, "down")?),
+                    capacity,
+                    expert_bytes: bytes,
+                });
+                dirs.push(std::sync::Mutex::new(
+                    super::expert_store::CacheDirectory::new(capacity),
+                ));
+            }
+            // DIAG: боковой поток = main (изоляция захвата локализуется)
+            let side = c.cuda_stream();
+            let cache_system = super::expert_store::CacheSystem {
+                pools,
+                dirs,
+                side,
+                promote_per_step,
+                capacity,
+                cache_mib: (cache_bytes / 1024 / 1024) as usize,
+                experts: n_experts,
+                k: runtime.k,
+                layers: n_layers,
+                stats: Default::default(),
+                steps_since_log: std::sync::atomic::AtomicUsize::new(0),
+                pending: std::sync::Mutex::new(Vec::new()),
+            };
+            log::info!(
+                "[moe] cache: {} МиБ → {capacity} слотов/слой (f={f:.2}, target {f_target:.2}), promote ≤ {promote_per_step}/шаг",
+                cache_system.cache_mib,
+            );
+            let _ = runtime.cache.set(cache_system);
         }
         Ok(())
     }
