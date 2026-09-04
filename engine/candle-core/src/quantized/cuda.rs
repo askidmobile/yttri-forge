@@ -38,6 +38,15 @@ fn force_mmq() -> bool {
     *ON.get_or_init(|| std::env::var_os("FORCE_MMQ").is_some())
 }
 
+/// FORCE_DMMV=1: все квантованные matmul идут эталонным путём «деквант +
+/// cuBLAS», минуя наши ядра MMVQ и MMQ. Медленно, но это референс для
+/// бисекции расхождений с llama.cpp: если дефект на нём исчезает, виноваты
+/// ядра, а не модель.
+fn force_dmmv_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FORCE_DMMV").is_some())
+}
+
 pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
@@ -45,7 +54,7 @@ pub fn set_force_dmmv(f: bool) {
 /// Текущий режим матвека. Нужен вызывающим, которые временно переключают
 /// путь и обязаны вернуть прежний, а не жёстко выключить.
 pub fn force_dmmv() -> bool {
-    FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
+    FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || force_dmmv_env()
 }
 
 // Per-device Q8_1 scratch cache: 2 слота на размер, чтобы избежать self-deadlock
@@ -1466,7 +1475,7 @@ impl QCudaStorage {
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
         // Optimized MMVQ and MMQ paths (support most paths: BF16/F16/F32, batch 1-8, all quant types, reuses per-device workspace).
-        if !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+        if !force_dmmv() {
             if let Some(result) = super::fast_mmvq::try_fwd(self, self_shape, storage, layout)? {
                 return Ok(result);
             }
@@ -1495,7 +1504,7 @@ impl QCudaStorage {
                 );
             }
         }
-        let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+        let max_bm = if force_dmmv() {
             // 0, не 1: vec-ветка под FORCE_DMMV уходит в
             // dequantize_mul_mat_vec_via_cublas, который деквантует ВЕСЬ вес в
             // f32 без тайлинга — голова 27B [248320x5120] это 5.09 GB и OOM на
