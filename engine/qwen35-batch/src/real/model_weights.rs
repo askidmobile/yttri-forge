@@ -5034,11 +5034,20 @@ impl GatedAttentionLayer {
         };
         let snap_scales = snap.q8_scales()?;
         if pool_scales.is_some() != snap_scales.is_some() {
-            candle_core::bail!(
-                "restore_kv_to_pool: формат снимка и пула различается (snapshot_q8={}, pool_q8={})",
-                snap_scales.is_some(),
-                pool_scales.is_some()
-            );
+            // Пул для F16-снимка — только ускорение: авторитет остаётся за
+            // single-slot кэшем, который вызывающий заливает следующей строкой,
+            // а `paged_dirty` заставит decode перенести его в пул штатной
+            // миграцией. Так делает КАЖДЫЙ обычный запрос при PGRAPH=off, и
+            // отдельного пути тут не нужно.
+            //
+            // Раньше здесь стоял bail, и он ронял ВТОРОЙ ход любого диалога при
+            // PGRAPH=off + KV_POOL_Q8=1 + prefix cache: eager-префил снимает
+            // F16, пул int8, форматы не сходятся (замер 2026-09-04, ошибка
+            // видна и в боевом логе до правки).
+            //
+            // Q8-снимок без Q8-пула остаётся фатальным — его ловит проверка
+            // `q8_snapshot && !restored_to_pool` в `restore_slot_state`.
+            return Ok(false);
         }
         let value_dtype = if pool_scales.is_some() {
             DType::U8
