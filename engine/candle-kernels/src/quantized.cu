@@ -6583,7 +6583,7 @@ extern "C" __global__ void
 
 template <typename block_q_t, float (*dequant_value)(const block_q_t *, int)>
 __device__ void indexed_moe_forward_iq_f32(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const float * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -6601,8 +6601,8 @@ __device__ void indexed_moe_forward_iq_f32(
     if (row >= n) return;
 
     const int blocks_per_row = k / QK_K;
-    const block_q_t * w = (const block_q_t *)all_weights
-        + ((size_t)expert_id * n + row) * blocks_per_row;
+    const block_q_t * w = (const block_q_t *)expert_ptrs[expert_id]
+        + (size_t)row * blocks_per_row;
 
     if (gridDim.y == 1 || gridDim.y > max_batch) {
         const int input_idx = input_dim1 == 1 ? current_batch : task_id;
@@ -6765,7 +6765,7 @@ static __device__ __forceinline__ float iq4_xs_value(const block_iq4_xs * bq4, i
 
 template <typename block_q_t, float (*dequant_value)(const block_q_t *, int)>
 __device__ void indexed_moe_forward_iq_f32_grouped(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const float * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -6783,8 +6783,8 @@ __device__ void indexed_moe_forward_iq_f32_grouped(
     if (row >= n) return;
 
     const int blocks_per_row = k / QK_K;
-    const block_q_t * w = (const block_q_t *)all_weights
-        + ((size_t)expert_id * n + row) * blocks_per_row;
+    const block_q_t * w = (const block_q_t *)expert_ptrs[expert_id]
+        + (size_t)row * blocks_per_row;
 
     __shared__ int tasks[route_tile];
     __shared__ int task_count;
@@ -6844,15 +6844,15 @@ __device__ void indexed_moe_forward_iq_f32_grouped(
 
 #define IQ_MOE_F32_EXTERN(name, BLOCK_, VALUE_) \
 extern "C" __global__ void name( \
-    const void * weights, const float * inputs, const unsigned int * ids, float * outputs, \
+    const void * const * expert_ptrs, const float * inputs, const unsigned int * ids, float * outputs, \
     const int n, const int k, const int batch, const int topk, const int input_dim1) { \
-    indexed_moe_forward_iq_f32<BLOCK_, VALUE_>(weights, inputs, ids, outputs, n, k, topk, input_dim1); \
+    indexed_moe_forward_iq_f32<BLOCK_, VALUE_>(expert_ptrs, inputs, ids, outputs, n, k, topk, input_dim1); \
 } \
 extern "C" __global__ void name##_grouped( \
-    const void * weights, const float * inputs, const unsigned int * ids, float * outputs, \
+    const void * const * expert_ptrs, const float * inputs, const unsigned int * ids, float * outputs, \
     const int n, const int k, const int batch, const int topk, const int input_dim1) { \
     indexed_moe_forward_iq_f32_grouped<BLOCK_, VALUE_>( \
-        weights, inputs, ids, outputs, n, k, batch, topk, input_dim1); \
+        expert_ptrs, inputs, ids, outputs, n, k, batch, topk, input_dim1); \
 }
 
 IQ_MOE_F32_EXTERN(indexed_moe_forward_iq2_s_f32, block_iq2_s, iq2_s_value)
@@ -6877,7 +6877,7 @@ IQ_MOE_F32_EXTERN(indexed_moe_forward_iq4_xs_f32, block_iq4_xs, iq4_xs_value)
  * @author
  *   Guoqing Bao
  *   Part of the project: https://github.com/guoqingbao/vllm.rs/
- * @param all_weights Pointer to the beginning of the weight tensor [num_experts, n, k].
+ * @param expert_ptrs Таблица из n_experts device-указателей на матрицы экспертов [num_experts] (FR-002).
  * @param all_inputs Pointer to the beginning of the input tensor [batch * topk, k].
  * @param indices Pointer to the expert indices for each task [batch * topk].
  * @param all_outputs Pointer to the beginning of the output tensor [batch * topk, n].
@@ -6885,13 +6885,12 @@ IQ_MOE_F32_EXTERN(indexed_moe_forward_iq4_xs_f32, block_iq4_xs, iq4_xs_value)
  * @param k The number of input features (columns in the weight matrix).
  * @param total_tasks The total number of tasks to process, typically batch_size * topk.
  * @param k_padded The value of k padded to a multiple of MATRIX_ROW_PADDING.
- * @param weight_expert_stride_bytes The stride in bytes to get from one expert matrix to the next.
  * @param input_task_stride_bytes The stride in bytes to get from one quantized input vector to the next.
  * @param output_task_stride_elems The stride in elements (f32) to get from one output vector to the next.
  */
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 __device__ void indexed_moe_forward(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -6921,18 +6920,15 @@ __device__ void indexed_moe_forward(
     const unsigned int expert_id = indices[task_id];
 
     // Calculate strides
-    const size_t weight_block_size = sizeof(block_q_t);
     const size_t input_block_size = sizeof(block_q8_1);
-    // Stride по весам — через qk шаблона, НЕ QK_K: для Q8_0 блок = 32 элемента
-    // (QK_K=256 только у K-quants). С QK_K stride был в 8x меньше → чтение
-    // мусора → мусорный вывод MoE на Q8_0 (поймано на Ornith-35B Q8_0).
-    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
     const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
     const size_t output_task_stride_elems = n;
 
     //data offsets of current task
+    // FR-002: адрес эксперта берётся из таблицы указателей — резидентные
+    // слоты VRAM, стейджинг и host-mapped буферы адресуются единообразно.
     const void * current_input_ptr  = (const char *)all_inputs  + input_idx * input_task_stride_bytes;
-    const void * current_weight_ptr = (const char *)all_weights + expert_id * weight_expert_stride_bytes;
+    const void * current_weight_ptr = expert_ptrs[expert_id];
     float * current_output_ptr = all_outputs + task_id * output_task_stride_elems;
 
     //fixed for inner compute
@@ -6981,7 +6977,7 @@ __device__ void indexed_moe_forward(
 }
 
 extern "C" __global__ void indexed_moe_forward_q2k_q8_1(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -6992,11 +6988,11 @@ extern "C" __global__ void indexed_moe_forward_q2k_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (expert_ptrs, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
 
 extern "C" __global__ void indexed_moe_forward_q3k_q8_1(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -7007,11 +7003,11 @@ extern "C" __global__ void indexed_moe_forward_q3k_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (expert_ptrs, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
 
 extern "C" __global__ void indexed_moe_forward_q4k_q8_1(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -7022,11 +7018,11 @@ extern "C" __global__ void indexed_moe_forward_q4k_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (expert_ptrs, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
 
 extern "C" __global__ void indexed_moe_forward_q5k_q8_1(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -7037,11 +7033,11 @@ extern "C" __global__ void indexed_moe_forward_q5k_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (expert_ptrs, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
 
 extern "C" __global__ void indexed_moe_forward_q6k_q8_1(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -7052,11 +7048,11 @@ extern "C" __global__ void indexed_moe_forward_q6k_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (expert_ptrs, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
 
 extern "C" __global__ void indexed_moe_forward_iq2_xxs_q8_1(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -7067,11 +7063,11 @@ extern "C" __global__ void indexed_moe_forward_iq2_xxs_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI2_XXS, block_iq2_xxs, VDR_IQ2_XXS_Q8_1_MMVQ, vec_dot_iq2_xxs_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (expert_ptrs, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
 
 extern "C" __global__ void indexed_moe_forward_iq2_xs_q8_1(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -7082,11 +7078,11 @@ extern "C" __global__ void indexed_moe_forward_iq2_xs_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI2_XS, block_iq2_xs, VDR_IQ2_XS_Q8_1_MMVQ, vec_dot_iq2_xs_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (expert_ptrs, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
 
 extern "C" __global__ void indexed_moe_forward_iq2_s_q8_1(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -7097,11 +7093,11 @@ extern "C" __global__ void indexed_moe_forward_iq2_s_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI2_S, block_iq2_s, VDR_IQ2_S_Q8_1_MMVQ, vec_dot_iq2_s_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (expert_ptrs, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
 
 extern "C" __global__ void indexed_moe_forward_iq3_xxs_q8_1(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -7112,11 +7108,11 @@ extern "C" __global__ void indexed_moe_forward_iq3_xxs_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI3_XXS, block_iq3_xxs, VDR_IQ3_XXS_Q8_1_MMVQ, vec_dot_iq3_xxs_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (expert_ptrs, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
 
 extern "C" __global__ void indexed_moe_forward_iq3_s_q8_1(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -7127,11 +7123,11 @@ extern "C" __global__ void indexed_moe_forward_iq3_s_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI3_S, block_iq3_s, VDR_IQ3_S_Q8_1_MMVQ, vec_dot_iq3_s_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (expert_ptrs, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
 
 extern "C" __global__ void indexed_moe_forward_iq4_xs_q8_1(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -7142,11 +7138,11 @@ extern "C" __global__ void indexed_moe_forward_iq4_xs_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI4_XS, block_iq4_xs, VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_iq4_xs_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (expert_ptrs, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
 
 extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -7157,7 +7153,7 @@ extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (expert_ptrs, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -7170,7 +7166,7 @@ extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
 
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 __device__ void indexed_moe_forward_grouped(
-    const void * __restrict__ all_weights,
+    const void * const * __restrict__ expert_ptrs,
     const void * __restrict__ all_inputs,   // q8_1
     const unsigned int * __restrict__ indices,
     float * __restrict__ all_outputs,
@@ -7189,12 +7185,11 @@ __device__ void indexed_moe_forward_grouped(
     if (row >= n) return;
 
     const int blocks_per_row_x = k / qk;
-    const size_t weight_expert_stride = (size_t)(n * k) / qk * sizeof(block_q_t);
     const size_t input_task_stride = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
     const size_t output_task_stride = n;
 
-    const block_q_t * w = (const block_q_t *)((const char *)all_weights
-        + expert_id * weight_expert_stride + row * blocks_per_row_x * sizeof(block_q_t));
+    const block_q_t * w = (const block_q_t *)((const char *)expert_ptrs[expert_id]
+        + row * blocks_per_row_x * sizeof(block_q_t));
 
     __shared__ int tasks[route_tile];
     __shared__ int task_count;
@@ -7264,14 +7259,14 @@ __device__ void indexed_moe_forward_grouped(
 
 #define IQ_MOE_Q8_1_GROUPED_EXTERN(name, qk_, qi_, BLOCK_, VDR_, VDOT_) \
 extern "C" __global__ void name##_grouped( \
-    const void * __restrict__ all_weights, \
+    const void * const * __restrict__ expert_ptrs, \
     const void * __restrict__ all_inputs, \
     const unsigned int * __restrict__ indices, \
     float * __restrict__ all_outputs, \
     const int n, const int k, const int batch, const int topk, \
     const int k_padded, const int input_dim1) { \
     indexed_moe_forward_grouped<qk_, qi_, BLOCK_, VDR_, VDOT_> \
-        (all_weights, all_inputs, indices, all_outputs, \
+        (expert_ptrs, all_inputs, indices, all_outputs, \
          n, k, batch, topk, k_padded, input_dim1); \
 }
 
@@ -7290,8 +7285,8 @@ IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_iq4_xs_q8_1, QK_K, QI4_XS, block_
 
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 __device__ void indexed_moe_forward_dual(
-    const void * __restrict__ w1_all,
-    const void * __restrict__ w2_all,
+    const void * const * __restrict__ w1_ptrs,
+    const void * const * __restrict__ w2_ptrs,
     const void * __restrict__ all_inputs,
     const unsigned int * __restrict__ indices,
     float * __restrict__ out1_all,
@@ -7310,14 +7305,13 @@ __device__ void indexed_moe_forward_dual(
     const int input_idx = (input_dim1 == 1) ? current_batch : task_id;
     const unsigned int expert_id = indices[task_id];
 
-    const size_t weight_block_size = sizeof(block_q_t);
     const size_t input_block_size = sizeof(block_q8_1);
-    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
     const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
 
     const char * x_ptr = (const char *)all_inputs + input_idx * input_task_stride_bytes;
-    const char * w1_ptr = (const char *)w1_all + expert_id * weight_expert_stride_bytes;
-    const char * w2_ptr = (const char *)w2_all + expert_id * weight_expert_stride_bytes;
+    // FR-002: адреса экспертов — из таблиц указателей (gate и up независимо).
+    const char * w1_ptr = (const char *)w1_ptrs[expert_id];
+    const char * w2_ptr = (const char *)w2_ptrs[expert_id];
     float * out1 = out1_all + task_id * n;
     float * out2 = out2_all + task_id * n;
 
@@ -7367,7 +7361,7 @@ __device__ void indexed_moe_forward_dual(
 
 #define DUAL_MOE_EXTERN(name, QK_, QI_, BLOCK_, VDR_, DOT_) \
 extern "C" __global__ void name( \
-    const void * w1, const void * w2, const void * inp, const unsigned int * ids, \
+    const void * const * w1, const void * const * w2, const void * inp, const unsigned int * ids, \
     float * out1, float * out2, \
     const int n, const int k, const int batch, const int topk, const int k_padded, const int input_dim1) { \
     indexed_moe_forward_dual<QK_, QI_, BLOCK_, VDR_, DOT_>(w1, w2, inp, ids, out1, out2, n, k, batch, topk, k_padded, input_dim1); \
@@ -7380,7 +7374,9 @@ DUAL_MOE_EXTERN(indexed_moe_forward_dual_iq3_xxs_q8_1, QK_K,  QI3_XXS, block_iq3
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_iq3_s_q8_1,   QK_K,  QI3_S,   block_iq3_s,   VDR_IQ3_S_Q8_1_MMVQ,   vec_dot_iq3_s_q8_1)
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_iq4_xs_q8_1,  QK_K,  QI4_XS,  block_iq4_xs,  VDR_IQ4_XS_Q8_1_MMVQ,  vec_dot_iq4_xs_q8_1)
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q8_0_q8_1, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1)
+DUAL_MOE_EXTERN(indexed_moe_forward_dual_q3k_q8_1,  QK_K,  QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1)
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q4k_q8_1,  QK_K,  QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
+DUAL_MOE_EXTERN(indexed_moe_forward_dual_q5k_q8_1,  QK_K,  QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q6k_q8_1,  QK_K,  QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q2k_q8_1,  QK_K,  QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1)
 

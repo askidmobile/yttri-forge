@@ -22,6 +22,10 @@ pub struct QCudaStorage {
     /// Включается env DEQUANT_CACHE=1 (смысл: карты с большим VRAM,
     /// A100 80GB; на 12GB не влезает — там tiled fallback как было).
     dequant_cache: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<CudaStorage>>>>,
+    /// FR-002: ленивая таблица указателей на экспертов упакованной раскладки
+    /// (`base + id·stride`). Строится при первом MoE-вызове; при выгрузке
+    /// движок строит таблицы сам поверх своего хранилища.
+    moe_table: std::sync::OnceLock<std::sync::Arc<CudaSlice<u64>>>,
 }
 
 fn dequant_cache_enabled() -> bool {
@@ -546,6 +550,7 @@ fn dequantize_mul_mat_vec_via_cublas(
         dtype,
         device: dev.clone(),
         dequant_cache: Default::default(),
+        moe_table: Default::default(),
     };
     // Dequantize [nrows, ncols] weights to f32
     let data_f32 = storage.dequantize(nrows * ncols)?;
@@ -885,7 +890,7 @@ fn contiguous_view<'a, T>(
 
 #[allow(clippy::too_many_arguments)]
 fn indexed_moe_forward_dispatch(
-    weight: &CudaView<u8>,
+    table: &CudaView<u64>,
     w_shape: &crate::Shape, //[num_experts, n, k]
     w_dtype: GgmlDType,
     input: &CudaView<f32>,
@@ -987,7 +992,7 @@ fn indexed_moe_forward_dispatch(
     };
 
     let mut builder = func.builder();
-    builder.arg(weight);
+    builder.arg(table);
     builder.arg(&*input_quant_guard);
     builder.arg(ids);
     builder.arg(&out);
@@ -1031,11 +1036,209 @@ fn indexed_moe_forward_dispatch(
     ))
 }
 
+// ═══════════════════════════════════════════════════════════════
+// FR-002 (план 2026-09-04-moe-expert-offload, фаза 1): публичные входы
+// MoE-ядер через таблицу указателей. Таблица [n_experts] u64 — device-адреса
+// матриц экспертов ([n, k] упакованного dtype); адреса могут указывать на
+// VRAM, стейджинг или device-mapped host-память. Упакованная раскладка идёт
+// через ленивую таблицу `base + id·stride` (packed_moe_table) — путь
+// адресации тот же, что и при выгрузке.
+// ═══════════════════════════════════════════════════════════════
+
+/// MoE-матмул по таблице указателей. `input` — [batch, topk|1, k] F32 CUDA
+/// (contiguous), `ids` — [batch, topk] U32 CUDA. Возвращает [batch, topk, n] F32.
+pub fn indexed_moe_forward_table(
+    dev: &CudaDevice,
+    dtype: GgmlDType,
+    shape: (usize, usize, usize), //[n_experts, n, k]
+    table: &CudaSlice<u64>,
+    input: &crate::Tensor,
+    ids: &crate::Tensor,
+) -> Result<crate::Tensor> {
+    let (in_st, in_l) = input.storage_and_layout();
+    let in_cuda = match &*in_st {
+        crate::Storage::Cuda(c) => c,
+        _ => crate::bail!("indexed_moe_forward_table: input not on CUDA"),
+    };
+    let (ids_st, ids_l) = ids.storage_and_layout();
+    let ids_cuda = match &*ids_st {
+        crate::Storage::Cuda(c) => c,
+        _ => crate::bail!("indexed_moe_forward_table: ids not on CUDA"),
+    };
+    let input_view = contiguous_view(in_cuda.as_cuda_slice::<f32>()?, in_l, "input")?;
+    let ids_view = contiguous_view(ids_cuda.as_cuda_slice::<u32>()?, ids_l, "ids")?;
+    let w_shape: crate::Shape = (shape.0, shape.1, shape.2).into();
+    let (out, out_shape) = indexed_moe_forward_dispatch(
+        &table.slice(0..),
+        &w_shape,
+        dtype,
+        &input_view,
+        in_l.shape(), //[batch, topk or 1, k]
+        &ids_view,
+        ids_l.shape(), //[batch, topk]
+        dev,
+    )?;
+    Ok(crate::Tensor::from((crate::Storage::Cuda(out), out_shape)))
+}
+
+/// Dual MoE-матмул (gate+up одним запуском) по двум таблицам указателей.
+/// Форма обеих матриц одинакова: [n_experts, n, k]. Возвращает (gate, up) —
+/// оба [batch, topk, n] F32.
+pub fn indexed_moe_forward_dual_table(
+    dev: &CudaDevice,
+    dtype: GgmlDType,
+    shape: (usize, usize, usize),
+    table1: &CudaSlice<u64>,
+    table2: &CudaSlice<u64>,
+    input: &crate::Tensor,
+    ids: &crate::Tensor,
+) -> Result<(crate::Tensor, crate::Tensor)> {
+    let (in_st, in_l) = input.storage_and_layout();
+    let in_cuda = match &*in_st {
+        crate::Storage::Cuda(c) => c,
+        _ => crate::bail!("indexed_moe_forward_dual_table: input not on CUDA"),
+    };
+    let (ids_st, ids_l) = ids.storage_and_layout();
+    let ids_cuda = match &*ids_st {
+        crate::Storage::Cuda(c) => c,
+        _ => crate::bail!("indexed_moe_forward_dual_table: ids not on CUDA"),
+    };
+    let input_view = contiguous_view(in_cuda.as_cuda_slice::<f32>()?, in_l, "input")?;
+    let ids_view = contiguous_view(ids_cuda.as_cuda_slice::<u32>()?, ids_l, "ids")?;
+    let w_shape: crate::Shape = (shape.0, shape.1, shape.2).into();
+    let (out1, out2, out_shape) = indexed_moe_forward_dual_dispatch(
+        &table1.slice(0..),
+        &table2.slice(0..),
+        &w_shape,
+        dtype,
+        &input_view,
+        in_l.shape(),
+        &ids_view,
+        ids_l.shape(),
+        dev,
+    )?;
+    Ok((
+        crate::Tensor::from((crate::Storage::Cuda(out1), out_shape.clone())),
+        crate::Tensor::from((crate::Storage::Cuda(out2), out_shape)),
+    ))
+}
+
+impl QCudaStorage {
+    /// Ленивая таблица указателей на экспертов упакованной раскладки
+    /// (`base + id·stride`). Stride = (n·k)/qk·type_size — ровно та формула,
+    /// что была в ядре; qk = block_size() dtype (для Q8_0 это 32, а не QK_K —
+    /// ловушка из Ornith-35B Q8_0 учтена на стороне построителя таблицы).
+    /// Для тестов и эталонных путей.
+    fn packed_moe_table(&self, shape: &crate::Shape) -> Result<std::sync::Arc<CudaSlice<u64>>> {
+        if let Some(t) = self.moe_table.get() {
+            return Ok(t.clone());
+        }
+        use cudarc::driver::DevicePtr;
+        let (n_experts, n, k) = shape.dims3()?;
+        let stride = (n * k) / self.dtype.block_size() * self.dtype.type_size();
+        let stream = self.device.cuda_stream();
+        let (base, _guard) = self.data.inner.device_ptr(&stream);
+        let host: Vec<u64> = (0..n_experts)
+            .map(|i| base + i as u64 * stride as u64)
+            .collect();
+        let mut tbl = unsafe { self.device.alloc::<u64>(n_experts)? };
+        self.device.memcpy_htod(&host, &mut tbl)?;
+        let arc = std::sync::Arc::new(tbl);
+        let _ = self.moe_table.set(arc.clone());
+        Ok(arc)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn indexed_moe_forward_dual_dispatch(
+    table1: &CudaView<u64>,
+    table2: &CudaView<u64>,
+    w_shape: &crate::Shape, //[num_experts, n, k]
+    w_dtype: GgmlDType,
+    input: &CudaView<f32>,
+    in_shape: &crate::Shape, //[batch, topk or 1, k]
+    ids: &CudaView<u32>,
+    idx_shape: &crate::Shape, //[batch, topk]
+    dev: &CudaDevice,
+) -> Result<(CudaStorage, CudaStorage, crate::Shape)> {
+    let kernel_name = match w_dtype {
+        GgmlDType::IQ2XXS => "indexed_moe_forward_dual_iq2_xxs_q8_1",
+        GgmlDType::IQ2XS => "indexed_moe_forward_dual_iq2_xs_q8_1",
+        GgmlDType::IQ2S => "indexed_moe_forward_dual_iq2_s_q8_1",
+        GgmlDType::IQ3XXS => "indexed_moe_forward_dual_iq3_xxs_q8_1",
+        GgmlDType::IQ3S => "indexed_moe_forward_dual_iq3_s_q8_1",
+        GgmlDType::IQ4XS => "indexed_moe_forward_dual_iq4_xs_q8_1",
+        GgmlDType::Q8_0 => "indexed_moe_forward_dual_q8_0_q8_1",
+        GgmlDType::Q2K => "indexed_moe_forward_dual_q2k_q8_1",
+        GgmlDType::Q3K => "indexed_moe_forward_dual_q3k_q8_1",
+        GgmlDType::Q4K => "indexed_moe_forward_dual_q4k_q8_1",
+        GgmlDType::Q5K => "indexed_moe_forward_dual_q5k_q8_1",
+        GgmlDType::Q6K => "indexed_moe_forward_dual_q6k_q8_1",
+        _ => crate::bail!("unsupported dtype for dual indexed moe {w_dtype:?}"),
+    };
+    let (n, k) = (w_shape.dims3()?.1, w_shape.dims3()?.2);
+    let batch = in_shape.dims()[0];
+    let topk = idx_shape.dims()[1];
+    let input_dim1 = in_shape.dims()[1];
+
+    // q8_1 quantize входа (один раз на обе проекции).
+    let total_rows = batch * input_dim1;
+    let k_padded = pad(k, MATRIX_ROW_PADDING);
+    let y_size_in_bytes =
+        k_padded * total_rows * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+    let mut input_quant_guard = q8_1_scratch(dev, y_size_in_bytes);
+    {
+        let mut view = input_quant_guard.slice_mut(..);
+        quantize_q8_1(input, &mut view, k, total_rows, dev)?;
+    }
+
+    let outsize = batch * topk * n;
+    let out1 = unsafe { dev.alloc::<f32>(outsize)? };
+    let out2 = unsafe { dev.alloc::<f32>(outsize)? };
+
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (n as u32, batch as u32, topk as u32),
+        block_dim: (WARP_SIZE as u32, 4, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = func.builder();
+    b.arg(table1);
+    b.arg(table2);
+    b.arg(&*input_quant_guard);
+    b.arg(ids);
+    b.arg(&out1);
+    b.arg(&out2);
+    barg!(b, n as i32);
+    barg!(b, k as i32);
+    barg!(b, batch as i32);
+    barg!(b, topk as i32);
+    barg!(b, k_padded as i32);
+    barg!(b, input_dim1 as i32);
+    let t0 = std::time::Instant::now();
+    unsafe { b.launch(cfg) }.w()?;
+    if std::env::var_os("TRACE_MMQ").is_some() {
+        let _ = dev.cuda_stream().synchronize();
+        eprintln!(
+            "[moe2] dtype={w_dtype:?} grid=({n},{batch},{topk}) n={n} k={k} batch={batch} topk={topk} gpu={:.1}ms",
+            t0.elapsed().as_secs_f64() * 1e3,
+        );
+    }
+
+    let shape: crate::Shape = (batch, topk, n).into();
+    Ok((
+        CudaStorage::wrap_cuda_slice(out1, dev.clone()),
+        CudaStorage::wrap_cuda_slice(out2, dev.clone()),
+        shape,
+    ))
+}
+
 impl QCudaStorage {
     /// Dual indexed MoE: gate+up with shared input and two outputs.
-    /// IQ types keep F32 input and use two measured-faster launches; K-quants share Q8_1 input.
     /// w1/w2 — packed [n_experts, n, k] одинакового dtype; input [batch, topk, k] f32;
     /// ids [batch, topk] u32. Выход: два [batch, topk, n] f32.
+    /// FR-002: веса адресуются через ленивую таблицу указателей
+    /// (`base + id·stride`) — тот же путь, что и при выгрузке.
     pub fn indexed_moe_forward_dual(
         &self,
         other: &QCudaStorage,
@@ -1053,88 +1256,21 @@ impl QCudaStorage {
                 other.dtype()
             );
         }
-        let input_storage = input.as_cuda_slice::<f32>()?;
-        let input_view = contiguous_view(input_storage, input_l, "input")?;
-        let ids_storage = ids.as_cuda_slice::<u32>()?;
-        let ids_view = contiguous_view(ids_storage, ids_l, "ids")?;
-        let kernel_name = match dtype {
-            GgmlDType::IQ2XXS => "indexed_moe_forward_dual_iq2_xxs_q8_1",
-            GgmlDType::IQ2XS => "indexed_moe_forward_dual_iq2_xs_q8_1",
-            GgmlDType::IQ2S => "indexed_moe_forward_dual_iq2_s_q8_1",
-            GgmlDType::IQ3XXS => "indexed_moe_forward_dual_iq3_xxs_q8_1",
-            GgmlDType::IQ3S => "indexed_moe_forward_dual_iq3_s_q8_1",
-            GgmlDType::IQ4XS => "indexed_moe_forward_dual_iq4_xs_q8_1",
-            GgmlDType::Q8_0 => "indexed_moe_forward_dual_q8_0_q8_1",
-            GgmlDType::Q2K => "indexed_moe_forward_dual_q2k_q8_1",
-            GgmlDType::Q4K => "indexed_moe_forward_dual_q4k_q8_1",
-            GgmlDType::Q6K => "indexed_moe_forward_dual_q6k_q8_1",
-            _ => crate::bail!("unsupported dtype for dual indexed moe {dtype:?}"),
-        };
-        let (n, k) = (self_shape.dims3()?.1, self_shape.dims3()?.2);
-        let batch = input_l.shape().dims()[0];
-        let topk = ids_l.shape().dims()[1];
-        let input_dim1 = input_l.shape().dims()[1];
-
-        // q8_1 quantize входа (один раз на обе проекции).
-        let dev = &self.device;
-        let total_rows = batch * input_dim1;
-        let k_padded = pad(k, MATRIX_ROW_PADDING);
-        let y_size_in_bytes =
-            k_padded * total_rows * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-        let mut input_quant_guard = q8_1_scratch(dev, y_size_in_bytes);
-        {
-            let mut view = input_quant_guard.slice_mut(..);
-            quantize_q8_1(&input_view, &mut view, k, total_rows, dev)?;
-        }
-
-        let outsize = batch * topk * n;
-        let out1 = unsafe { dev.alloc::<f32>(outsize)? };
-        let out2 = unsafe { dev.alloc::<f32>(outsize)? };
-
-        let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
-        let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: (n as u32, batch as u32, topk as u32),
-            block_dim: (WARP_SIZE as u32, 4, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut b = func.builder();
-        b.arg(&self.data.inner);
-        b.arg(&other.data.inner);
-        b.arg(&*input_quant_guard);
-        b.arg(&ids_view);
-        b.arg(&out1);
-        b.arg(&out2);
-        barg!(b, n as i32);
-        barg!(b, k as i32);
-        barg!(b, batch as i32);
-        barg!(b, topk as i32);
-        barg!(b, k_padded as i32);
-        barg!(b, input_dim1 as i32);
-        let t0 = std::time::Instant::now();
-        unsafe { b.launch(cfg) }.w()?;
-        let trace_mmq = std::env::var_os("TRACE_MMQ").is_some();
-        if trace_mmq {
-            let _ = dev.cuda_stream().synchronize();
-            eprintln!(
-                "[moe2] dtype={:?} grid=({},{},{}) n={} k={} batch={} topk={} gpu={:.1}ms",
-                dtype,
-                n,
-                batch,
-                topk,
-                n,
-                k,
-                batch,
-                topk,
-                t0.elapsed().as_secs_f64() * 1e3,
-            );
-        }
-
-        let shape: crate::Shape = (batch, topk, n).into();
-        Ok((
-            CudaStorage::wrap_cuda_slice(out1, dev.clone()),
-            CudaStorage::wrap_cuda_slice(out2, dev.clone()),
-            shape,
-        ))
+        let table1 = self.packed_moe_table(self_shape)?;
+        let table2 = other.packed_moe_table(self_shape)?;
+        let input_view = contiguous_view(input.as_cuda_slice::<f32>()?, input_l, "input")?;
+        let ids_view = contiguous_view(ids.as_cuda_slice::<u32>()?, ids_l, "ids")?;
+        indexed_moe_forward_dual_dispatch(
+            &table1.slice(0..),
+            &table2.slice(0..),
+            self_shape,
+            dtype,
+            &input_view,
+            input_l.shape(),
+            &ids_view,
+            ids_l.shape(),
+            &self.device,
+        )
     }
 }
 
@@ -1188,8 +1324,9 @@ impl QCudaStorage {
             let input_view = contiguous_view(input_storage, input_l, "input")?;
             let ids_storage = ids.as_cuda_slice::<u32>()?;
             let ids_view = contiguous_view(ids_storage, ids_l, "ids")?;
+            let table = self.packed_moe_table(self_shape)?;
             indexed_moe_forward_dispatch(
-                &self.data.inner.slice(0..),
+                &table.slice(0..),
                 self_shape, //[num_experts, n, k]
                 self.dtype(),
                 &input_view,
@@ -1219,6 +1356,7 @@ impl QCudaStorage {
             device: device.clone(),
             dtype,
             dequant_cache: Default::default(),
+            moe_table: Default::default(),
         })
     }
 
@@ -1251,6 +1389,7 @@ impl QCudaStorage {
                 dtype: self.dtype,
                 device: self.device.clone(),
                 dequant_cache: Default::default(),
+                moe_table: Default::default(),
             }
             .dequantize(elem_count)?;
             *g = Some(std::sync::Arc::new(w));
@@ -1931,6 +2070,7 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
         device: device.clone(),
         dtype,
         dequant_cache: Default::default(),
+        moe_table: Default::default(),
     }))
 }
 
@@ -1953,6 +2093,7 @@ pub fn load_quantized_bytes(
         device: device.clone(),
         dtype,
         dequant_cache: Default::default(),
+        moe_table: Default::default(),
     }))
 }
 

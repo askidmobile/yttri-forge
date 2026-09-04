@@ -26,6 +26,10 @@ mod metal {
 }
 #[cfg(feature = "cuda")]
 pub mod cuda;
+// FR-002: публичные входы MoE-ядер через таблицу указателей (фаза 1
+// 2026-09-04-moe-expert-offload). Упакованные пути — через методы QTensor.
+#[cfg(feature = "cuda")]
+pub use cuda::{indexed_moe_forward_dual_table, indexed_moe_forward_table};
 #[cfg(feature = "cuda")]
 pub mod fast_mmq;
 #[cfg(feature = "cuda")]
