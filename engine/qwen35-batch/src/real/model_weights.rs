@@ -2445,6 +2445,10 @@ impl DeltaNetLayer {
             }
             _ => self.project_in(x)?,
         };
+        dump_sub("dn.qkv", &qkv_t);
+        dump_sub("dn.z", &z_t);
+        dump_sub("dn.beta", &beta_t);
+        dump_sub("dn.alpha", &alpha_t);
         #[cfg(not(target_os = "macos"))]
         let dn_proj_ms = {
             // Гейт по feature, а не по target_os: без CUDA на Windows/Linux
@@ -2538,6 +2542,7 @@ impl DeltaNetLayer {
                     &beta_t,
                     &alpha_t,
                 )?;
+                dump_sub("dn.gated", &gated_all);
                 if gprof2 {
                     let _ = ctx.dev.cuda_stream().synchronize();
                     eprintln!(
@@ -2550,6 +2555,9 @@ impl DeltaNetLayer {
                     Some(fo) => fo.forward(&gated_all),
                     None => self.ssm_out.forward(&gated_all),
                 };
+                if let Ok(t) = &r {
+                    dump_sub("dn.out", t);
+                }
                 if dn_gpf3 {
                     if let Device::Cuda(c) = &device {
                         let _ = c.cuda_stream().synchronize();
@@ -2797,10 +2805,12 @@ impl DeltaNetLayer {
         // 5. Один трансфер CPU→GPU + batch output projection
         let output_tensor = Tensor::from_vec(all_outputs, (1, seq_len, value_dim), &Device::Cpu)?
             .to_device(&device)?;
+        dump_sub("dn.gated", &output_tensor);
         #[cfg(target_os = "macos")]
         let result = dispatch_q4k_matmul(&self.ssm_out, self.ssm_out_opt.as_ref(), &output_tensor)?;
         #[cfg(not(target_os = "macos"))]
         let result = self.ssm_out.forward(&output_tensor)?;
+        dump_sub("dn.out", &result);
 
         Ok(result)
     }
@@ -8185,6 +8195,10 @@ impl ModelWeights {
         #[cfg(not(feature = "cuda"))]
         let emb_ready = self.tok_embeddings.forward(x)?.to_device(x.device())?;
         let mut layer_in = emb_ready;
+        if seq_len > 1 {
+            dump_reset();
+            dump_layer(-1, "embed", &layer_in);
+        }
         let t_embed = t_start.elapsed();
 
         let t_layers_start = std::time::Instant::now();
@@ -8264,6 +8278,7 @@ impl ModelWeights {
                         layer_in = layer_in.to_device(&block_dev)?;
                     }
                     layer_in = block.forward_prefill(&layer_in, index_pos)?;
+                    dump_layer(bi as i64, if block.is_deltanet() { "delta" } else { "attn" }, &layer_in);
                     // Бисекция недетерминизма: BISECT_HIDDEN=N — после
                     // слоя N печатать FNV-1a checksum hidden (первые 4 строки
                     // каждого чанка). Два прогона в одном процессе покажут
@@ -8339,7 +8354,9 @@ impl ModelWeights {
         let t_head_start = std::time::Instant::now();
         let x = self.norm.forward(&layer_in)?;
         let x = x.i((.., seq_len - 1, ..))?;
+        dump_layer(1000, "final_norm", &x.unsqueeze(1)?);
         let logits = self.output.forward(&x)?;
+        dump_layer(1001, "logits", &logits.unsqueeze(1)?);
         let t_head = t_head_start.elapsed();
 
         // Профилирование
@@ -10294,4 +10311,62 @@ mod snapshot_host_device_tests {
         }
         Ok(())
     }
+}
+
+/// Послойный дамп hidden последней позиции (LAYER_DEBUG=путь к файлу).
+///
+/// `BISECT_HIDDEN` даёт FNV-хеш — «биты разошлись», но не где и на сколько.
+/// Здесь пишется сам вектор: сравнение двух дампов (CUDA против CPU, наш
+/// против llama.cpp) показывает первый расходящийся слой и величину.
+/// `dump_reset` в начале форварда очищает файл; дальше одна строка JSON на
+/// запись. `dump_sub` — промежуточные точки внутри блока: у них нет номера
+/// слоя, поэтому ключ — порядковый номер (у обоих бэкендов порядок один).
+fn dump_path() -> Option<&'static str> {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var("LAYER_DEBUG").ok()).as_deref()
+}
+
+static DUMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn dump_reset() {
+    if let Some(path) = dump_path() {
+        let _ = std::fs::File::create(path);
+        DUMP_SEQ.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn dump_write(layer: i64, tag: &str, x: &Tensor) {
+    let Some(path) = dump_path() else {
+        return;
+    };
+    let vals = (|| -> Result<Vec<f32>> {
+        let t = x.dim(1)?;
+        x.i((0, t - 1))?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+    })();
+    let Ok(vals) = vals else {
+        return;
+    };
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    use std::io::Write;
+    let body: Vec<String> = vals.iter().map(|v| format!("{v:e}")).collect();
+    let _ = writeln!(
+        f,
+        "{{\"layer\":{layer},\"tag\":\"{tag}\",\"v\":[{}]}}",
+        body.join(",")
+    );
+}
+
+fn dump_layer(layer: i64, tag: &str, x: &Tensor) {
+    dump_write(layer, tag, x);
+}
+
+/// Промежуточная точка внутри блока; x: [1, T, D] — берётся последняя позиция.
+fn dump_sub(tag: &str, x: &Tensor) {
+    if dump_path().is_none() {
+        return;
+    }
+    let n = DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    dump_write(-1, &format!("{n:03}:{tag}"), x);
 }

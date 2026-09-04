@@ -1757,7 +1757,7 @@ impl QCudaStorage {
                 | GgmlDType::IQ4XS
                 | GgmlDType::IQ1S
         );
-        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+        let out = if force_dmmv() {
             if iq_type && dequant_cache_enabled() {
                 use crate::backend::BackendStorage;
                 let w = self.cached_dequant_f32(nrows * ncols)?;
@@ -1826,7 +1826,7 @@ impl QCudaStorage {
         // вместо tiled dequant каждый вызов.
         if is_iq
             && dequant_cache_enabled()
-            && !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
+            && !force_dmmv()
         {
             let w = self.cached_dequant_f32(n * k)?;
             let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
@@ -1837,7 +1837,7 @@ impl QCudaStorage {
             return Ok((out, out_shape.into()));
         }
 
-        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || is_iq {
+        let out = if force_dmmv() || is_iq {
             // Tiled dequantize matmul: dequantize weight in row-chunks to avoid
             // allocating the full f32 weight (n*k*4 bytes) which can exceed VRAM
             // headroom during prefill and trigger CUDA unified-memory paging.

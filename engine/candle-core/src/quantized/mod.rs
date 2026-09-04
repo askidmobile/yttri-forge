@@ -1323,7 +1323,11 @@ impl QTensor {
         x: &Tensor,
         prequant: Option<&Q8_1Activation>,
     ) -> Result<Tensor> {
-        if !cuda::FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+        // Через force_dmmv(), а не через атомик напрямую: иначе FORCE_DMMV=1 из
+        // окружения не доходил до путей с предквантованной активацией —
+        // проекции DeltaNet, внимания и FFN оставались на MMVQ, и «эталонный»
+        // прогон был эталонным лишь наполовину (2026-09-04).
+        if !cuda::force_dmmv() {
             if let Some(Q8_1Activation::Cuda {
                 slice,
                 ncols,
