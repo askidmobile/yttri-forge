@@ -2087,7 +2087,9 @@ impl MetalStorage {
         }
 
         let suppress = self.device.new_buffer_with_data(suppress_ids)?;
-        let output = self.device.new_buffer(1, DType::U32, "argmax_suppressed_f32")?;
+        // Результат читаем на CPU (`read_to_vec` ниже) → shared-пул, а не
+        // приватный `new_buffer`: у того `contents()` NULL.
+        let output = self.device.allocate_buffer(DType::U32.size_in_bytes())?;
         let input = self.buffer_slice(layout, self.dtype);
         {
             let encoder = self.device.command_encoder()?;
@@ -2146,10 +2148,14 @@ impl MetalStorage {
         } else {
             self.device.new_buffer_with_data(suppress_ids)?
         };
-        let tile_values =
-            self.device.new_buffer(per_tile_els * tile_count, DType::F32, "topk_vals")?;
-        let tile_indices =
-            self.device.new_buffer(per_tile_els * tile_count, DType::U32, "topk_idxs")?;
+        // Тайлы читаем на CPU (`read_to_vec` ниже) → shared-пул, а не
+        // приватный `new_buffer`: у того `contents()` NULL.
+        let tile_values = self
+            .device
+            .allocate_buffer(per_tile_els * tile_count * DType::F32.size_in_bytes())?;
+        let tile_indices = self
+            .device
+            .allocate_buffer(per_tile_els * tile_count * DType::U32.size_in_bytes())?;
         let input = self.buffer_slice(layout, self.dtype);
         {
             let encoder = self.device.command_encoder()?;
@@ -2422,15 +2428,22 @@ impl MetalStorage {
 
     /// Zero-copy GPU→CPU transfer for StorageModeShared buffers.
     ///
-    /// On Apple Silicon, all compute buffers use unified memory (StorageModeShared).
-    /// This means CPU can read GPU results directly without blit copy.
-    /// Only needs flush+wait to ensure GPU has finished writing.
+    /// Shared (unified-memory) buffers are read in place after flush+wait.
+    /// Private ones (pooled `new_buffer` outputs since #3416) have no CPU
+    /// mapping and take the blit path instead.
     ///
     /// Saves ~0.15ms per call by eliminating:
     /// - allocate_buffer for blit destination
     /// - blit command encoder dispatch
     /// - extra memory allocation
     pub fn to_cpu_zero_copy<T: Clone>(&self) -> Result<Vec<T>> {
+        // Выход op'а живёт в пуловом `new_buffer`, а с #3416 это
+        // StorageModePrivate без CPU-отображения: `contents()` NULL и
+        // `read_to_vec` на нём — assert посреди выборки (Yttri, 29.08 и 04.09).
+        // Такой буфер читаем как все: blit в shared и ждём.
+        if self.buffer.is_private() {
+            return self.to_cpu_fast();
+        }
         self.device.wait_until_completed_fast()?;
         Ok(read_to_vec(&self.buffer, self.count))
     }

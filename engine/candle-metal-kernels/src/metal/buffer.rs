@@ -39,6 +39,15 @@ impl Buffer {
         self.as_ref().contents().as_ptr() as *mut u8
     }
 
+    /// Буфер без отображения в память CPU (`StorageModePrivate`): у него
+    /// `contents()` — NULL, читать его можно только через blit. Спрашиваем
+    /// storage mode, а не указатель: objc2 объявляет `contents()` как
+    /// `NonNull`, и `is_null()` над ним — UB, которое release-сборка вправе
+    /// выкинуть вместе с `assert!` в `read_to_vec`.
+    pub fn is_private(&self) -> bool {
+        self.as_ref().storageMode() == objc2_metal::MTLStorageMode::Private
+    }
+
     /// Get the raw pointer to the underlying Metal buffer object.
     /// Used for dependency tracking in the compute encoder.
     pub(crate) fn raw_ptr(&self) -> *const ProtocolObject<dyn MTLBuffer> {
