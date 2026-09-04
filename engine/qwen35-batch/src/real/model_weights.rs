@@ -3793,10 +3793,14 @@ impl GatedAttentionLayer {
             // нашли раньше и вылечили тем же способом (см. ветку seq_len == 1 выше).
             // Память не страдает: chunked-путь держит [256 × kv_len], в F32 это
             // 120 МБ на чанк вместо 60 — на порядок меньше весов модели.
-            let attn_dtype = if q.device().is_cuda() {
-                DType::F32
-            } else {
+            // F16 остаётся только на Metal (там это про память); CPU считает в
+            // F32 — иначе он не годится как эталон: сверка 2026-09-04 показала
+            // расхождение CUDA↔CPU с первого attention-слоя (1.1% при 1654
+            // токенах) при побитовом совпадении всех DeltaNet-слоёв.
+            let attn_dtype = if q.device().is_metal() {
                 DType::F16
+            } else {
+                DType::F32
             };
             let q = q.to_dtype(attn_dtype)?.contiguous()?;
             let k = k.to_dtype(attn_dtype)?.contiguous()?;
