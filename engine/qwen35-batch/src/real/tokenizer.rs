@@ -18,8 +18,8 @@ use super::multimodal::{self, IMAGE_PAD_TOKEN_ID, VIDEO_PAD_TOKEN_ID};
 /// контейнер .ytf: у второго внутри лежит готовый tokenizer.json, и читатель
 /// разворачивает его в тот же ключ `tokenizer.huggingface.json`.
 pub fn load_from_gguf_path(path: &std::path::Path) -> Result<Tokenizer> {
-    let (ct, _mmap) = super::ytf16::content_any_path(path)
-        .map_err(|e| anyhow!("read model: {e}"))?;
+    let (ct, _mmap) =
+        super::ytf16::content_any_path(path).map_err(|e| anyhow!("read model: {e}"))?;
     load_from_gguf(&ct.metadata)
 }
 
@@ -47,6 +47,14 @@ pub fn load_from_gguf(metadata: &HashMap<String, gguf_file::Value>) -> Result<To
     }
     build_from_ggml_keys(metadata)
 }
+
+/// Пре-токенизатор Qwen2/Qwen3.x: регексп из tokenizer.json модели (и из
+/// llama.cpp, LLAMA_VOCAB_PRE_TYPE_QWEN2), затем ByteLevel без собственного
+/// регекспа — ровно как в оригинальном tokenizer.json Qwen.
+const QWEN2_PRE_TOKENIZER: &str = r#"{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]}"#;
+
+const BYTE_LEVEL_DECODER: &str =
+    r#"{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}"#;
 
 fn build_from_ggml_keys(metadata: &HashMap<String, gguf_file::Value>) -> Result<Tokenizer> {
     let tokens_val = metadata
@@ -152,12 +160,39 @@ fn build_from_ggml_keys(metadata: &HashMap<String, gguf_file::Value>) -> Result<
         .and_then(|value| value.to_string().ok())
         .map(String::as_str)
         .unwrap_or("gpt2");
+    // `tokenizer.ggml.pre` задаёт пре-токенизацию — регексп, которым текст
+    // режется на куски ДО BPE. Раньше поле игнорировалось и для всех моделей
+    // брался регексп GPT-2 (ByteLevel use_regex=true). Для Qwen он другой:
+    // `[^\r\n\p{L}\p{N}]?\p{L}+` клеит ведущий символ к слову (`_dev`,
+    // `-dev` — один токен), `\s*[\r\n]+` держит `\n\n` целиком, цифры идут
+    // по одной. Сверка 2026-09-04 с llama.cpp на одном и том же тексте 18 КБ:
+    // 4452 токена у нас против 4208 — модель видела не тот ряд токенов, что в
+    // обучении, отсюда и подмены вроде `inline-flex` -> `inline-rect`.
+    // Список имён — как в llama.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN2).
+    let tokenizer_pre = metadata
+        .get("tokenizer.ggml.pre")
+        .and_then(|value| value.to_string().ok())
+        .map(String::as_str)
+        .unwrap_or("default");
     let (pre_tokenizer, decoder) = if tokenizer_model == "gemma4" {
         // Gemma 4 uses SPM-style BPE: raw UTF-8, spaces become U+2581,
         // then merges run over the complete text (no GPT-2 byte mapping).
         let metaspace =
             r#"{"type":"Metaspace","replacement":"▁","prepend_scheme":"never","split":false}"#;
         (metaspace, metaspace)
+    } else if matches!(
+        tokenizer_pre,
+        "qwen2"
+            | "qwen35"
+            | "refact"
+            | "command-r"
+            | "deepseek-r1-qwen"
+            | "kormo"
+            | "f2llmv2"
+            | "hunyuan"
+            | "solar-open"
+    ) {
+        (QWEN2_PRE_TOKENIZER, BYTE_LEVEL_DECODER)
     } else {
         let byte_level =
             r#"{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}"#;
@@ -521,5 +556,37 @@ mod tests {
             build_chatml_text(&messages),
             "<|im_start|>system\nsystem<|im_end|>\n<|im_start|>user\nПривет<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod pre_tokenizer_tests {
+    use super::QWEN2_PRE_TOKENIZER;
+    use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+    use tokenizers::tokenizer::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer};
+
+    fn splits(text: &str) -> Vec<String> {
+        let pre: PreTokenizerWrapper = serde_json::from_str(QWEN2_PRE_TOKENIZER).unwrap();
+        let mut s = PreTokenizedString::from(text);
+        pre.pre_tokenize(&mut s).unwrap();
+        s.get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .into_iter()
+            .map(|(piece, _, _)| piece.to_string())
+            .collect()
+    }
+
+    /// Ровно те три расхождения, что дали 4452 токена против 4208 у llama.cpp
+    /// на одном тексте: `\n\n` целиком, ведущий `_`/`-` клеится к слову.
+    /// ByteLevel внутри уже отобразил байты в GPT-2-алфавит (`Ċ` = `\n`).
+    #[test]
+    fn qwen2_regex_matches_llama_cpp_splits() {
+        assert_eq!(splits("\n\nYou"), vec!["ĊĊ", "You"]);
+        assert_eq!(splits("a_dev"), vec!["a", "_dev"]);
+        assert_eq!(splits("pi-dev"), vec!["pi", "-dev"]);
+        // А вот после пробела дефис уходит в ` ?[^\s\p{L}\p{N}]+` вместе с
+        // пробелом, и слово остаётся отдельно — так же режет и llama.cpp.
+        assert_eq!(splits("x -dev"), vec!["x", "Ġ-", "dev"]);
+        // Цифры — по одной, как у Qwen (GPT-2 склеил бы `123`).
+        assert_eq!(splits("v123"), vec!["v", "1", "2", "3"]);
     }
 }
