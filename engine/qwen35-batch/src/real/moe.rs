@@ -8,6 +8,19 @@ use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{ops::softmax_last_dim, Linear};
 use std::sync::Arc;
 
+// Выгрузка экспертов (план 2026-09-04-moe-expert-offload, фаза 2).
+#[cfg(feature = "cuda")]
+use super::expert_store::{MoeRuntime, SharedLayerStore};
+
+/// Где лежат маршрутизируемые эксперты MoE (PD-002).
+pub enum ExpertWeights {
+    /// Упакованные VRAM-тензоры: Reference-бэкенд и резидентный Ptx-путь.
+    Packed(PackedExperts),
+    /// Хранилище слоя при выгрузке (pinned host + таблицы указателей).
+    #[cfg(feature = "cuda")]
+    Store(SharedLayerStore),
+}
+
 // ─── Forward mode ─────────────────────────────────────────────────────────────
 
 /// Distinguishes chunked prefill from batched decode.
@@ -328,11 +341,16 @@ fn silu_div(xs: &Tensor) -> Result<Tensor> {
 /// Qwen3.6 MoE feed-forward block.
 pub struct Qwen35MoeBlock {
     router: MoeRouter,
-    routed: PackedExperts,
+    pub(crate) routed: ExpertWeights,
     shared: SharedExpert,
     backend: MoeBackend,
     #[allow(dead_code)]
     cfg: Qwen35MoeConfig,
+    /// Индекс слоя ствола (след маршрутизации, стейджинг префила).
+    layer_idx: usize,
+    /// Общий рантайм MoE модели (след + стейджинг) — только при выгрузке.
+    #[cfg(feature = "cuda")]
+    runtime: Option<Arc<MoeRuntime>>,
 }
 
 impl Qwen35MoeBlock {
@@ -345,10 +363,36 @@ impl Qwen35MoeBlock {
     ) -> Self {
         Self {
             router,
+            routed: ExpertWeights::Packed(routed),
+            shared,
+            backend,
+            cfg,
+            layer_idx: usize::MAX,
+            #[cfg(feature = "cuda")]
+            runtime: None,
+        }
+    }
+
+    /// Полный конструктор: `new()` делегирует сюда с упакованными весами.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_weights(
+        cfg: Qwen35MoeConfig,
+        router: MoeRouter,
+        routed: ExpertWeights,
+        shared: SharedExpert,
+        backend: MoeBackend,
+        layer_idx: usize,
+        runtime: Option<Arc<MoeRuntime>>,
+    ) -> Self {
+        Self {
+            router,
             routed,
             shared,
             backend,
             cfg,
+            layer_idx,
+            runtime,
         }
     }
 
@@ -361,15 +405,22 @@ impl Qwen35MoeBlock {
 
         #[cfg(feature = "cuda")]
         if matches!(self.backend, MoeBackend::Ptx) && xs.device().is_cuda() {
-            let combined = self.forward_ptx_cuda(&xs_2d)?;
+            let combined = self.forward_ptx_cuda(&xs_2d, mode)?;
             return combined.reshape((batch, seq_len, n_embd));
         }
 
         let route = self.router.route_topk(&xs_2d)?;
         let t0 = std::time::Instant::now();
-        let routed = self
-            .backend
-            .routed_swiglu(&xs_2d, &self.routed, &route, mode)?;
+        // Reference/legacy-путь работает только с упакованными весами;
+        // хранилище выгрузки ходит через forward_ptx_cuda.
+        let packed = match &self.routed {
+            ExpertWeights::Packed(p) => p,
+            #[cfg(feature = "cuda")]
+            ExpertWeights::Store(_) => {
+                candle_core::bail!("хранилище выгрузки не поддерживает reference-бэкенд (FR-009)")
+            }
+        };
+        let routed = self.backend.routed_swiglu(&xs_2d, packed, &route, mode)?;
         let shared = self.shared.forward(&xs_2d)?;
         if crate::scheduler::trace_on() && matches!(self.backend, MoeBackend::Ptx) {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -394,12 +445,18 @@ impl Qwen35MoeBlock {
 
     /// Полностью GPU-путь (CUDA): router → GPU softmax+topk kernel →
     /// dual indexed GEMM (gate+up) → SwiGLU → down → weighted sum.
-    /// Без единого D2H/H2D round-trip (раньше: ~120 синков/шаг на 40 блоков).
+    /// Декод — без единого D2H/H2D round-trip; ids шага копируются в след
+    /// маршрутизации (PD-003). При выгрузке (FR-004) ядра читают промахи
+    /// zero-copy из pinned-памяти через таблицы указателей; префил (FR-005)
+    /// идёт через стейджинг: один D2H ids на слой на чанк, подъём union,
+    /// таблицы на время слоя.
     #[cfg(feature = "cuda")]
-    fn forward_ptx_cuda(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward_ptx_cuda(&self, xs: &Tensor, mode: ForwardMode) -> Result<Tensor> {
+        use candle_core::quantized::{indexed_moe_forward_dual_table, indexed_moe_forward_table};
         let k = self.router.n_experts_per_tok;
         let device = xs.device();
         let cuda_dev = device.as_cuda_device()?;
+        let (n_tokens, _) = xs.dims2()?;
 
         // Router на GPU.
         let logits = self
@@ -408,31 +465,113 @@ impl Qwen35MoeBlock {
             .forward(xs)?
             .to_dtype(DType::F32)?
             .contiguous()?;
+        // След пишется только на декоде (префил ходит своими temp-ids).
+        let trace = match (&self.runtime, mode) {
+            (Some(rt), ForwardMode::DecodeBatch) => Some((rt.clone(), self.layer_idx)),
+            _ => None,
+        };
         let (ids_t, w_t) = gpu_softmax_topk(
             cuda_dev,
             &logits,
             self.router.n_experts,
             k,
             self.router.norm_topk_prob,
+            trace.as_ref().map(|(rt, layer)| (rt.as_ref(), *layer)),
         )?;
 
         // Shared input [tokens, 1, n_embd]. Indexed kernels reuse each token row
         // across top-k routes; materializing [tokens, k, n_embd] wastes 8x memory.
         let x3 = xs.to_dtype(DType::F32)?.unsqueeze(1)?.contiguous()?;
 
-        // gate+up одним dual GEMM.
-        let (gate, up) =
-            self.routed
-                .gate
-                .indexed_moe_forward_dual_cuda(&self.routed.up, &x3, &ids_t)?;
-        let act = gate.silu()?.mul(&up)?.contiguous()?;
-        let down = self.routed.down.indexed_moe_forward_cuda(&act, &ids_t)?; // [tokens, topk, n_embd]
-
         // Взвешивание GPU-весами + редукция по topk.
-        let w = w_t.unsqueeze(candle_core::D::Minus1)?; // [tokens, topk, 1]
-        let routed = down.broadcast_mul(&w)?.sum(candle_core::D::Minus2)?;
-        let shared = self.shared.forward(xs)?;
-        routed.broadcast_add(&shared)
+        let weighted_sum = |down: Tensor, w_t: &Tensor| -> Result<Tensor> {
+            let w = w_t.unsqueeze(candle_core::D::Minus1)?; // [tokens, topk, 1]
+            down.broadcast_mul(&w)?.sum(candle_core::D::Minus2)
+        };
+        let add_shared = |routed: Tensor, xs: &Tensor| -> Result<Tensor> {
+            let shared = self.shared.forward(xs)?;
+            routed.broadcast_add(&shared)
+        };
+
+        match (&self.routed, mode) {
+            (ExpertWeights::Store(store), ForwardMode::DecodeBatch) => {
+                let store = store.lock().expect("expert layer store");
+                let (g_shape, d_shape) = store.shapes();
+                // gate+up одним dual GEMM; промахи ядро читает zero-copy.
+                let (gate, up) = indexed_moe_forward_dual_table(
+                    cuda_dev,
+                    store.gate.dtype,
+                    g_shape,
+                    store.gate.table(),
+                    store.up.table(),
+                    &x3,
+                    &ids_t,
+                )?;
+                let act = gate.silu()?.mul(&up)?.contiguous()?;
+                let down = indexed_moe_forward_table(
+                    cuda_dev,
+                    store.down.dtype,
+                    d_shape,
+                    store.down.table(),
+                    &act,
+                    &ids_t,
+                )?; // [tokens, topk, n_embd]
+                drop(store);
+                add_shared(weighted_sum(down, &w_t)?, xs)
+            }
+            (ExpertWeights::Store(store), ForwardMode::Prefill) => {
+                let runtime = self.runtime.as_ref().ok_or_else(|| {
+                    candle_core::Error::Msg("moe runtime отсутствует при выгрузке".to_string())
+                })?;
+                let staging = runtime.staging().ok_or_else(|| {
+                    candle_core::Error::Msg(
+                        "стейджинг не выделен: init_paged_decode должен пройти раньше первого префила (PD-010)"
+                            .to_string(),
+                    )
+                })?;
+                let mut store = store.lock().expect("expert layer store");
+                // FR-005: один D2H ids на слой на чанк.
+                let ids_host = ids_t
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<u32>()?;
+                store.prefill_prepare_layer(cuda_dev, staging, &ids_host)?;
+                let (g_shape, d_shape) = store.shapes();
+                let (gate, up) = indexed_moe_forward_dual_table(
+                    cuda_dev,
+                    store.gate.dtype,
+                    g_shape,
+                    store.gate.table(),
+                    store.up.table(),
+                    &x3,
+                    &ids_t,
+                )?;
+                let act = gate.silu()?.mul(&up)?.contiguous()?;
+                let down = indexed_moe_forward_table(
+                    cuda_dev,
+                    store.down.dtype,
+                    d_shape,
+                    store.down.table(),
+                    &act,
+                    &ids_t,
+                )?;
+                // Таблицы слоя возвращаются на host до следующих шагов —
+                // memcpy в том же stream, упорядочено после ядер.
+                store.prefill_release_layer(cuda_dev)?;
+                drop(store);
+                add_shared(weighted_sum(down, &w_t)?, xs)
+            }
+            (ExpertWeights::Packed(packed), _) => {
+                // Резидентный путь: те же ядра через ленивую таблицу упаковки.
+                let (gate, up) =
+                    packed
+                        .gate
+                        .indexed_moe_forward_dual_cuda(&packed.up, &x3, &ids_t)?;
+                let act = gate.silu()?.mul(&up)?.contiguous()?;
+                let down = packed.down.indexed_moe_forward_cuda(&act, &ids_t)?; // [tokens, topk, n_embd]
+                add_shared(weighted_sum(down, &w_t)?, xs)
+            }
+        }
     }
 
     /// Config accessor for diagnostics / adapter reporting.
@@ -635,6 +774,8 @@ pub fn f32_qtensor(t: &Tensor) -> Result<Arc<QTensor>> {
 
 /// Stable softmax+topk на GPU: logits [n_tokens, n_experts] F32 →
 /// (ids [n_tokens, k] u32, weights [n_tokens, k] f32) — без D2H.
+/// `trace` — (рантайм MoE, индекс слоя): после ядра ids копируются в
+/// постоянный буфер следа (PD-003) — d2d копия захватывается в граф.
 #[cfg(feature = "cuda")]
 fn gpu_softmax_topk(
     dev: &candle_core::CudaDevice,
@@ -642,6 +783,7 @@ fn gpu_softmax_topk(
     n_experts: usize,
     topk: usize,
     norm_topk_prob: bool,
+    trace: Option<(&super::expert_store::MoeRuntime, usize)>,
 ) -> Result<(Tensor, Tensor)> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     let (n_tokens, _) = logits.dims2()?;
@@ -680,6 +822,11 @@ fn gpu_softmax_topk(
     }
     drop(l_st);
 
+    // PD-003: ids шага → постоянный буфер следа (d2d, захватывается в граф).
+    if let Some((runtime, layer)) = trace {
+        runtime.trace.copy_in(dev, layer, &ids, n_tokens)?;
+    }
+
     let ids_storage = candle_core::CudaStorage::wrap_cuda_slice(ids, dev.clone());
     let ids_t = Tensor::from((candle_core::Storage::Cuda(ids_storage), (n_tokens, topk)));
     let w_storage = candle_core::CudaStorage::wrap_cuda_slice(weights, dev.clone());
@@ -706,7 +853,7 @@ mod cuda_router_tests {
             .collect();
         let logits_t = Tensor::from_slice(&logits, (n_tokens, n_experts), &device)?;
         let (ids, weights) =
-            gpu_softmax_topk(device.as_cuda_device()?, &logits_t, n_experts, topk, true)?;
+            gpu_softmax_topk(device.as_cuda_device()?, &logits_t, n_experts, topk, true, None)?;
         let ids = ids.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
         let weights = weights.to_device(&Device::Cpu)?.to_vec2::<f32>()?;
 

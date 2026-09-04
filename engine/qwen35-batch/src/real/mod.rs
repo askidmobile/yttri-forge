@@ -6,6 +6,10 @@
 //! но standalone crate не зависит от Tauri.
 
 pub mod adapter;
+// Выгрузка экспертов MoE (план 2026-09-04-moe-expert-offload): CUDA-модуль —
+// pinned host + таблицы указателей + след маршрутизации.
+#[cfg(feature = "cuda")]
+pub mod expert_store;
 #[cfg(feature = "cuda")]
 pub mod delta_rule_cuda;
 /// Phase 2: true batched decode (ось slot B) — CUDA.

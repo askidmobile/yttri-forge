@@ -306,6 +306,22 @@ fn pgraph_mode() -> PgraphMode {
     *MODE.get_or_init(|| parse_pgraph_mode(std::env::var("PGRAPH").ok().as_deref()))
 }
 
+/// Эффективный режим PGRAPH: при выгрузке экспертов графовый префил
+/// принудительно выключается (FR-007) — явный PGRAPH=on не ошибка, а WARN.
+#[cfg(feature = "cuda")]
+fn pgraph_mode_effective(experts_ram: bool) -> PgraphMode {
+    let mode = pgraph_mode();
+    if experts_ram && mode != PgraphMode::Off {
+        static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        WARNED.get_or_init(|| {
+            log::warn!("[pg] disabled: experts in ram (prefill needs per-layer promotion)")
+        });
+        PgraphMode::Off
+    } else {
+        mode
+    }
+}
+
 #[cfg(feature = "cuda")]
 fn parse_pgraph_mode(value: Option<&str>) -> PgraphMode {
     match value {
@@ -538,14 +554,14 @@ impl Qwen35BatchAdapter {
 
         // Загрузка весов (zero-copy на Metal, обычный путь на CPU).
         #[cfg(target_os = "macos")]
-        let model = if matches!(device, Device::Metal(_)) {
+        let mut model = if matches!(device, Device::Metal(_)) {
             ModelWeights::from_gguf_zero_copy(ct, mmap, &device)
                 .map_err(|e| anyhow!("load weights zero-copy: {e}"))?
         } else {
             ModelWeights::from_gguf(ct, mmap, &device).map_err(|e| anyhow!("load weights: {e}"))?
         };
         #[cfg(not(target_os = "macos"))]
-        let model =
+        let mut model =
             ModelWeights::from_gguf(ct, mmap, &device).map_err(|e| anyhow!("load weights: {e}"))?;
 
         // После загрузки весов пул держит reserved-страницы от upload staging.
@@ -553,6 +569,16 @@ impl Qwen35BatchAdapter {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(c) = &device {
             let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+        }
+        // PD-010: при выгрузке экспертов пул KV и стейджинг создаются сразу
+        // при загрузке — иначе кэш (фаза 4) заберёт память пула.
+        #[cfg(feature = "cuda")]
+        let moe_experts_ram = model.experts_ram();
+        #[cfg(feature = "cuda")]
+        if moe_experts_ram {
+            model
+                .prepare_expert_offload(&device)
+                .map_err(|e| anyhow!("prepare expert offload: {e}"))?;
         }
 
         // F16-GEMM сайдкара по умолчанию аккумулирует в F32 (как в pytorch).
@@ -1870,8 +1896,16 @@ impl Qwen35BatchAdapter {
     /// Возвращает (логиты графа, использовать_ли_их_как_результат).
     #[cfg(feature = "cuda")]
     fn prefill_try_graphed(&mut self, chunk: &PrefillChunk) -> Result<(Option<Vec<f32>>, bool)> {
+        #[cfg(feature = "cuda")]
+        let moe_ram = self.model.experts_ram();
+        #[cfg(feature = "cuda")]
+        let mode = pgraph_mode_effective(moe_ram);
+        #[cfg(not(feature = "cuda"))]
         let mode = pgraph_mode();
-        if mode == PgraphMode::Off {
+        // FR-007: при выгрузке эффективный режим Off (захвата префила нет),
+        // но пейджед-прогрев обязан выполняться (KV в пуле) — потому bail
+        // только вне выгрузки; внутренний гейт решает остальное.
+        if mode == PgraphMode::Off && !moe_ram {
             self.prefill_path[chunk.slot_idx] = PrefillPath::Eager;
             return Ok((None, false));
         }
@@ -1949,7 +1983,14 @@ impl Qwen35BatchAdapter {
     #[cfg(feature = "cuda")]
     fn prefill_chunk_graphed(&mut self, chunk: &PrefillChunk) -> Result<Option<Vec<f32>>> {
         let slot = chunk.slot_idx;
-        if pgraph_mode() == PgraphMode::Off {
+        #[cfg(feature = "cuda")]
+        let moe_ram = self.model.experts_ram();
+        #[cfg(feature = "cuda")]
+        // FR-007: захвата графового префила при выгрузке нет (WARN уже дан),
+        // но KV обязан идти в paged pool — иначе миграция int8 запрещена и
+        // графы декода не захватятся. Поэтому при выгрузке пейджед-прогрев
+        // без захвата выполняется независимо от PGRAPH.
+        if pgraph_mode_effective(moe_ram) == PgraphMode::Off && !moe_ram {
             self.prefill_path[slot] = PrefillPath::Eager;
             return Ok(None);
         }
@@ -1958,6 +1999,7 @@ impl Qwen35BatchAdapter {
         };
         let t = chunk.tokens.len();
         // Промпт уже пошёл по eager — назад дороги нет: строки посчитанных
+        // чанков в пул не попали, и append оставил бы там дыру.
         // чанков в пул не попали, и append оставил бы там дыру.
         if self.prefill_path[slot] == PrefillPath::Eager {
             return Ok(None);
@@ -2252,7 +2294,10 @@ impl Qwen35BatchAdapter {
                 drop(logits);
                 // Хвост короче порога: результат уже посчитан прогревочным
                 // проходом, KV в пуле, состояние консистентно — захват не нужен.
-                if !verify && t < pgraph_min_capture_t() {
+                // FR-007: при выгрузке экспертов захват подавлен всегда —
+                // каждый чанк идёт пейджед-проходом (KV в пуле, MoE-слои через
+                // стейджинг), декод-графы захватываются без миграции int8.
+                if !verify && (t < pgraph_min_capture_t() || self.model.experts_ram()) {
                     return Ok((flat, prime_hidden, false));
                 }
                 // Пул полон — новую форму не захватываем: вытеснение роняло

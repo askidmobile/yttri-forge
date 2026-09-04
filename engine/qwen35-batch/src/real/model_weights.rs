@@ -764,16 +764,25 @@ fn sigmoid_scalar(x: f32) -> f32 {
 // QuantizedEmbedding — embedding lookup прямо из Q4 данных, без деквантизации всей таблицы
 // ════════════════════════════════════════════════════════════════════════════════
 
+/// Источник байтов embedding: file-backed mmap (zero-copy) или обычная RAM.
+#[derive(Clone)]
+enum EmbedBacking {
+    Mmap(Arc<memmap2::Mmap>),
+    Ram(Arc<Vec<u8>>),
+}
+
 /// Quantized embedding table: хранит сырые Q4 данные (~83 МБ) вместо f16 (297 МБ).
 ///
 /// В forward() деквантизирует только нужные строки (для seq=2048 → 2048 строк × 4.5 КБ = 9 МБ).
 /// Это экономит ~214 МБ постоянной памяти vs pre-dequantized f16 Embedding.
 #[derive(Clone)]
 struct QuantizedEmbedding {
-    /// mmap'd GGUF файл — shared reference. Embedding читает данные напрямую из file-backed pages.
-    /// Это TRUE zero-copy: нет heap allocation для embedding данных.
-    mmap: Arc<memmap2::Mmap>,
-    /// Смещение данных embedding в mmap
+    /// Источник байтов: file-backed mmap (default) или обычная RAM — копия,
+    /// сделанная при загрузке. При выгрузке экспертов (FR-001) embedding
+    /// держится в RAM: под давлением памяти (pinned + prefix cache) страницы
+    /// mmap-файла вытесняются на диск, и каждый токен уходил бы в page fault.
+    backing: EmbedBacking,
+    /// Смещение данных embedding внутри источника
     data_offset: usize,
     /// Длина данных embedding в байтах
     data_len: usize,
@@ -799,10 +808,14 @@ impl std::fmt::Debug for QuantizedEmbedding {
 }
 
 impl QuantizedEmbedding {
-    /// Доступ к raw данным embedding (sub-slice mmap).
+    /// Доступ к raw данным embedding (sub-slice источника).
     #[inline]
     fn raw_data(&self) -> &[u8] {
-        &self.mmap[self.data_offset..self.data_offset + self.data_len]
+        let full: &[u8] = match &self.backing {
+            EmbedBacking::Mmap(m) => m,
+            EmbedBacking::Ram(v) => v,
+        };
+        &full[self.data_offset..self.data_offset + self.data_len]
     }
 
     /// Создание из mmap — TRUE zero-copy.
@@ -847,7 +860,7 @@ impl QuantizedEmbedding {
         );
 
         Ok(Self {
-            mmap,
+            backing: EmbedBacking::Mmap(mmap),
             data_offset,
             data_len,
             ggml_dtype,
@@ -855,6 +868,31 @@ impl QuantizedEmbedding {
             n_rows,
             n_cols,
         })
+    }
+
+    /// Копия embedding в обычную RAM (FR-001): байты читаются из mmap один
+    /// раз при загрузке; дальше file-backed страницы не нужны.
+    fn from_ram_copy(
+        mmap: &Arc<memmap2::Mmap>,
+        tensor_info: &gguf_file::TensorInfo,
+        tensor_data_offset: u64,
+    ) -> Result<Self> {
+        let mut emb = Self::from_mmap(Arc::clone(mmap), tensor_info, tensor_data_offset)?;
+        let (offset, len) = emb.raw_range();
+        // Копия начинается с нуля: data_offset сбрасывается (offset был
+        // абсолютным смещением в файле).
+        emb.backing = EmbedBacking::Ram(Arc::new(mmap[offset..offset + len].to_vec()));
+        emb.data_offset = 0;
+        log::info!(
+            "[moe] token_embd: {:.1} МиБ скопированы в RAM (FR-001)",
+            len as f64 / 1024.0 / 1024.0
+        );
+        Ok(emb)
+    }
+
+    /// Диапазон данных embedding внутри источника.
+    fn raw_range(&self) -> (usize, usize) {
+        (self.data_offset, self.data_len)
     }
 
     /// Пустой embedding без mmap. Используется на CUDA GPU_ONLY когда
@@ -877,7 +915,7 @@ impl QuantizedEmbedding {
         let f = std::fs::File::open(&tmp).expect("open temp");
         let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&f) }.expect("mmap temp"));
         Self {
-            mmap,
+            backing: EmbedBacking::Mmap(mmap),
             data_offset: 0,
             data_len: 0,
             ggml_dtype: candle_core::quantized::GgmlDType::Q8_0,
@@ -5733,6 +5771,10 @@ pub struct ModelWeights {
     /// Признак, что хотя бы один decode уже подготовил paged pools у attention слоёв.
     #[cfg(feature = "cuda")]
     pub(crate) paged_ready: bool,
+    /// Рантайм выгрузки экспертов MoE (план 2026-09-04-moe-expert-offload):
+    /// след маршрутизации + стейджинг. Только при ram-размещении (FR-001).
+    #[cfg(feature = "cuda")]
+    pub(crate) moe_runtime: Option<Arc<super::expert_store::MoeRuntime>>,
     /// GPU-профайлер graphed decode: 4 CUDA events (start / после emb / после блоков / после head).
     #[cfg(feature = "cuda")]
     pub(crate) gprof_events: Option<[cudarc::driver::sys::CUevent; 4]>,
@@ -5742,6 +5784,58 @@ pub struct ModelWeights {
 }
 
 impl ModelWeights {
+    /// Рантайм выгрузки (Some — эксперты в RAM, FR-001).
+    #[cfg(feature = "cuda")]
+    pub fn moe_runtime(&self) -> Option<&Arc<super::expert_store::MoeRuntime>> {
+        self.moe_runtime.as_ref()
+    }
+
+    /// Хранилища MoE-слоёв (для выделения стейджинга и наблюдаемости).
+    #[cfg(feature = "cuda")]
+    pub fn moe_stores(&self) -> Vec<super::expert_store::SharedLayerStore> {
+        let mut out = Vec::new();
+        for block in &self.blocks {
+            if let FeedForward::Moe(moe) = &block.ff {
+                if let super::moe::ExpertWeights::Store(store) = &moe.routed {
+                    out.push(store.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Эксперты выгружены в RAM? (для адаптера: PGRAPH off с WARN, сводка.)
+    #[cfg(feature = "cuda")]
+    pub fn experts_ram(&self) -> bool {
+        self.moe_runtime.is_some()
+    }
+
+    /// PD-010: пул KV сразу при загрузке, затем стейджинг (пул → стейджинг →
+    /// кэш фазы 4). Вызывается адаптером после загрузки при ram-размещении.
+    #[cfg(feature = "cuda")]
+    pub fn prepare_expert_offload(&mut self, device: &Device) -> Result<()> {
+        let runtime = match &self.moe_runtime {
+            Some(rt) => rt.clone(),
+            None => return Ok(()),
+        };
+        // 1. Пул на объявленный CTX — до стейджинга и кэша (D-008).
+        self.init_paged_decode(device)?;
+        // 2. Стейджинг из остатка (fail-closed при нехватке).
+        let mut max = [0usize; 3];
+        for store in self.moe_stores() {
+            let s = store.lock().expect("expert layer store");
+            max[0] = max[0].max(s.gate.expert_bytes * s.gate.n_experts);
+            max[1] = max[1].max(s.up.expert_bytes * s.up.n_experts);
+            max[2] = max[2].max(s.down.expert_bytes * s.down.n_experts);
+        }
+        if let Device::Cuda(c) = device {
+            let _ = crate::real::paged_kv_cuda::kv_pool_is_q8(); // прогрев флага
+            let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+            runtime.alloc_staging(c, max)?;
+        }
+        Ok(())
+    }
+
     /// Загрузить модель из GGUF файла.
     ///
     /// `mmap` — Arc на mmap'd GGUF файл. Embedding хранит ссылку (zero-copy),
@@ -6259,10 +6353,120 @@ impl ModelWeights {
             full_attention_interval,
         );
 
-        // Token embeddings — zero-copy из mmap
+        // FR-009: MOE_EXPERTS=vram|ram|auto (default auto). Решение один раз
+        // при загрузке, числа и причина в лог; fail-closed (FR-008).
+        // На не-CUDA `ram` отвергается: там единая память, выгрузке некуда идти.
+        #[cfg(not(feature = "cuda"))]
+        let moe_experts_ram = if is_moe
+            && matches!(std::env::var("MOE_EXPERTS").ok().as_deref(), Some("ram"))
+        {
+            candle_core::bail!(
+                "MOE_EXPERTS=ram поддерживается только на CUDA (FR-009); на Metal/CPU единая память"
+            );
+        } else {
+            false
+        };
+        let requested_moe_backend = std::env::var("MOE_BACKEND").ok();
+        #[cfg(feature = "cuda")]
+        let (moe_experts_ram, moe_experts_bytes, n_moe_layers) = if is_moe && device.is_cuda() {
+            let cuda_dev = device.as_cuda_device()?;
+            let mtp_on = std::env::var("MTP").as_deref() == Ok("1");
+            let mut experts_bytes: u64 = 0;
+            let mut trunk_bytes: u64 = 0;
+            for (name, info) in ct.tensor_infos.iter() {
+                let size = (info.shape.elem_count() / info.ggml_dtype.block_size()
+                    * info.ggml_dtype.type_size()) as u64;
+                let layer = name
+                    .strip_prefix("blk.")
+                    .and_then(|r| r.split('.').next())
+                    .and_then(|i| i.parse::<usize>().ok());
+                let is_exps = name.contains(".ffn_gate_exps.")
+                    || name.contains(".ffn_up_exps.")
+                    || name.contains(".ffn_down_exps.");
+                let is_nextn = layer.map(|l| l >= block_count).unwrap_or(false);
+                if is_nextn && !mtp_on {
+                    continue; // nextn не грузится при MTP=0
+                }
+                if is_exps {
+                    experts_bytes += size;
+                } else if !name.starts_with("token_embd") {
+                    trunk_bytes += size; // output/внимание/DeltaNet/роутеры/shared — VRAM
+                }
+            }
+            let n_moe_layers = (0..block_count)
+                .filter(|i| {
+                    ct.tensor_infos
+                        .contains_key(&format!("blk.{i}.ffn_gate_exps.weight"))
+                })
+                .count();
+            let prefix_cache_mib = std::env::var("PREFIX_CACHE_MIB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(8192);
+            let requested_moe_backend = std::env::var("MOE_BACKEND").ok();
+            let requested =
+                super::expert_store::parse_placement(std::env::var("MOE_EXPERTS").ok().as_deref())?;
+            if requested == super::expert_store::ExpertPlacement::Ram
+                && requested_moe_backend.as_deref() == Some("reference")
+            {
+                candle_core::bail!(
+                    "MOE_EXPERTS=ram вместе с MOE_BACKEND=reference: выгрузка существует только для PTX-пути (FR-009)"
+                );
+            }
+            let (ram, reason) = match requested {
+                super::expert_store::ExpertPlacement::Vram => {
+                    (false, "запрошено vram".to_string())
+                }
+                super::expert_store::ExpertPlacement::Ram => {
+                    super::expert_store::check_host_ram_free(experts_bytes, prefix_cache_mib)?;
+                    (true, "запрошено ram".to_string())
+                }
+                super::expert_store::ExpertPlacement::Auto => {
+                    let (free_vram, _total) = cuda_dev
+                        .cuda_stream()
+                        .context()
+                        .mem_get_info()
+                        .map_err(|e| candle_core::Error::Msg(format!("cuMemGetInfo: {e}")))?;
+                    let (ram, why) = super::expert_store::resolve_auto(
+                        free_vram as u64, trunk_bytes, experts_bytes,
+                    );
+                    if ram {
+                        super::expert_store::check_host_ram_free(experts_bytes, prefix_cache_mib)?;
+                    }
+                    (ram, format!("auto ({why})"))
+                }
+            };
+            log::info!(
+                "[moe] experts: {} — {:.0} МиБ pinned, {n_moe_layers} слоёв × {} экспертов; ствол на GPU {:.0} МиБ; {}",
+                if ram { "ram" } else { "vram" },
+                experts_bytes as f64 / 1024.0 / 1024.0,
+                moe_n_experts,
+                trunk_bytes as f64 / 1024.0 / 1024.0,
+                reason,
+            );
+            super::expert_store::set_resolved_placement(if ram {
+                super::expert_store::ResolvedPlacement::Ram
+            } else {
+                super::expert_store::ResolvedPlacement::Vram
+            });
+            (ram, experts_bytes, n_moe_layers)
+        } else {
+            (false, 0u64, 0usize)
+        };
+        // Token embeddings — zero-copy из mmap; при выгрузке экспертов (FR-001)
+        // — копия в обычную RAM: под давлением pinned+prefix cache страницы
+        // file-backed mmap вытесняются на диск, и каждый токен уходил бы в
+        // page fault.
         let emb_info = ct.tensor_infos.get("token_embd.weight").ok_or_else(|| {
             candle_core::Error::Msg("cannot find tensor info for token_embd.weight".into())
         })?;
+        #[cfg(feature = "cuda")]
+        let tok_embeddings = if moe_experts_ram {
+            QuantizedEmbedding::from_ram_copy(mmap, emb_info, ct.tensor_data_offset)?
+        } else {
+            QuantizedEmbedding::from_mmap(Arc::clone(mmap), emb_info, ct.tensor_data_offset)?
+        };
+        #[cfg(not(feature = "cuda"))]
         let tok_embeddings =
             QuantizedEmbedding::from_mmap(Arc::clone(mmap), emb_info, ct.tensor_data_offset)?;
 
@@ -6593,7 +6797,6 @@ impl ModelWeights {
         };
 
         // ── Загрузка слоёв ──
-        let requested_moe_backend = std::env::var("MOE_BACKEND").ok();
         let kv_cache_dtype = std::env::var("KV_CACHE_DTYPE").unwrap_or_else(|_| {
             if is_moe {
                 "q8".into()
@@ -6609,6 +6812,10 @@ impl ModelWeights {
         let use_q8_f16_kv_cache = kv_cache_dtype == "q8_f16";
         eprintln!("[{tag}] batched KV cache: {kv_cache_dtype}");
         let mut blocks = Vec::with_capacity(block_count);
+        // Рантайм MoE создаётся на первом MoE-слое и разделяется всеми блоками.
+        #[cfg(feature = "cuda")]
+        let moe_runtime_once: std::sync::OnceLock<Arc<super::expert_store::MoeRuntime>> =
+            std::sync::OnceLock::new();
         let load_start = std::time::Instant::now();
 
         for layer_idx in 0..block_count {
@@ -6647,16 +6854,23 @@ impl ModelWeights {
                     moe_norm_topk,
                 );
 
-                // Packed routed experts: Arc<QTensor> (not dequantized at load).
-                let gate = Arc::new(load_heavy(&format!("{prefix}.ffn_gate_exps.weight"))?);
-                let up = Arc::new(load_heavy(&format!("{prefix}.ffn_up_exps.weight"))?);
-                let down = Arc::new(load_heavy(&format!("{prefix}.ffn_down_exps.weight"))?);
-                let routed = PackedExperts {
-                    gate,
-                    up,
-                    down,
-                    n_experts: moe_n_experts,
-                };
+                // FR-001: маршрутизируемые эксперты при выгрузке идут в pinned
+                // host-память (device-mapped, без QTensor); иначе — VRAM.
+                // dtype берём из заголовка — он нужен и до загрузки.
+                let gate_info = ct
+                    .tensor_infos
+                    .get(&format!("{prefix}.ffn_gate_exps.weight"))
+                    .ok_or_else(|| candle_core::Error::Msg("нет ffn_gate_exps".into()))?;
+                let up_info = ct
+                    .tensor_infos
+                    .get(&format!("{prefix}.ffn_up_exps.weight"))
+                    .ok_or_else(|| candle_core::Error::Msg("нет ffn_up_exps".into()))?;
+                let down_info = ct
+                    .tensor_infos
+                    .get(&format!("{prefix}.ffn_down_exps.weight"))
+                    .ok_or_else(|| candle_core::Error::Msg("нет ffn_down_exps".into()))?;
+                let (gate_dtype, up_dtype, down_dtype) =
+                    (gate_info.ggml_dtype, up_info.ggml_dtype, down_info.ggml_dtype);
 
                 // Shared expert: scalar gate_inp (Linear) + SwiGLU gate/up/down (QMatMul).
                 let shexp_gate_inp_qt = load_heavy(&format!("{prefix}.ffn_gate_inp_shexp.weight"))?;
@@ -6687,11 +6901,112 @@ impl ModelWeights {
                 let backend = select_backend(
                     requested_moe_backend.as_deref(),
                     device.is_cuda(),
-                    routed.gate.dtype(),
-                    routed.up.dtype(),
-                    routed.down.dtype(),
+                    gate_dtype,
+                    up_dtype,
+                    down_dtype,
                 )?;
-                FeedForward::Moe(Qwen35MoeBlock::new(cfg, router, routed, shared, backend))
+                #[cfg(feature = "cuda")]
+                let ff = if moe_experts_ram {
+                    let cuda_dev = device.as_cuda_device()?;
+                    let load_experts = |name: &str,
+                                        info: &gguf_file::TensorInfo|
+                     -> Result<super::expert_store::ExpertMatrix> {
+                        let dims = info.shape.dims();
+                        if dims.len() != 3 {
+                            candle_core::bail!(
+                                "{name}: ожидается [n_experts, n, k], ранг {}",
+                                dims.len()
+                            );
+                        }
+                        let (start, size) = ct.tensor_byte_range(name)?;
+                        super::expert_store::ExpertMatrix::load(
+                            cuda_dev,
+                            info.ggml_dtype,
+                            dims[0],
+                            dims[1],
+                            dims[2],
+                            data,
+                            start,
+                            size,
+                        )
+                    };
+                    let store = super::expert_store::SharedLayerStore::new(std::sync::Mutex::new(
+                        super::expert_store::ExpertLayerStore {
+                            idx: layer_idx,
+                            gate: load_experts(
+                                &format!("{prefix}.ffn_gate_exps.weight"),
+                                gate_info,
+                            )?,
+                            up: load_experts(&format!("{prefix}.ffn_up_exps.weight"), up_info)?,
+                            down: load_experts(
+                                &format!("{prefix}.ffn_down_exps.weight"),
+                                down_info,
+                            )?,
+                        },
+                    ));
+                    let runtime = match moe_runtime_once.get() {
+                        Some(rt) => rt.clone(),
+                        None => {
+                            let cap = decode_capacity() as usize
+                                * (crate::scheduler::speculative_width() + 1);
+                            let rt = super::expert_store::MoeRuntime::new(
+                                cuda_dev,
+                                n_moe_layers,
+                                moe_n_experts_per_tok,
+                                cap,
+                                moe_experts_bytes,
+                            )?;
+                            let _ = moe_runtime_once.set(rt.clone());
+                            rt
+                        }
+                    };
+                    FeedForward::Moe(Qwen35MoeBlock::new_with_weights(
+                        cfg,
+                        router,
+                        super::moe::ExpertWeights::Store(store),
+                        shared,
+                        backend,
+                        layer_idx,
+                        Some(runtime),
+                    ))
+                } else {
+                    let gate = Arc::new(load_heavy(&format!("{prefix}.ffn_gate_exps.weight"))?);
+                    let up = Arc::new(load_heavy(&format!("{prefix}.ffn_up_exps.weight"))?);
+                    let down = Arc::new(load_heavy(&format!("{prefix}.ffn_down_exps.weight"))?);
+                    FeedForward::Moe(Qwen35MoeBlock::new_with_weights(
+                        cfg,
+                        router,
+                        super::moe::ExpertWeights::Packed(PackedExperts {
+                            gate,
+                            up,
+                            down,
+                            n_experts: moe_n_experts,
+                        }),
+                        shared,
+                        backend,
+                        layer_idx,
+                        moe_runtime_once.get().cloned(),
+                    ))
+                };
+                #[cfg(not(feature = "cuda"))]
+                let ff = {
+                    let gate = Arc::new(load_heavy(&format!("{prefix}.ffn_gate_exps.weight"))?);
+                    let up = Arc::new(load_heavy(&format!("{prefix}.ffn_up_exps.weight"))?);
+                    let down = Arc::new(load_heavy(&format!("{prefix}.ffn_down_exps.weight"))?);
+                    FeedForward::Moe(Qwen35MoeBlock::new(
+                        cfg,
+                        router,
+                        PackedExperts {
+                            gate,
+                            up,
+                            down,
+                            n_experts: moe_n_experts,
+                        },
+                        shared,
+                        backend,
+                    ))
+                };
+                ff
             } else {
                 // ── Dense SwiGLU MLP ──
                 let w1 = load_heavy(&format!("{prefix}.ffn_gate.weight"))?;
@@ -7163,6 +7478,8 @@ impl ModelWeights {
             // Unified arena инициализируется после build_model_common в from_gguf_zero_copy.
             #[cfg(target_os = "macos")]
             unified_arena: None,
+            #[cfg(feature = "cuda")]
+            moe_runtime: moe_runtime_once.get().cloned(),
             #[cfg(feature = "cuda")]
             paged_ctx: None,
             #[cfg(feature = "cuda")]

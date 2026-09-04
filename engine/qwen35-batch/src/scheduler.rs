@@ -75,11 +75,21 @@ pub const PREFILL_CHUNK: usize = 512;
 pub fn prefill_chunk_size() -> usize {
     static SZ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SZ.get_or_init(|| {
-        std::env::var("PREFILL_CHUNK")
+        let sz = std::env::var("PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(PREFILL_CHUNK)
+            .unwrap_or(PREFILL_CHUNK);
+        // FR-005: при выгрузке чанк не меньше 256 — иначе число синков и
+        // объём подъёмов на токен растут кратно.
+        #[cfg(feature = "cuda")]
+        let sz = if sz < 256 && crate::real::expert_store::experts_ram() {
+            log::info!("[moe] PREFILL_CHUNK={sz} < 256 при выгрузке — поднят до 256 (FR-005)");
+            256
+        } else {
+            sz
+        };
+        sz
     })
 }
 
