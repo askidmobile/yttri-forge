@@ -529,13 +529,11 @@ impl Qwen35Mtp {
         self.check_slot(slot)?;
         // FR-011: embed_tokens возвращает rank-2 [n_tok, H]; unsqueeze до
         // [1, n_tok, H] для dims3() ниже (rank fix независимо от вызывающего).
-        eprintln!("[mtp-dbg] catch_up: embeds rank={} shape={:?}", embeddings.dims().len(), embeddings.dims());
         let embeddings = if embeddings.dims().len() == 2 {
             embeddings.unsqueeze(0)?
         } else {
             embeddings.clone()
         };
-        eprintln!("[mtp-dbg] catch_up: after unsqueeze rank={}", embeddings.dims().len());
         let (_, seq, hidden) = embeddings.dims3()?;
         if target_hidden.dims() != [1, seq, self.profile.hidden_size] || hidden != self.profile.hidden_size {
             candle_core::bail!("MTP catch-up shape mismatch");
