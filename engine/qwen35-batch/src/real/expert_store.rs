@@ -1076,6 +1076,28 @@ impl CacheSystem {
                 "[moe] decode hit {rate:.1}% (последние {} шагов), префил поднял {pf} МиБ (окно)",
                 Self::LOG_EVERY
             );
+            // TRACE: аудит таблиц против директории — сколько записей gate
+            // реально указывают в host-память (zero-copy), а сколько в VRAM.
+            if crate::scheduler::trace_on() {
+                for &layer in &[0usize, self.layers / 2, self.layers.saturating_sub(1)] {
+                    let Some(store) = stores.get(layer) else { continue };
+                    let st = store.lock().expect("expert store");
+                    let n = st.gate.n_experts;
+                    let mut entries = vec![0u64; n];
+                    let table = st.gate.table();
+                    if dev.cuda_stream().memcpy_dtoh(table, &mut entries).is_ok() {
+                        let h0 = st.gate.host_entry(0);
+                        let h1 = h0 + (n as u64) * st.gate.expert_bytes as u64;
+                        let host = entries.iter().filter(|&&a| a >= h0 && a < h1).count();
+                        let dir_res = self.dirs[layer].lock().expect("cache dir").resident.len();
+                        eprintln!(
+                            "[moe-audit] L{layer}: dir_resident={dir_res} table_host={host} table_vram={} cap={}",
+                            n - host,
+                            self.pools[layer].capacity
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }

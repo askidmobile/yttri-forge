@@ -1515,13 +1515,29 @@ impl BatchModel for Qwen35BatchAdapter {
         // FR-006/PD-004: кэш горячих экспертов — D2H следа прошлого шага,
         // LRU, подъёмы промахов на боковом потоке (перед графом шага).
         #[cfg(feature = "cuda")]
+        let dec_t0 = std::time::Instant::now();
+        #[cfg(feature = "cuda")]
         self.model
             .before_moe_step(&self.device)
             .map_err(|e| anyhow!("moe before_step: {e}"))?;
+        #[cfg(feature = "cuda")]
+        let dec_t1 = std::time::Instant::now();
         // CUDA-graph decode: один cuGraphLaunch на весь forward. None → eager.
         #[cfg(feature = "cuda")]
         {
-            match self.decode_batch_graphed(b, &tokens, &rope_positions, &slots, &positions) {
+            let graphed = self.decode_batch_graphed(b, &tokens, &rope_positions, &slots, &positions);
+            if crate::scheduler::trace_on() {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 32 == 0 {
+                    eprintln!(
+                        "[dec] #{n} before_step={:.2}ms graphed={:.2}ms",
+                        (dec_t1 - dec_t0).as_secs_f64() * 1e3,
+                        dec_t1.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+            }
+            match graphed {
                 Ok(Some((out, _hidden))) => {
                     for i in 0..b {
                         let sidx = slot_order[i];
