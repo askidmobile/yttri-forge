@@ -537,7 +537,7 @@ impl Qwen35MoeBlock {
                 // Фаза 4: кэш (свободные слоты → стейджинг); таблицы
                 // полностью перезаписываются подготовкой.
                 let staging_experts = match runtime.cache.get() {
-                    (Some(cache), false) => {
+                    Some(cache) => {
                         cache.prefill_prepare_layer(
                             cuda_dev,
                             store,

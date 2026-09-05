@@ -691,13 +691,10 @@ impl Qwen35Mtp {
                 down.forward(&activated)?
             }
             MtpFfn::Moe { block } => {
-                // FR-011: MoE-черновик — те же ядра, что и ствол (T=1,
-                // DecodeBatch). Эксперты VRAM-резиденты (D-007).
-                let (batch, seq, n_embd) = ffn.dims3()?;
-                let ffn_2d = ffn.reshape(((), n_embd))?;
-                let mode = ForwardMode::DecodeBatch;
-                let moe_out = block.forward(&ffn_2d, mode)?;
-                moe_out.reshape((batch, seq, n_embd))?
+                // FR-011: MoE-черновик — те же ядра, что и ствол.
+                // Эксперты VRAM-резиденты (D-007). Block.forward принимает
+                // 3D [batch, seq, H] и сам делает reshape внутри.
+                block.forward(&ffn, ForwardMode::DecodeBatch)?
             }
         };
         out + after_attention
@@ -1084,10 +1081,8 @@ impl Qwen35Mtp {
             }
             MtpFfn::Moe { block } => {
                 // FR-011: MoE-черновик — те же ядра, что и ствол (T=1).
-                let (_, _, n_embd) = ffn.dims3()?;
-                let ffn_2d = ffn.reshape(((), n_embd))?;
-                let moe_out = block.forward(&ffn_2d, ForwardMode::DecodeBatch)?;
-                moe_out.reshape((1, 1, n_embd))? + after_attention
+                // Block.forward принимает 3D [batch, seq, H].
+                block.forward(&ffn, ForwardMode::DecodeBatch)? + after_attention
             }
         }?; // [1,1,H] — unwrap Result<Tensor> для .i() ниже
         let pre_head = pre.i((.., 0, ..))?; // [1,H]
