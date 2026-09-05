@@ -485,27 +485,42 @@ impl MtpProfile {
             .iter()
             .map(|(name, info)| (name.clone(), clone_tensor_info(info)))
             .collect();
-        match Architecture::from_metadata(&metadata) {
+        let arch = Architecture::from_metadata(&metadata);
+        match &arch {
             Ok(Architecture::DenseQwen35) => {}
-            Ok(other) => errs.push(format!("MTP architecture {other:?}, expected dense qwen35")),
+            Ok(Architecture::Qwen35Moe) => {
+                // FR-011: MoE-вариант — nextn-слой содержит routed experts
+                // + router + shared expert вместо плотного FFN. intermediate
+                // из expert_feed_forward_length.
+            }
+            Ok(other) => errs.push(format!("MTP architecture {other:?}, expected dense qwen35 or qwen35moe")),
             Err(error) => errs.push(format!("{error}")),
         }
-        let blocks = md_u32(&metadata, "qwen35.block_count", &mut errs).unwrap_or(0);
-        let nextn = md_u32(&metadata, "qwen35.nextn_predict_layers", &mut errs).unwrap_or(0);
-        let hidden = md_u32(&metadata, "qwen35.embedding_length", &mut errs).unwrap_or(0);
-        let context = md_u32(&metadata, "qwen35.context_length", &mut errs).unwrap_or(0);
-        let intermediate =
-            md_u32(&metadata, "qwen35.feed_forward_length", &mut errs).unwrap_or(0);
-        let heads = md_u32(&metadata, "qwen35.attention.head_count", &mut errs).unwrap_or(0);
+        let is_moe = matches!(arch, Ok(Architecture::Qwen35Moe));
+        // FR-011: MoE-вариант использует qwen35moe.* метаданные; плотный — qwen35.*.
+        // Embedded MTP: MTP_PATH = основной GGUF с MoE-блоком (не тонкий файл).
+        let md_prefix = if is_moe { "qwen35moe" } else { "qwen35" };
+        let embedded = is_moe && ct.tensor_infos.len() > 15;
+        let blocks = md_u32(&metadata, &format!("{md_prefix}.block_count"), &mut errs).unwrap_or(0);
+        let nextn = md_u32(&metadata, &format!("{md_prefix}.nextn_predict_layers"), &mut errs).unwrap_or(0);
+        let hidden = md_u32(&metadata, &format!("{md_prefix}.embedding_length"), &mut errs).unwrap_or(0);
+        let context = md_u32(&metadata, &format!("{md_prefix}.context_length"), &mut errs).unwrap_or(0);
+        let intermediate = if is_moe {
+            md_u32(&metadata, "qwen35moe.expert_feed_forward_length", &mut errs)
+                .unwrap_or(0)
+        } else {
+            md_u32(&metadata, &format!("{md_prefix}.feed_forward_length"), &mut errs).unwrap_or(0)
+        };
+        let heads = md_u32(&metadata, &format!("{md_prefix}.attention.head_count"), &mut errs).unwrap_or(0);
         let kv_heads =
-            md_u32(&metadata, "qwen35.attention.head_count_kv", &mut errs).unwrap_or(0);
+            md_u32(&metadata, &format!("{md_prefix}.attention.head_count_kv"), &mut errs).unwrap_or(0);
         let key_length =
-            md_u32(&metadata, "qwen35.attention.key_length", &mut errs).unwrap_or(0);
+            md_u32(&metadata, &format!("{md_prefix}.attention.key_length"), &mut errs).unwrap_or(0);
         let value_length =
-            md_u32(&metadata, "qwen35.attention.value_length", &mut errs).unwrap_or(0);
+            md_u32(&metadata, &format!("{md_prefix}.attention.value_length"), &mut errs).unwrap_or(0);
         let rms = md_f32_req(
             &metadata,
-            "qwen35.attention.layer_norm_rms_epsilon",
+            &format!("{md_prefix}.attention.layer_norm_rms_epsilon"),
             &mut errs,
         )
         .unwrap_or(0.0) as f64;
@@ -513,18 +528,23 @@ impl MtpProfile {
         // hidden 2560), Qwen3.8+ - MTP встроен в основной файл (blk.<last>).
         // Всё выводится из метаданных + text-профиля, кроме инвариантов
         // mtp.rs: head_dim=256, rope_dim=64, rope_base=1e7 (константы форварда).
-        if nextn != 1 {
-            errs.push(format!("MTP nextn_predict_layers={nextn}, expected 1"));
+        if nextn != 1 && !embedded {
+            errs.push(format!("MTP nextn_predict_layers={nextn}, expected 1 (embedded: {embedded})"));
         }
         if key_length != 256 || value_length != 256 {
             errs.push(format!(
                 "MTP head_dim {key_length}/{value_length}, mtp.rs supports only 256"
             ));
         }
-        if text.architecture != Architecture::DenseQwen35
+        // FR-011: для MoE текст-профиль имеет feed_forward_length = shared
+        // эксперт FFN, а MtpProfile.intermediate = expert FFN — они разные
+        // по определению, не сравнивать.
+        let arch_ok = text.architecture == Architecture::DenseQwen35
+            || (is_moe && text.architecture == Architecture::Qwen35Moe);
+        if !arch_ok && !embedded
             || text.hidden_size != hidden
             || text.context_length != context
-            || text.feed_forward_length != intermediate
+            || (!is_moe && text.feed_forward_length != intermediate)
             || text.attention_head_count != heads
             || text.attention_head_count_kv != kv_heads
             || text.attention_key_length != key_length
@@ -546,6 +566,7 @@ impl MtpProfile {
         // Кванты матриц: 4B-MTP был Q8_0; у Qwen3.8 IQ4_XS/Q3_K. Разрешаем
         // любой поддерживаемый CUDA-путём квант (гейт численности - teacher-forced).
         let matrix = [
+            GgmlDType::BF16,
             GgmlDType::Q8_0,
             GgmlDType::Q2K,
             GgmlDType::Q3K,
@@ -562,18 +583,53 @@ impl MtpProfile {
             GgmlDType::IQ1M,
             GgmlDType::F16,
         ];
-        let norm = [GgmlDType::F32];
-        for (name, shape) in [
-            (format!("{prefix}.attn_q.weight"), vec![heads * head_dim * 2, hidden]),
-            (format!("{prefix}.attn_k.weight"), vec![kv_heads * head_dim, hidden]),
-            (format!("{prefix}.attn_v.weight"), vec![kv_heads * head_dim, hidden]),
-            (format!("{prefix}.attn_output.weight"), vec![hidden, heads * head_dim]),
-            (format!("{prefix}.ffn_gate.weight"), vec![intermediate, hidden]),
-            (format!("{prefix}.ffn_up.weight"), vec![intermediate, hidden]),
-            (format!("{prefix}.ffn_down.weight"), vec![hidden, intermediate]),
-            (format!("{prefix}.nextn.eh_proj.weight"), vec![hidden, 2 * hidden]),
-        ] {
-            require_tensor_contract(&tensors, &name, &shape, &matrix, &mut errs);
+        let norm = [GgmlDType::BF16, GgmlDType::F32];
+        if is_moe {
+            // FR-011: MoE-вариант — routed experts + router + shared expert
+            // вместо плотного FFN.
+            let expert_count = md_u32(&metadata, "qwen35moe.expert_count", &mut errs).unwrap_or(256);
+            let expert_ff = md_u32(
+                &metadata,
+                "qwen35moe.expert_feed_forward_length",
+                &mut errs,
+            )
+            .unwrap_or(intermediate) as usize;
+            let shared_ff = md_u32(
+                &metadata,
+                "qwen35moe.expert_shared_feed_forward_length",
+                &mut errs,
+            )
+            .unwrap_or(intermediate) as usize;
+            for (name, shape) in [
+                (format!("{prefix}.attn_q.weight"), vec![heads * head_dim * 2, hidden]),
+                (format!("{prefix}.attn_k.weight"), vec![kv_heads * head_dim, hidden]),
+                (format!("{prefix}.attn_v.weight"), vec![kv_heads * head_dim, hidden]),
+                (format!("{prefix}.attn_output.weight"), vec![hidden, heads * head_dim]),
+                (format!("{prefix}.ffn_gate_exps.weight"), vec![expert_count, expert_ff, hidden]),
+                (format!("{prefix}.ffn_up_exps.weight"), vec![expert_count, expert_ff, hidden]),
+                (format!("{prefix}.ffn_down_exps.weight"), vec![expert_count, hidden, expert_ff]),
+                (format!("{prefix}.ffn_gate_inp.weight"), vec![expert_count, hidden]),
+                (format!("{prefix}.ffn_gate_shexp.weight"), vec![shared_ff, hidden]),
+                (format!("{prefix}.ffn_up_shexp.weight"), vec![shared_ff, hidden]),
+                (format!("{prefix}.ffn_down_shexp.weight"), vec![hidden, shared_ff]),
+                (format!("{prefix}.ffn_gate_inp_shexp.weight"), vec![hidden]),
+                (format!("{prefix}.nextn.eh_proj.weight"), vec![hidden, 2 * hidden]),
+            ] {
+                require_tensor_contract(&tensors, &name, &shape, &matrix, &mut errs);
+            }
+        } else {
+            for (name, shape) in [
+                (format!("{prefix}.attn_q.weight"), vec![heads * head_dim * 2, hidden]),
+                (format!("{prefix}.attn_k.weight"), vec![kv_heads * head_dim, hidden]),
+                (format!("{prefix}.attn_v.weight"), vec![kv_heads * head_dim, hidden]),
+                (format!("{prefix}.attn_output.weight"), vec![hidden, heads * head_dim]),
+                (format!("{prefix}.ffn_gate.weight"), vec![intermediate, hidden]),
+                (format!("{prefix}.ffn_up.weight"), vec![intermediate, hidden]),
+                (format!("{prefix}.ffn_down.weight"), vec![hidden, intermediate]),
+                (format!("{prefix}.nextn.eh_proj.weight"), vec![hidden, 2 * hidden]),
+            ] {
+                require_tensor_contract(&tensors, &name, &shape, &matrix, &mut errs);
+            }
         }
         for (name, shape) in [
             (format!("{prefix}.attn_norm.weight"), vec![hidden]),
@@ -586,17 +642,19 @@ impl MtpProfile {
         ] {
             require_tensor_contract(&tensors, &name, &shape, &norm, &mut errs);
         }
-        // Для тонкого файла (только MTP-тензоры) запрещаем лишнее; встроенный
-        // основной GGUF содержит транк - проверка не применима.
-        let mtp_only: Vec<_> = tensors
-            .keys()
-            .filter(|name| name.starts_with(&format!("{prefix}.")))
-            .collect();
-        if tensors.len() == mtp_only.len() && tensors.len() != 15 {
-            errs.push(format!(
-                "thin MTP tensor count={}, expected 15",
-                tensors.len()
-            ));
+        // Тонкий файл: 15 MTP-тензоров; встроенный: GGUF содержит транк —
+        // проверка неприменима.
+        if !embedded {
+            let mtp_only: Vec<_> = tensors
+                .keys()
+                .filter(|name| name.starts_with(&format!("{prefix}.")))
+                .collect();
+            if tensors.len() == mtp_only.len() && tensors.len() != 15 {
+                errs.push(format!(
+                    "thin MTP tensor count={}, expected 15",
+                    tensors.len()
+                ));
+            }
         }
         let quant_set = tensors
             .iter()

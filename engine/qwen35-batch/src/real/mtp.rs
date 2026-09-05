@@ -10,6 +10,10 @@ use std::{fs::File, path::Path, sync::Arc};
 use super::{
     model_profile::{ModelProfile, MtpProfile},
     model_weights::ModelWeights,
+    moe::{
+        ForwardMode, MoeRouter, PackedExperts, Qwen35MoeBlock, Qwen35MoeConfig,
+        select_backend, SharedExpert,
+    },
     multimodal::MROPE_DIMENSION_SOURCES,
 };
 
@@ -77,9 +81,8 @@ pub struct Qwen35Mtp {
     k_norm: RmsNorm,
     o: QMatMul,
     ffn_norm: RmsNorm,
-    gate: QMatMul,
-    up: QMatMul,
-    down: QMatMul,
+    /// FR-011: FFN черновика — плотный или MoE (у 35B-A3B nextn-слой MoE).
+    ffn: MtpFfn,
     head_norm: RmsNorm,
     shared_head: QMatMul,
     short_head: Option<ShortHead>,
@@ -96,7 +99,18 @@ pub struct Qwen35Mtp {
 
 /// Стейджинг прохода головы: адреса стабильны между replay, всё, что меняется
 /// от прохода к проходу, кладётся сюда ДО launch, выходы читаются ПОСЛЕ.
-#[cfg(feature = "cuda")]
+/// FFN черновика MTP: плотный (4B/Ornith/Qwen3.8) или MoE (35B-A3B, FR-011).
+pub enum MtpFfn {
+    Dense {
+        gate: QMatMul,
+        up: QMatMul,
+        down: QMatMul,
+    },
+    Moe {
+        block: Qwen35MoeBlock,
+    },
+}
+
 #[derive(Clone)]
 struct DraftStaging {
     emb_in: Tensor,    // [1,1,H] F32 — эмбеддинг токена (деквант на хосте, H2D)
@@ -186,7 +200,30 @@ fn draft_id_log() -> bool {
 /// MTP_GRAPH_CHECK=1 — после каждого replay повторить проход eager на
 /// тех же входах и сравнить id и hidden; печать по проходу. Состояние после
 /// проверки — от eager-прохода (строка кеша перезаписана тем же значением).
-#[cfg(feature = "cuda")]
+fn moe_meta_u32(content: &candle_core::quantized::gguf_file::Content, key: &str, default: u32) -> u32 {
+    content
+        .metadata
+        .get(key)
+        .and_then(|v| v.to_u32().ok())
+        .unwrap_or(default)
+}
+
+fn moe_n_experts(content: &candle_core::quantized::gguf_file::Content, _prefix: &str) -> usize {
+    moe_meta_u32(content, "qwen35moe.expert_count", 256) as usize
+}
+
+fn moe_topk(content: &candle_core::quantized::gguf_file::Content, _prefix: &str) -> usize {
+    moe_meta_u32(content, "qwen35moe.expert_used_count", 8) as usize
+}
+
+fn moe_intermediate(content: &candle_core::quantized::gguf_file::Content, _prefix: &str) -> usize {
+    moe_meta_u32(content, "qwen35moe.expert_feed_forward_length", 512) as usize
+}
+
+fn moe_shared_intermediate(content: &candle_core::quantized::gguf_file::Content, _prefix: &str) -> usize {
+    moe_meta_u32(content, "qwen35moe.expert_shared_feed_forward_length", 512) as usize
+}
+
 fn draft_graph_check() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("MTP_GRAPH_CHECK").as_deref() == Ok("1"))
@@ -220,6 +257,70 @@ impl Qwen35Mtp {
             Ok(RmsNorm::new(weight, rms_norm_eps))
         };
         let prefix = format!("blk.{}", profile.mtp_block);
+        // FR-011: MoE-вариант (35B-A3B): nextn-слой содержит routed experts
+        // + router + shared expert вместо плотного FFN. Эксперты всегда
+        // VRAM-резиденты (D-007, ~307 МиБ).
+        let is_moe = content.tensor_infos.contains_key(&format!("{prefix}.ffn_gate_exps.weight"));
+        let ffn = if is_moe {
+            #[cfg(feature = "cuda")]
+            {
+                let moe_cfg = Qwen35MoeConfig {
+                    hidden_size: profile.hidden_size,
+                    n_experts: moe_n_experts(&content, &prefix),
+                    n_experts_per_tok: moe_topk(&content, &prefix),
+                    routed_intermediate: moe_intermediate(&content, &prefix),
+                    shared_intermediate: moe_shared_intermediate(&content, &prefix),
+                    norm_topk_prob: true,
+                };
+                // Router: ffn_gate_inp → dequantize → F32 Linear.
+                let router_qt = content.tensor_from_slice(data, &format!("{prefix}.ffn_gate_inp.weight"), &device)?;
+                let router_w = router_qt.dequantize(&device)?.to_dtype(DType::F32)?;
+                let router = MoeRouter::new(
+                    candle_nn::Linear::new(router_w, None),
+                    moe_cfg.n_experts,
+                    moe_cfg.n_experts_per_tok,
+                    moe_cfg.norm_topk_prob,
+                );
+                // Routed experts: VRAM-резиденты (D-007).
+                let gate_qt = content.tensor_from_slice(data, &format!("{prefix}.ffn_gate_exps.weight"), &device)?;
+                let up_qt = content.tensor_from_slice(data, &format!("{prefix}.ffn_up_exps.weight"), &device)?;
+                let down_qt = content.tensor_from_slice(data, &format!("{prefix}.ffn_down_exps.weight"), &device)?;
+                let backend = select_backend(None, device.is_cuda(), gate_qt.dtype(), up_qt.dtype(), down_qt.dtype())?;
+                let routed = PackedExperts {
+                    gate: Arc::new(gate_qt),
+                    up: Arc::new(up_qt),
+                    down: Arc::new(down_qt),
+                    n_experts: moe_cfg.n_experts,
+                };
+                // Shared expert.
+                let shexp_gate_inp_qt = content.tensor_from_slice(data, &format!("{prefix}.ffn_gate_inp_shexp.weight"), &device)?;
+                let shexp_gate_inp_w = shexp_gate_inp_qt.dequantize(&device)?.to_dtype(DType::F32)?;
+                let shexp_gate_inp_w = if shexp_gate_inp_w.rank() == 1 {
+                    let h = shexp_gate_inp_w.dim(0)?;
+                    shexp_gate_inp_w.reshape((1, h))?
+                } else {
+                    shexp_gate_inp_w
+                };
+                let shared_expert = SharedExpert::new(
+                    candle_nn::Linear::new(shexp_gate_inp_w, None),
+                    qmat(&format!("{prefix}.ffn_gate_shexp.weight"))?,
+                    qmat(&format!("{prefix}.ffn_up_shexp.weight"))?,
+                    qmat(&format!("{prefix}.ffn_down_shexp.weight"))?,
+                );
+                let block = Qwen35MoeBlock::new(moe_cfg, router, routed, shared_expert, backend);
+                MtpFfn::Moe { block }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                candle_core::bail!("MoE MTP требует CUDA-фичу");
+            }
+        } else {
+            MtpFfn::Dense {
+                gate: qmat(&format!("{prefix}.ffn_gate.weight"))?,
+                up: qmat(&format!("{prefix}.ffn_up.weight"))?,
+                down: qmat(&format!("{prefix}.ffn_down.weight"))?,
+            }
+        };
         let mut mtp = Self {
             profile,
             device: device.clone(),
@@ -234,9 +335,7 @@ impl Qwen35Mtp {
             k_norm: norm(&format!("{prefix}.attn_k_norm.weight"))?,
             o: qmat(&format!("{prefix}.attn_output.weight"))?,
             ffn_norm: norm(&format!("{prefix}.post_attention_norm.weight"))?,
-            gate: qmat(&format!("{prefix}.ffn_gate.weight"))?,
-            up: qmat(&format!("{prefix}.ffn_up.weight"))?,
-            down: qmat(&format!("{prefix}.ffn_down.weight"))?,
+            ffn,
             head_norm: norm(&format!("{prefix}.nextn.shared_head_norm.weight"))?,
             shared_head,
             short_head: None,
@@ -428,6 +527,15 @@ impl Qwen35Mtp {
         rope_positions: Option<&[Vec<u32>; 3]>,
     ) -> Result<()> {
         self.check_slot(slot)?;
+        // FR-011: embed_tokens возвращает rank-2 [n_tok, H]; unsqueeze до
+        // [1, n_tok, H] для dims3() ниже (rank fix независимо от вызывающего).
+        eprintln!("[mtp-dbg] catch_up: embeds rank={} shape={:?}", embeddings.dims().len(), embeddings.dims());
+        let embeddings = if embeddings.dims().len() == 2 {
+            embeddings.unsqueeze(0)?
+        } else {
+            embeddings.clone()
+        };
+        eprintln!("[mtp-dbg] catch_up: after unsqueeze rank={}", embeddings.dims().len());
         let (_, seq, hidden) = embeddings.dims3()?;
         if target_hidden.dims() != [1, seq, self.profile.hidden_size] || hidden != self.profile.hidden_size {
             candle_core::bail!("MTP catch-up shape mismatch");
@@ -447,7 +555,7 @@ impl Qwen35Mtp {
                 1,
             )?
         };
-        let _ = self.forward_rows(slot, embeddings, &shifted, start_pos, rope_positions)?;
+        let _ = self.forward_rows(slot, &embeddings, &shifted, start_pos, rope_positions)?;
         self.slots[slot].pending_target_hidden =
             Some(target_hidden.i((.., seq - 1, ..))?);
         Ok(())
@@ -577,8 +685,22 @@ impl Qwen35Mtp {
         )?;
         let after_attention = (mixed + residual)?;
         let ffn = self.ffn_norm.forward(&after_attention)?;
-        let activated = self.gate.forward(&ffn)?.silu_mul_direct(&self.up.forward(&ffn)?)?;
-        self.down.forward(&activated)? + after_attention
+        let out = match &self.ffn {
+            MtpFfn::Dense { gate, up, down } => {
+                let activated = gate.forward(&ffn)?.silu_mul_direct(&up.forward(&ffn)?)?;
+                down.forward(&activated)?
+            }
+            MtpFfn::Moe { block } => {
+                // FR-011: MoE-черновик — те же ядра, что и ствол (T=1,
+                // DecodeBatch). Эксперты VRAM-резиденты (D-007).
+                let (batch, seq, n_embd) = ffn.dims3()?;
+                let ffn_2d = ffn.reshape(((), n_embd))?;
+                let mode = ForwardMode::DecodeBatch;
+                let moe_out = block.forward(&ffn_2d, mode)?;
+                moe_out.reshape((batch, seq, n_embd))?
+            }
+        };
+        out + after_attention
     }
 
     fn attention(
@@ -955,8 +1077,19 @@ impl Qwen35Mtp {
         let mixed = self.attention_graphed(slot, &self.attn_norm.forward(&projected)?, st)?;
         let after_attention = (mixed + &projected)?;
         let ffn = self.ffn_norm.forward(&after_attention)?;
-        let activated = self.gate.forward(&ffn)?.silu_mul_direct(&self.up.forward(&ffn)?)?;
-        let pre = (self.down.forward(&activated)? + after_attention)?; // [1,1,H]
+        let pre = match &self.ffn {
+            MtpFfn::Dense { gate, up, down } => {
+                let activated = gate.forward(&ffn)?.silu_mul_direct(&up.forward(&ffn)?)?;
+                down.forward(&activated)? + after_attention
+            }
+            MtpFfn::Moe { block } => {
+                // FR-011: MoE-черновик — те же ядра, что и ствол (T=1).
+                let (_, _, n_embd) = ffn.dims3()?;
+                let ffn_2d = ffn.reshape(((), n_embd))?;
+                let moe_out = block.forward(&ffn_2d, ForwardMode::DecodeBatch)?;
+                moe_out.reshape((1, 1, n_embd))? + after_attention
+            }
+        }?; // [1,1,H] — unwrap Result<Tensor> для .i() ниже
         let pre_head = pre.i((.., 0, ..))?; // [1,H]
         let normalized = self.head_norm.forward(&pre_head)?;
         let logits = match &self.short_head {

@@ -1219,11 +1219,13 @@ impl BatchModel for Qwen35BatchAdapter {
             (Some(logits), Some((embeds, hidden)))
         } else if self.mtp.is_some() && self.mtp_slot_aligned[sidx] {
             let embeds = self.model.embed_tokens(&ids, &self.device)?;
+            // FR-011: catch_up ожидает [1, seq, H] — unsqueeze из rank-2.
+            let embeds_3d = embeds.unsqueeze(0)?;
             let (logits, hidden) = self
                 .model
-                .forward_embeds_with_hidden(&embeds, chunk.start_pos)
+                .forward_embeds_with_hidden(&embeds_3d, chunk.start_pos)
                 .map_err(|error| anyhow!("prefill forward: {error}"))?;
-            (Some(logits), Some((embeds, hidden)))
+            (Some(logits), Some((embeds_3d, hidden)))
         } else {
             (
                 Some(
