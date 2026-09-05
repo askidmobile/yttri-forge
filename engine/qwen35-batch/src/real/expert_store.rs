@@ -1231,33 +1231,38 @@ impl CacheSystem {
             };
             let cache_map: std::collections::HashMap<usize, usize> =
                 slot_assign.iter().copied().collect();
-            let host_base = st.gate.host_entry(0); // host-адреса плотные: base + e*bytes
-            let host_stride = if n_experts > 0 { st.gate.host_entry(1) - host_base } else { 0 };
-            let build = |pool_ptr: u64, staging_ptr: u64, bytes: u64| -> Vec<u64> {
+            // Адреса строго по матрице: у gate/up/down свои host-буферы и свои
+            // expert_bytes. Стейджинг размечен по id эксперта (staging_base +
+            // e·bytes, как в mixed_table_entries) — один общий адрес для всех
+            // staging-экспертов давал им веса одного эксперта, а после
+            // исправления копий — незаписанную память (NaN → `[PAD]`).
+            // Раньше host-адреса up/down брались из gate — промахи декода по
+            // up/down читали веса gate.
+            let build = |host_base: u64, pool_ptr: u64, staging_ptr: u64, bytes: u64| -> Vec<u64> {
                 (0..n_experts)
                     .map(|e| {
                         if let Some(&slot) = cache_map.get(&e) {
                             pool_ptr + slot as u64 * bytes
                         } else if to_staging.contains(&e) {
-                            staging_ptr // общий буфер: все staging-эксперты слоя на 0
+                            staging_ptr + e as u64 * bytes
                         } else {
-                            host_base + e as u64 * host_stride
+                            host_base + e as u64 * bytes
                         }
                     })
                     .collect()
             };
-            let tg = build(pg_ptr, sg_ptr, gate_bytes as u64);
+            let tg = build(st.gate.host_entry(0), pg_ptr, sg_ptr, gate_bytes as u64);
             dev.memcpy_htod(&tg, st.gate.table_mut())?;
-            let tu = build(pu_ptr, su_ptr, up_bytes as u64);
+            let tu = build(st.up.host_entry(0), pu_ptr, su_ptr, up_bytes as u64);
             dev.memcpy_htod(&tu, st.up.table_mut())?;
-            let td = build(pd_ptr, sd_ptr, down_bytes as u64);
+            let td = build(st.down.host_entry(0), pd_ptr, sd_ptr, down_bytes as u64);
             dev.memcpy_htod(&td, st.down.table_mut())?;
             Ok(to_staging)
         }
     }
 
-    /// После ядер слоя: staging-эксперты возвращаются на host (их общий
-    /// staging-буфер перезапишет следующий слой); кэш-записи сохраняются.
+    /// После ядер слоя: staging-эксперты возвращаются на host (стейджинг
+    /// перезапишет следующий слой); кэш-записи сохраняются.
     pub fn prefill_release_staging(
         &self,
         dev: &candle_core::CudaDevice,
