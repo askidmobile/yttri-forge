@@ -6630,8 +6630,11 @@ impl ModelWeights {
         let emb_info = ct.tensor_infos.get("token_embd.weight").ok_or_else(|| {
             candle_core::Error::Msg("cannot find tensor info for token_embd.weight".into())
         })?;
+        // EMB_RAM_COPY=0 — диагностика: оставить mmap и при выгрузке (A/B паритета).
         #[cfg(feature = "cuda")]
-        let tok_embeddings = if moe_experts_ram {
+        let tok_embeddings = if moe_experts_ram
+            && std::env::var("EMB_RAM_COPY").as_deref() != Ok("0")
+        {
             QuantizedEmbedding::from_ram_copy(mmap, emb_info, ct.tensor_data_offset)?
         } else {
             QuantizedEmbedding::from_mmap(Arc::clone(mmap), emb_info, ct.tensor_data_offset)?
