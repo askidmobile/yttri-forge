@@ -36,6 +36,13 @@ askidmobile/candle заморожен как референс.
 Сборка на yttri-win: `D:\Projects\yttri-inference\inference-build.bat`
 указывает на `<clone>/engine/qwen35-batch`.
 
+## Форк mlx-audio-swift
+
+`mlx-audio-swift/` — форк [Blaizzy/mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift)
+v0.1.3 (MIT) с патчем видимости двух символов NemotronASR. Потребитель —
+Swift-сайдкар Yttri (`.package(path:)`, продукт `MLXAudioSTT`), задача T-558.
+Что именно пропатчено и как обновлять — `mlx-audio-swift/YTTRI-FORK.md`.
+
 | Репо | Роль |
 |---|---|
 | askidmobile/candle (ЗАМОРОЖЕН на 05aa926a) | исторический референс |
