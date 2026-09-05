@@ -1164,10 +1164,26 @@ impl CacheSystem {
                     )
                     .map_err(candle_core::Error::wrap)?;
             }
+            // Стейджинг размечен по id эксперта (таблица: staging_base + e·bytes,
+            // см. staging_table_entries), поэтому копия обязана лечь по e·bytes.
+            // Копия по смещению 0 для всех e давала ядрам незаписанную память —
+            // мусор в KV с первого чанка и петля «每天都有分享» на любой длине.
             for &e in &to_staging {
-                main.memcpy_htod(st.gate.expert_host_slice(e), &mut sg.slice_mut(0..gate_bytes)).map_err(candle_core::Error::wrap)?;
-                main.memcpy_htod(st.up.expert_host_slice(e), &mut su.slice_mut(0..up_bytes)).map_err(candle_core::Error::wrap)?;
-                main.memcpy_htod(st.down.expert_host_slice(e), &mut sd.slice_mut(0..down_bytes)).map_err(candle_core::Error::wrap)?;
+                main.memcpy_htod(
+                    st.gate.expert_host_slice(e),
+                    &mut sg.slice_mut(e * gate_bytes..(e + 1) * gate_bytes),
+                )
+                .map_err(candle_core::Error::wrap)?;
+                main.memcpy_htod(
+                    st.up.expert_host_slice(e),
+                    &mut su.slice_mut(e * up_bytes..(e + 1) * up_bytes),
+                )
+                .map_err(candle_core::Error::wrap)?;
+                main.memcpy_htod(
+                    st.down.expert_host_slice(e),
+                    &mut sd.slice_mut(e * down_bytes..(e + 1) * down_bytes),
+                )
+                .map_err(candle_core::Error::wrap)?;
             }
             drop(sg);
             drop(su);
