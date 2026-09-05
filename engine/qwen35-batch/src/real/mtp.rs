@@ -44,6 +44,16 @@ const MTP_KV_GROW: usize = 4096;
 struct MtpSlot {
     kv: Option<MtpKv>,
     pending_target_hidden: Option<Tensor>, // normalized target hidden [1,HIDDEN]
+    /// Буферы K/V, вытесненные ростом ёмкости. Не освобождаются до конца
+    /// процесса: их адреса запечены в захваченные графы черновика, а
+    /// cudaFreeAsync под такими графами отравляет поток
+    /// (CUDA_ERROR_INVALID_VALUE на следующем sync/alloc — см. OQ-7).
+    /// Рост ёмкости геометрический, так что суммарно ≤ 2× финального буфера.
+    retired_kv: Vec<MtpKv>,
+    /// Стейджинг графа черновика — живёт со слотом, а не с графом: при
+    /// перезахвате граф разрушается, стейджинг остаётся (те же адреса).
+    #[cfg(feature = "cuda")]
+    draft_staging: Option<DraftStaging>,
 }
 
 #[derive(Clone)]
@@ -801,14 +811,40 @@ impl Qwen35Mtp {
             .transpose()?
             .unwrap_or(false);
         if !fits {
-            let cap = (total + MTP_KV_GROW).next_multiple_of(MTP_KV_GROW);
+            // Удвоение, а не +GROW: старые буферы остаются жить (retired_kv),
+            // геометрический рост держит их суммарный объём в пределах 2×.
+            let old_cap = self.slots[slot].kv.as_ref().map(|c| c.k.dim(1)).transpose()?.unwrap_or(0);
+            let cap = total.max(old_cap * 2).next_multiple_of(MTP_KV_GROW);
+            // Граф черновика запёк адреса старого K/V. Освободить буферы под
+            // живым графом нельзя: следующая аллокация падала с
+            // CUDA_ERROR_INVALID_VALUE («черновик сорвался» на промптах длиннее
+            // MTP_KV_GROW — тот же механизм, что в OQ-7 у графов декода).
+            // Поэтому граф снимается ДО перевыделения: на пустом потоке,
+            // с синхронизацией по обе стороны разрушения.
+            #[cfg(feature = "cuda")]
+            if let Some(old_graph) = self.draft_graphs[slot].take() {
+                if let Device::Cuda(d) = &self.device {
+                    d.cuda_stream()
+                        .synchronize()
+                        .map_err(|e| candle_core::Error::Msg(format!("mtp kv grow: sync before graph drop: {e:?}")))?;
+                    drop(old_graph);
+                    d.cuda_stream()
+                        .synchronize()
+                        .map_err(|e| candle_core::Error::Msg(format!("mtp kv grow: sync after graph drop: {e:?}")))?;
+                }
+                eprintln!(
+                    "[mtp] граф черновика слота {slot} снят до перевыделения кеша K/V ({past}+{extra} → cap {cap})"
+                );
+            }
             let k = Tensor::zeros((1, cap, kv_heads, hd), DType::F16, &self.device)?;
             let v = Tensor::zeros((1, cap, kv_heads, hd), DType::F16, &self.device)?;
-            if let Some(old) = self.slots[slot].kv.as_ref() {
+            if let Some(old) = self.slots[slot].kv.take() {
                 if old.len > 0 {
                     k.slice_set(&old.k.narrow(1, 0, old.len)?, 1, 0)?;
                     v.slice_set(&old.v.narrow(1, 0, old.len)?, 1, 0)?;
                 }
+                // Не освобождать: адреса могли быть запечены в граф черновика.
+                self.slots[slot].retired_kv.push(old);
             }
             self.slots[slot].kv = Some(MtpKv { k, v, len: past });
         }
@@ -888,7 +924,8 @@ impl Qwen35Mtp {
             _ => candle_core::bail!("draft_graphed: устройство не CUDA"),
         };
         // Ёмкость под все проходы — ДО захвата: рост меняет адреса кеша.
-        self.ensure_kv_capacity(slot, width)?;
+        self.ensure_kv_capacity(slot, width)
+            .map_err(|e| candle_core::Error::Msg(format!("draft_graphed/ensure_kv_capacity: {e}")))?;
         let (k_ptr, cap, len) = {
             let cache = self.slots[slot].kv.as_ref().expect("ensure_kv_capacity создаёт кеш");
             (
@@ -920,34 +957,46 @@ impl Qwen35Mtp {
                     // Разрушать только на пустом стриме и не выделять ничего до
                     // следующей синхронизации: освобождение внешних буферов графа
                     // рядом с instantiate соседнего ломало аллокатор (OQ-7).
-                    cuda_dev.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+                    cuda_dev
+                        .cuda_stream()
+                        .synchronize()
+                        .map_err(|e| candle_core::Error::Msg(format!("draft_graphed/stale sync before drop: {e:?}")))?;
                     drop(old);
-                    cuda_dev.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+                    cuda_dev
+                        .cuda_stream()
+                        .synchronize()
+                        .map_err(|e| candle_core::Error::Msg(format!("draft_graphed/stale sync after drop: {e:?}")))?;
                 }
                 if stale {
                     eprintln!("[mtp] граф черновика слота {slot} перезахвачен: кеш K/V перевыделен");
                 }
             }
-            let st = match self.draft_graphs[slot].as_ref() {
-                Some(g) => g.st.clone(),
-                None => DraftStaging::new(&self.device, self.profile.hidden_size)?,
+            let stage = |what: &'static str| move |e: candle_core::Error| candle_core::Error::Msg(format!("draft_graphed/{what}: {e}"));
+            let st = match self.slots[slot].draft_staging.as_ref() {
+                Some(st) => st.clone(),
+                None => {
+                    let st = DraftStaging::new(&self.device, self.profile.hidden_size)
+                        .map_err(stage("staging_new"))?;
+                    self.slots[slot].draft_staging = Some(st.clone());
+                    st
+                }
             };
             if offset == 0 {
-                st.hidden_in.slice_set(&hidden0, 0, 0)?;
-                st.len_dev.slice_set(&len_t, 0, 0)?;
+                st.hidden_in.slice_set(&hidden0, 0, 0).map_err(stage("hidden_in"))?;
+                st.len_dev.slice_set(&len_t, 0, 0).map_err(stage("len_dev"))?;
             }
-            let emb = target.embed_for_graph(&[token], &self.device)?; // [1,1,H] F32
-            st.emb_in.slice_set(&emb, 0, 0)?;
-            let (cos, sin) = rope_tables(start_pos + offset, 1, &self.device)?;
-            st.cos_in.slice_set(&cos, 0, 0)?;
-            st.sin_in.slice_set(&sin, 0, 0)?;
+            let emb = target.embed_for_graph(&[token], &self.device).map_err(stage("embed_for_graph"))?; // [1,1,H] F32
+            st.emb_in.slice_set(&emb, 0, 0).map_err(stage("emb_in"))?;
+            let (cos, sin) = rope_tables(start_pos + offset, 1, &self.device).map_err(stage("rope_tables"))?;
+            st.cos_in.slice_set(&cos, 0, 0).map_err(stage("cos_in"))?;
+            st.sin_in.slice_set(&sin, 0, 0).map_err(stage("sin_in"))?;
 
             if self.draft_graphs[slot].is_none() {
                 // Прайм (исполняется, результат — этого прохода) + захват
                 // (не исполняется). Guard: параметры ядер — через htod-кэш,
                 // иначе в захват попал бы pageable memcpy.
                 let _guard = cuda_dev.enable_cuda_graph_htod_cache();
-                self.draft_pass_body(slot, &st)?;
+                self.draft_pass_body(slot, &st).map_err(stage("prime_pass"))?;
                 let stream = cuda_dev.cuda_stream();
                 let captured = (|| -> Result<(csys::CUgraphExec, csys::CUgraph)> {
                     unsafe {
@@ -956,13 +1005,13 @@ impl Qwen35Mtp {
                             csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
                         )
                     }
-                    .map_err(candle_core::Error::wrap)?;
+                    .map_err(|e| candle_core::Error::Msg(format!("draft_graphed/begin_capture: {e:?}")))?;
                     if let Err(e) = self.draft_pass_body(slot, &st) {
                         let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
-                        return Err(e);
+                        return Err(candle_core::Error::Msg(format!("draft_graphed/capture_pass: {e}")));
                     }
                     let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
-                        .map_err(candle_core::Error::wrap)?;
+                        .map_err(|e| candle_core::Error::Msg(format!("draft_graphed/end_capture: {e:?}")))?;
                     if cu_graph.is_null() {
                         candle_core::bail!("end_capture вернул пустой граф");
                     }
@@ -1066,10 +1115,11 @@ impl Qwen35Mtp {
     /// head_norm + shared_head + argmax, но все входы — из `st`, все выходы —
     /// в `st`, длина кеша — на устройстве. Захватывается графом целиком.
     fn draft_pass_body(&mut self, slot: usize, st: &DraftStaging) -> Result<()> {
-        let e = self.enorm.forward(&st.emb_in)?;
-        let h = self.hnorm.forward(&st.hidden_in)?;
-        let projected = self.eh_proj.forward(&Tensor::cat(&[&e, &h], 2)?)?;
-        let mixed = self.attention_graphed(slot, &self.attn_norm.forward(&projected)?, st)?;
+        let body = |what: &'static str| move |e: candle_core::Error| candle_core::Error::Msg(format!("pass_body/{what}: {e}"));
+        let e = self.enorm.forward(&st.emb_in).map_err(body("enorm"))?;
+        let h = self.hnorm.forward(&st.hidden_in).map_err(body("hnorm"))?;
+        let projected = self.eh_proj.forward(&Tensor::cat(&[&e, &h], 2).map_err(body("cat"))?).map_err(body("eh_proj"))?;
+        let mixed = self.attention_graphed(slot, &self.attn_norm.forward(&projected).map_err(body("attn_norm"))?, st).map_err(body("attention_graphed"))?;
         let after_attention = (mixed + &projected)?;
         let ffn = self.ffn_norm.forward(&after_attention)?;
         let pre = match &self.ffn {
@@ -1083,8 +1133,8 @@ impl Qwen35Mtp {
                 block.forward(&ffn, ForwardMode::DecodeBatch)? + after_attention
             }
         }?; // [1,1,H] — unwrap Result<Tensor> для .i() ниже
-        let pre_head = pre.i((.., 0, ..))?; // [1,H]
-        let normalized = self.head_norm.forward(&pre_head)?;
+        let pre_head = pre.i((.., 0, ..)).map_err(body("pre_head"))?; // [1,H]
+        let normalized = self.head_norm.forward(&pre_head).map_err(body("head_norm"))?;
         let logits = match &self.short_head {
             Some(sh) => sh.proj.forward(&normalized)?, // [1, n_short]
             None => self.shared_head.forward(&normalized)?, // [1, V]
@@ -1097,9 +1147,9 @@ impl Qwen35Mtp {
             Some(sh) => sh.ids.index_select(&idx, 0)?,
             None => idx,
         };
-        st.out_id.slice_set(&id, 0, 0)?;
+        st.out_id.slice_set(&id, 0, 0).map_err(body("out_id"))?;
         // hidden следующего прохода = pre_head (как в eager-цикле).
-        st.hidden_in.slice_set(&pre, 0, 0)?;
+        st.hidden_in.slice_set(&pre, 0, 0).map_err(body("hidden_next"))?;
         // len += 1 — после внимания: ядро дописи и seqlens читали прежнюю длину.
         let next = st.len_dev.broadcast_add(&st.one_u32)?;
         st.len_dev.slice_set(&next, 0, 0)?;
