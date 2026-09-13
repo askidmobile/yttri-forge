@@ -205,6 +205,41 @@ fn prefix_cache_max_tokens() -> usize {
             .unwrap_or(usize::MAX)
     })
 }
+
+/// Дополнительные checkpoint'ы для branch-point prefix cache.
+/// По умолчанию включены; `PREFIX_CACHE_CHECKPOINTS=0` возвращает прежнее
+/// поведение — только последняя граница чанка.
+fn prefix_cache_checkpoints_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("PREFIX_CACHE_CHECKPOINTS")
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Верхняя позиция дополнительного checkpoint'а. Степени двойки до этого
+/// предела покрывают системные/tool-префиксы, не раздувая state cache.
+fn prefix_cache_checkpoint_max() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("PREFIX_CACHE_CHECKPOINT_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(8192)
+    })
+}
+
+#[inline]
+fn is_prefix_cache_checkpoint(pos: usize) -> bool {
+    pos > 0 && pos <= prefix_cache_checkpoint_max() && pos.is_power_of_two()
+}
 /// Размер пула декодных графов. Ключ — только ширина батча b (состав слотов
 /// ядра читают из стейджинга PagedModelCtx::slots_dev), так что различных
 /// форм не больше числа слотов; сверх пула не захватываем (DGRAPH_LRU).
@@ -380,13 +415,12 @@ pub struct Qwen35BatchAdapter {
     /// Per-slot snapshot после prefill — источник state для seed в batched buffers.
     /// Хранится и для time-multiplexed fallback (если batched decode disabled).
     slot_snaps: Vec<Option<StateSnapshot>>,
-    /// Снимок на границе последнего чанка префила — для prefix cache.
-    /// Снимок конца промпта для кеша непригоден: хвост промпта (суффикс
-    /// генерации `<|im_start|>assistant`) на следующем ходу заменяется
-    /// ответом, и запись перестаёт быть префиксом. Граница чанка лежит
-    /// заведомо раньше расхождения. Откатить снимок назад нельзя: три
-    /// четверти слоёв — DeltaNet с рекуррентным состоянием.
-    slot_prefix_snaps: Vec<Option<(usize, StateSnapshot)>>,
+    /// Снимки на границах чанков префила — для prefix cache.
+    /// Раньше хранили только последнюю границу; этого мало для divergent
+    /// branch, где расхождение происходит раньше последнего чанка. Теперь
+    /// храним набор checkpoint'ов, ограниченный степенями двойки и env
+    /// `PREFIX_CACHE_CHECKPOINT_MAX`.
+    slot_prefix_snaps: Vec<Vec<(usize, StateSnapshot)>>,
     /// Снимать ли границу (включается сервером, когда кеш префикса активен):
     /// лишний снимок стоит копии всего KV в VRAM.
     capture_prefix: bool,
@@ -649,7 +683,7 @@ impl Qwen35BatchAdapter {
             device,
             profile,
             slot_snaps: (0..num_slots).map(|_| None).collect(),
-            slot_prefix_snaps: (0..num_slots).map(|_| None).collect(),
+            slot_prefix_snaps: (0..num_slots).map(|_| Vec::new()).collect(),
             capture_prefix: false,
             slot_seeded: vec![false; num_slots],
             #[cfg(feature = "cuda")]
@@ -741,9 +775,12 @@ impl Qwen35BatchAdapter {
         self.capture_prefix = on;
     }
 
-    /// Забрать снимок границы: (позиция, состояние). Одноразовый.
-    pub fn take_prefix_snapshot(&mut self, slot: usize) -> Option<(usize, StateSnapshot)> {
-        self.slot_prefix_snaps.get_mut(slot).and_then(Option::take)
+    /// Забрать checkpoint'ы границ: (позиция, состояние). Одноразово.
+    pub fn take_prefix_snapshots(&mut self, slot: usize) -> Vec<(usize, StateSnapshot)> {
+        self.slot_prefix_snaps
+            .get_mut(slot)
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Внедрить snapshot слоту (prefix-cache hit): при следующем prefill_chunk
@@ -1032,7 +1069,7 @@ impl BatchModel for Qwen35BatchAdapter {
             self.state_owner = None;
             self.model.clear_state();
             self.slot_snaps[sidx] = None;
-            self.slot_prefix_snaps[sidx] = None;
+            self.slot_prefix_snaps[sidx].clear();
             self.slot_seeded[sidx] = false;
             if let Some(mtp) = self.mtp.as_mut() {
                 mtp.reset_slot(sidx)
@@ -1099,13 +1136,14 @@ impl BatchModel for Qwen35BatchAdapter {
         // Снимок границы для prefix cache: состояние слота здесь отвечает
         // ровно chunk.start_pos, и эта позиция кратна размеру чанка.
         let prefix_limit = prefix_cache_max_tokens();
-        let capture_at_limit = chunk.start_pos == prefix_limit;
-        let capture_final_below_limit = chunk.is_final && chunk.start_pos <= prefix_limit;
-        if self.capture_prefix
-            && self.slot_prefix_snaps[sidx].is_none()
-            && chunk.start_pos > 0
-            && (capture_at_limit || capture_final_below_limit)
-        {
+        let capture_extra =
+            prefix_cache_checkpoints_enabled() && is_prefix_cache_checkpoint(chunk.start_pos);
+        let capture_final = chunk.is_final && chunk.start_pos > 0;
+        let capture_position = chunk.start_pos > 0
+            && chunk.start_pos <= prefix_limit
+            && (capture_extra || capture_final);
+        let already_captured = self.slot_prefix_snaps[sidx].iter().any(|(pos, _)| *pos == chunk.start_pos);
+        if self.capture_prefix && capture_position && !already_captured {
             let device_snap = self
                 .model
                 .snapshot_slot_state(&self.device, sidx, chunk.start_pos)
@@ -1122,7 +1160,7 @@ impl BatchModel for Qwen35BatchAdapter {
                 let _ = c.cuda_stream().synchronize();
                 let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
             }
-            self.slot_prefix_snaps[sidx] = Some((chunk.start_pos, host_snap));
+            self.slot_prefix_snaps[sidx].push((chunk.start_pos, host_snap));
         }
 
         let pf_restore = pf_t0.elapsed();
