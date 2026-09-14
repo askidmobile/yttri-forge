@@ -976,6 +976,18 @@ impl Qwen35BatchAdapter {
 }
 
 impl BatchModel for Qwen35BatchAdapter {
+    /// Граница раунда для `MTP_TIMING=1` (см. `BatchModel::speculative_timing_sync`):
+    /// применяется только диагностикой, поэтому в рабочем режиме не зовётся.
+    fn speculative_timing_sync(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(cuda) = &self.device {
+            cuda.cuda_stream()
+                .synchronize()
+                .map_err(|error| anyhow!("speculative timing sync: {error:?}"))?;
+        }
+        Ok(())
+    }
+
     fn vocab_size(&self) -> usize {
         if self.vocab != 0 {
             self.vocab

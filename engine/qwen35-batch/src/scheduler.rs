@@ -519,6 +519,17 @@ impl<M: BatchModel> BatchScheduler<M> {
                 // Probe каждые 4 шага: не залипнуть в baseline навсегда.
                 self.skip_count[slot] += 1;
                 if self.skip_count[slot] % 4 != 3 {
+                    if timing {
+                        // Пропущенный раунд уходит в обычный decode_batch и НЕ
+                        // печатает строку [mtp]: раньше такие шаги не были видны
+                        // в логе вообще, хотя стоят как целый forward.
+                        eprintln!(
+                            "[mtp-skip] slot={slot} adaptive K=1 (m={} k={}) → baseline decode",
+                            self.slot_last_m[slot], self.slot_last_k[slot]
+                        );
+                    }
+                    // Adaptive skip — не откат: транзакция не открывалась,
+                    // поэтому в fallback_category он не попадает.
                     return Ok(SpeculativeStep::AdaptiveSkip);
                 }
                 self.slot_last_k[slot] = 2;
@@ -591,15 +602,18 @@ impl<M: BatchModel> BatchScheduler<M> {
         let t_sample = Instant::now();
         let mut verified = Vec::with_capacity(draft.len());
         let mut accepted = 0usize;
+        // История копируется ОДИН раз на раунд, а не на каждую проверенную
+        // строку: раньше `generated_tokens().to_vec()` стоял внутри цикла и
+        // делал K полных копий истории (и K аллокаций) на раунд.
+        let mut history = self.slots[slot].generated_tokens().to_vec();
         for (logits, &draft_id) in rows.iter().zip(&draft) {
-            let mut history = self.slots[slot].generated_tokens().to_vec();
-            history.extend_from_slice(&verified);
             let target = self.sampler.sample_indexed(slot, &history, logits);
             verified.push(target);
             if target != draft_id {
                 break;
             }
             accepted += 1;
+            history.push(target);
             if target == self.eos {
                 break;
             }
@@ -618,34 +632,28 @@ impl<M: BatchModel> BatchScheduler<M> {
             self.sampler.restore(slot, sampler_checkpoint)?;
             return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Commit));
         }
+        // Конец шести фаз begin..commit (см. печать ниже).
+        let t_phases_end = Instant::now();
         // P0.5c: фиксируем результат раунда для adaptive width.
         let verified_len_for_pred = verified.len();
+        let round_pos = pos;
         self.slot_last_m[slot] = verified.len();
         self.slot_last_k[slot] = draft.len();
-        if timing {
-            let now = Instant::now();
-            // Разрыв между раундами и сумма фаз: без них не видно, что время
-            // уходит мимо разбивки. Разрыв — планировщик, дренаж, хостовая
-            // часть между раундами; сумма фаз — то, что разбивка объясняет.
-            let gap = self.slot_last_round_end[slot]
-                .map(|prev| (t_begin - prev).as_secs_f64() * 1e3)
-                .unwrap_or(0.0);
-            let phases = (now - t_begin).as_secs_f64() * 1e3;
-            eprintln!(
-                "[mtp] slot={slot} K={} m={} begin={:.1}ms draft={:.1}ms verify={:.1}ms sample={:.1}ms accept={:.1}ms commit={:.1}ms | фазы={:.1}ms разрыв={:.1}ms раунд={:.1}ms",
-                draft.len(),
-                verified.len(),
-                (t_draft - t_begin).as_secs_f64() * 1e3,
-                (t_verify - t_draft).as_secs_f64() * 1e3,
-                (t_sample - t_verify).as_secs_f64() * 1e3,
-                (t_accept - t_sample).as_secs_f64() * 1e3,
-                (t_commit - t_accept).as_secs_f64() * 1e3,
-                t_commit.elapsed().as_secs_f64() * 1e3,
-                phases,
-                gap,
-                phases + gap,
-            );
-        }
+        // Граница раунда. Фазы begin/accept/commit на CUDA только ставят работу
+        // в очередь (D2D-копии чекпоинта, restore теневого снимка, reset_kv_len):
+        // блокирующего чтения в них нет, поэтому их настоящая стоимость всплывает
+        // на первом D2H СЛЕДУЮЩЕГО раунда (draft, затем verify) и попадает в
+        // чужие колонки. Здесь она возвращается в тот раунд, который её породил.
+        // Вызов живёт только под MTP_TIMING — рабочий конвейер не тормозит.
+        let sync_ms = if timing {
+            let t_sync = Instant::now();
+            if let Err(error) = self.model.speculative_timing_sync() {
+                eprintln!("[mtp] синхронизация раунда сорвалась: {error}");
+            }
+            t_sync.elapsed().as_secs_f64() * 1e3
+        } else {
+            0.0
+        };
         if mtp_predict_on() {
             // Разрыв прошлого раунда против m этого — та самая корреляция.
             // Печатаем до обновления, иначе сравним разрыв с самим собой.
@@ -661,9 +669,9 @@ impl<M: BatchModel> BatchScheduler<M> {
                 .map(|logits| top2_gap(logits))
                 .unwrap_or(f32::NAN);
         }
-        self.slot_last_round_end[slot] = Some(Instant::now());
         self.speculative[slot].used = true;
         self.speculative[slot].accepted += accepted;
+        let t_push = Instant::now();
         for token in verified {
             if self.slots[slot].push_verified(&[token]) == 0 {
                 break;
@@ -674,6 +682,45 @@ impl<M: BatchModel> BatchScheduler<M> {
                 break;
             }
         }
+        // Хвост раунда (push принятых токенов + should_stop) раньше попадал в
+        // «разрыв» следующего раунда, где его нельзя было отличить от дренажа
+        // планировщика. Теперь у него своя колонка.
+        let push_ms = if timing {
+            t_push.elapsed().as_secs_f64() * 1e3
+        } else {
+            0.0
+        };
+        if timing {
+            // Разрыв — интервал между раундами (планировщик, дренаж, хостовая
+            // часть). «Раунд» = фазы + sync + push + разрыв, то есть полный
+            // интервал между концами соседних раундов: только он и является
+            // настоящей стоимостью раунда. Сумма шести фаз («фазы») — нижняя
+            // оценка: она не содержит ни отложенной GPU-работы, ни хвоста, ни
+            // дренажа между раундами.
+            let gap = self.slot_last_round_end[slot]
+                .map(|prev| (t_begin - prev).as_secs_f64() * 1e3)
+                .unwrap_or(0.0);
+            let phases = (t_phases_end - t_begin).as_secs_f64() * 1e3;
+            eprintln!(
+                "[mtp] slot={slot} K={} m={} pos={} begin={:.1}ms draft={:.1}ms verify={:.1}ms sample={:.1}ms accept={:.1}ms commit={:.1}ms sync={:.1}ms push={:.1}ms | фазы={:.1}ms разрыв={:.1}ms раунд={:.1}ms",
+                draft.len(),
+                verified_len_for_pred,
+                round_pos,
+                (t_draft - t_begin).as_secs_f64() * 1e3,
+                (t_verify - t_draft).as_secs_f64() * 1e3,
+                (t_sample - t_verify).as_secs_f64() * 1e3,
+                (t_accept - t_sample).as_secs_f64() * 1e3,
+                (t_commit - t_accept).as_secs_f64() * 1e3,
+                (t_phases_end - t_commit).as_secs_f64() * 1e3,
+                sync_ms,
+                push_ms,
+                phases,
+                gap,
+                phases + sync_ms + push_ms + gap,
+            );
+        }
+        self.slot_last_round_end[slot] = Some(Instant::now());
+        // Раунд прошёл целиком: commit состоялся, отката нет.
         Ok(SpeculativeStep::Committed)
     }
 
@@ -694,6 +741,20 @@ impl<M: BatchModel> BatchScheduler<M> {
         if items.is_empty() {
             return Ok(());
         }
+        // Диагностика MTP_TIMING: обычный (неспекулятивный) decode-шаг — это
+        // целый forward на карте, но строки [mtp] он не печатает. Без этой
+        // строки такие шаги (adaptive skip, откат MTP, хвост запроса с
+        // remaining_new_tokens < 2) выпадали из лога целиком.
+        // Замер и сбор id — только под диагностикой: обычный decode-шаг это
+        // горячий путь (в том числе для моделей без MTP), лишняя аллокация и
+        // два чтения часов здесь не нужны.
+        let skip_timing = mtp_timing_on();
+        let skip_t0 = skip_timing.then(Instant::now);
+        let skip_ids: Vec<usize> = if skip_timing {
+            items.iter().map(|item| item.slot_idx).collect()
+        } else {
+            Vec::new()
+        };
         let batch = DecodeBatch { items };
         if trace_on() {
             let poss: Vec<usize> = batch.items.iter().map(|item| item.pos).collect();
@@ -717,6 +778,12 @@ impl<M: BatchModel> BatchScheduler<M> {
             if should_stop(item.slot_idx, self.slots[item.slot_idx].generated_tokens()) {
                 self.slots[item.slot_idx].status = SlotStatus::Finished;
             }
+        }
+        if let Some(skip_t0) = skip_t0 {
+            eprintln!(
+                "[mtp-skip] slots={skip_ids:?} baseline={:.1}ms",
+                skip_t0.elapsed().as_secs_f64() * 1e3
+            );
         }
         Ok(())
     }

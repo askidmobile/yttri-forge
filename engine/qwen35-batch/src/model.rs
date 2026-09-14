@@ -230,6 +230,22 @@ pub trait BatchModel {
         Ok(())
     }
 
+    /// Дождаться завершения всей GPU-работы, поставленной в очередь раундом.
+    ///
+    /// Нужно только диагностике (`MTP_TIMING=1`). Фазы `begin`, `accept` и
+    /// `commit` на CUDA только ставят работу в очередь (D2D-копии чекпоинта,
+    /// restore теневого снимка, `reset_kv_len`) — блокирующего чтения в них нет,
+    /// поэтому их реальная стоимость всплывает на первом D2H СЛЕДУЮЩЕГО раунда
+    /// (`draft`, затем `verify`) и попадает в чужие колонки. Явная граница
+    /// раунда возвращает её туда, где она возникла: без неё раунд с `m < K`
+    /// выглядит дешевле, чем он есть, а следующий за ним — дороже.
+    ///
+    /// В рабочем режиме (без `MTP_TIMING`) не вызывается вовсе, поэтому
+    /// конвейер не тормозит. Дефолт — no-op: синхронизировать нечего.
+    fn speculative_timing_sync(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Сбросить per-slot state слота `idx` (новый запрос).
     fn reset_slot(&mut self, idx: usize) -> Result<()>;
 }
@@ -267,6 +283,9 @@ impl<T: BatchModel + ?Sized> BatchModel for &mut T {
     }
     fn speculative_rollback(&mut self, slot: usize) -> Result<()> {
         (**self).speculative_rollback(slot)
+    }
+    fn speculative_timing_sync(&self) -> Result<()> {
+        (**self).speculative_timing_sync()
     }
 }
 
