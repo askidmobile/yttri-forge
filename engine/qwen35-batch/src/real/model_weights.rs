@@ -1105,6 +1105,29 @@ impl QuantizedEmbedding {
 // Dense MLP (SwiGLU) — идентично Qwen3
 // ════════════════════════════════════════════════════════════════════════════════
 
+/// Размер под-чанка FFN на префилле по оси токенов (env `FFN_PREFILL_CHUNK`).
+///
+/// `0` — считать FFN целиком (поведение до 2026-09-14). По умолчанию `4096`.
+///
+/// Зачем разбиение: промежуточные активации SwiGLU линейны по длине чанка.
+/// gate/up/silu — `[1,T,12288]` в F32 (выход `QMatMul::forward` на CUDA всегда
+/// F32: квантованный matmul пишет `alloc::<f32>`, а F16-сайдкар возвращает
+/// dtype входа), то есть 48 КиБ на токен каждая, down — `[1,T,4096]` (16 КиБ).
+/// При внешнем чанке T=16384 три `[1,T,12288]` это ~2,25 ГиБ единовременно;
+/// вместе с резидуальным потоком блока они не влезают в свободные ~4 ГиБ на
+/// RTX 3060 (веса 4956 МиБ + paged-пул 2064 МиБ из 12288 МиБ) →
+/// `prefill forward: CUDA_ERROR_OUT_OF_MEMORY`. С под-чанком пик FFN
+/// перестаёт зависеть от внешнего T.
+fn prefill_ffn_chunk_size() -> usize {
+    static SZ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SZ.get_or_init(|| {
+        std::env::var("FFN_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4096)
+    })
+}
+
 #[derive(Debug, Clone)]
 struct DenseMlp {
     feed_forward_w1: QMatMul, // gate_proj (ffn_gate)
@@ -1126,7 +1149,45 @@ struct DenseMlp {
 
 impl DenseMlp {
     /// Префилл-путь: если подключён сайдкар, считаем по нему (dual-read).
+    ///
+    /// Длинный чанк идёт под-чанками по оси токенов (`prefill_ffn_chunk_size`):
+    /// промежуточные активации SwiGLU линейны по T и при T=16384 давали OOM.
+    /// Строки матмула независимы, а вход берётся непрерывным срезом, поэтому
+    /// разбиение не меняет арифметику — выход поэлементно тот же, что и при
+    /// целом проходе (отличие только в сборке строк результата `slice_set`).
     fn forward_prefill(&self, xs: &Tensor) -> Result<Tensor> {
+        let chunk = prefill_ffn_chunk_size();
+        let t = match xs.dims() {
+            [_, t, _] => *t,
+            _ => 0,
+        };
+        if chunk == 0 || t <= chunk {
+            return self.forward_prefill_all(xs);
+        }
+        let mut out: Option<Tensor> = None;
+        let mut off = 0usize;
+        while off < t {
+            let len = chunk.min(t - off);
+            let part = self.forward_prefill_all(&xs.narrow(1, off, len)?.contiguous()?)?;
+            let part = part.contiguous()?;
+            match out.as_mut() {
+                Some(dst) => dst.slice_set(&part, 1, off)?,
+                None => {
+                    let (b_sz, _, n_out) = part.dims3()?;
+                    let dst = Tensor::zeros((b_sz, t, n_out), part.dtype(), part.device())?;
+                    dst.slice_set(&part, 1, off)?;
+                    out = Some(dst);
+                }
+            }
+            off += len;
+        }
+        out.ok_or_else(|| {
+            candle_core::Error::Msg("DenseMlp::forward_prefill: пустой вход".into())
+        })
+    }
+
+    /// Один проход FFN без разбиения: F16-сайдкар, если подключён, иначе GGUF-квант.
+    fn forward_prefill_all(&self, xs: &Tensor) -> Result<Tensor> {
         let (Some(w1t), Some(w3t), Some(w2t)) = (&self.f16_w1, &self.f16_w3, &self.f16_w2) else {
             return self.forward(xs);
         };
@@ -10920,4 +10981,69 @@ fn dump_sub(tag: &str, x: &Tensor) {
     }
     let n = DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     dump_write(-1, &format!("{n:03}:{tag}"), x);
+}
+
+#[cfg(test)]
+mod ffn_subchunk_equiv_tests {
+    use super::*;
+
+    fn build_mlp(
+        h: usize,
+        f: usize,
+        dev: &Device,
+        sidecar: bool,
+    ) -> Result<DenseMlp> {
+        let w1 = Tensor::randn(0f32, 0.02f32, (f, h), dev)?;
+        let w3 = Tensor::randn(0f32, 0.02f32, (f, h), dev)?;
+        let w2 = Tensor::randn(0f32, 0.02f32, (h, f), dev)?;
+        let (f16_w1, f16_w2, f16_w3) = if sidecar {
+            (
+                Some(QMatMul::TensorF16(w1.to_dtype(DType::F16)?)),
+                Some(QMatMul::TensorF16(w2.to_dtype(DType::F16)?)),
+                Some(QMatMul::TensorF16(w3.to_dtype(DType::F16)?)),
+            )
+        } else {
+            (None, None, None)
+        };
+        Ok(DenseMlp {
+            feed_forward_w1: QMatMul::Tensor(w1),
+            feed_forward_w2: QMatMul::Tensor(w2),
+            feed_forward_w3: QMatMul::Tensor(w3),
+            #[cfg(target_os = "macos")]
+            feed_forward_w1_opt: None,
+            #[cfg(target_os = "macos")]
+            feed_forward_w2_opt: None,
+            #[cfg(target_os = "macos")]
+            feed_forward_w3_opt: None,
+            f16_w1,
+            f16_w2,
+            f16_w3,
+        })
+    }
+
+    fn compare(sidecar: bool) -> Result<()> {
+        std::env::set_var("FFN_PREFILL_CHUNK", "1024");
+        let dev = Device::Cpu;
+        let (h, f) = (512usize, 1536usize);
+        let t = 1024 * 3 + 7; // хвостовой под-чанк неполный
+        let mlp = build_mlp(h, f, &dev, sidecar)?;
+        let x = Tensor::randn(0f32, 1f32, (1usize, t, h), &dev)?;
+        let chunked = mlp.forward_prefill(&x)?;
+        let full = mlp.forward_prefill_all(&x)?;
+        assert_eq!(chunked.dims(), &[1, t, h]);
+        assert_eq!(chunked.dims(), full.dims());
+        let d = (chunked - full)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(d < 1e-4, "sidecar={sidecar}: max |chunked - full| = {d}");
+        Ok(())
+    }
+
+    #[test]
+    fn subchunk_matches_full_pass_sidecar() -> Result<()> {
+        compare(true)
+    }
+
+    #[test]
+    fn subchunk_matches_full_pass_no_sidecar() -> Result<()> {
+        compare(false)
+    }
 }
