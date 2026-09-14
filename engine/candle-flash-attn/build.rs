@@ -82,6 +82,38 @@ const HEADER_FILES: [&str; 18] = [
     "kernels/utils.h",
 ];
 
+/// Каталог библиотек CUDA Toolkit для СТАТИЧЕСКОЙ линковки cudart.
+///
+/// Динамический `-lcudart` резолвил линкер через `LIBRARY_PATH` (Linux) или
+/// `LIB` (MSVC), поэтому build.rs про CUDA ничего знать не требовалось. Для
+/// `rustc-link-lib=static=` файл ищет САМ rustc по своим `link-search`-путям
+/// и падает раньше линкера — значит путь нужно сообщить явно.
+///
+/// Корень берём из окружения: его выставляют и `build_linux.sh`, и
+/// `with_msvc.ps1` (там же пинится нужная версия тулкита).
+fn cuda_lib_dir(is_target_msvc: bool) -> Option<PathBuf> {
+    let root = ["CUDA_PATH", "CUDA_ROOT", "CUDA_HOME", "CUDA_TOOLKIT_ROOT_DIR"]
+        .iter()
+        .find_map(std::env::var_os)
+        .map(PathBuf::from)?;
+
+    let candidates: Vec<PathBuf> = if is_target_msvc {
+        vec![root.join("lib").join("x64")]
+    } else {
+        vec![
+            root.join("lib64"),
+            root.join("targets").join("x86_64-linux").join("lib"),
+            root.join("lib"),
+        ]
+    };
+    let stem = if is_target_msvc {
+        "cudart_static.lib"
+    } else {
+        "libcudart_static.a"
+    };
+    candidates.into_iter().find(|dir| dir.join(stem).is_file())
+}
+
 fn update_hash(hash: &mut u64, bytes: &[u8]) {
     const FNV_PRIME: u64 = 1099511628211;
     for &byte in bytes {
@@ -160,8 +192,43 @@ fn main() -> Result<()> {
 
     println!("cargo::rustc-link-search={}", build_dir.display());
     println!("cargo::rustc-link-lib=flashattention");
-    println!("cargo::rustc-link-lib=dylib=cudart");
+
+    // cudart линкуется СТАТИЧЕСКИ, а не как dylib.
+    //
+    // Динамический вариант кладёт в итоговый бинарь жёсткую зависимость —
+    // импорт `cudart64_12.dll` на Windows, `DT_NEEDED libcudart.so.12` на
+    // Linux, — и загрузчик резолвит её ДО main(). На машине без CUDA-рантайма
+    // приложение не стартует вовсе: ни окна с ошибкой, ни строки в логах,
+    // даже если GPU не нужен и код FlashAttention никогда не вызывается.
+    // Так умерла бета Yttri 0.89.3-beta.1 на Windows и Linux (2026-09-14).
+    //
+    // Статический cudart сам грузит драйвер (`nvcuda.dll` / `libcuda.so.1`)
+    // лениво, поэтому бинарь остаётся запускаемым везде, а CUDA-функции
+    // отказывают в рантайме — это и есть ожидаемое поведение.
+    //
+    // Второго экземпляра рантайма в процессе не появляется: потребители
+    // линкуют `cudarc` с `features = ["driver"]`, то есть используют
+    // driver API, а не runtime API. Семантика выполнения не меняется —
+    // меняется только момент и способ загрузки.
+    for var in ["CUDA_PATH", "CUDA_ROOT", "CUDA_HOME", "CUDA_TOOLKIT_ROOT_DIR"] {
+        println!("cargo::rerun-if-env-changed={var}");
+    }
+    let Some(cuda_lib) = cuda_lib_dir(is_target_msvc) else {
+        panic!(
+            "cudart_static не найден: задай CUDA_PATH (или CUDA_ROOT/CUDA_HOME) \
+             на корень CUDA Toolkit. Динамический cudart намеренно НЕ используется — \
+             он делает бинарь незапускаемым на машине без CUDA-рантайма."
+        );
+    };
+    println!("cargo::rustc-link-search=native={}", cuda_lib.display());
+    println!("cargo::rustc-link-lib=static=cudart_static");
     if !is_target_msvc {
+        // Зависимости статического cudart: динамическая загрузка драйвера и
+        // таймеры. На glibc 2.34+ они слиты в libc, но стаб-библиотеки на
+        // месте и линковка от их упоминания не страдает.
+        println!("cargo::rustc-link-lib=dylib=dl");
+        println!("cargo::rustc-link-lib=dylib=rt");
+        println!("cargo::rustc-link-lib=dylib=pthread");
         println!("cargo::rustc-link-lib=dylib=stdc++");
     }
     Ok(())
