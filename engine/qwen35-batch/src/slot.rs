@@ -62,6 +62,11 @@ pub struct Slot {
     /// Возрастает на 1 за decode-шаг; во время prefill — растёт на размер чанка.
     /// pub(crate): scheduler выставляет при primed-admit (prefix cache).
     pub(crate) index_pos: usize,
+    /// Верхняя граница ПЕРВОГО prefill-чанка запроса. Нужна, чтобы разбить
+    /// длинный промпт на границе, которую prefix cache сможет переиспользовать:
+    /// чанк режется на токене `<|im_start|>` последнего сообщения, и снимок
+    /// ложится ровно на стык истории и генерационного суффикса.
+    pub(crate) first_chunk: Option<usize>,
 }
 
 impl Slot {
@@ -73,6 +78,7 @@ impl Slot {
             prefill_done: 0,
             generated: Vec::new(),
             index_pos: 0,
+            first_chunk: None,
         }
     }
 
@@ -83,14 +89,22 @@ impl Slot {
         self.prefill_done = 0;
         self.generated.clear();
         self.index_pos = 0;
+        self.first_chunk = None;
     }
 
     /// Принять новый запрос и перейти в Prefilling.
     pub fn admit(&mut self, req: SlotRequest) {
+        self.admit_with_first_chunk(req, None)
+    }
+
+    /// Как `admit`, но первый prefill-чанк ограничен `first_chunk` токенами
+    /// (prefix-cache friendly split). `None` = обычное поведение.
+    pub fn admit_with_first_chunk(&mut self, req: SlotRequest, first_chunk: Option<usize>) {
         debug_assert_eq!(self.status, SlotStatus::Idle, "admit в занятый слот");
         self.reset();
         self.request = Some(req);
         self.status = SlotStatus::Prefilling;
+        self.first_chunk = first_chunk.filter(|k| *k > 0);
     }
 
     /// Токены prompt'а, ещё не обработанные prefill'ом.

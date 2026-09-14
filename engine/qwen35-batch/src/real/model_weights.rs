@@ -9681,6 +9681,50 @@ impl ModelWeights {
             .ok_or_else(|| candle_core::Error::Msg("paged ctx missing".into()))?
             .max_blocks;
         let ps = crate::real::paged_kv_cuda::PAGE_SIZE;
+
+        // int8-пул: append-ядро пишет от позиции kv_len[slot], поэтому перед
+        // квантующей миграцией слот стейджится как пустой, а строка block-table
+        // указывает на страницы этого слота.
+        let q8_len = {
+            let is_q8 = self.blocks.iter().any(|b| match &b.layer {
+                HybridLayerType::Attention(a) => a
+                    .paged_pool
+                    .as_ref()
+                    .map(|p| p.k_scale.is_some())
+                    .unwrap_or(false),
+                _ => false,
+            });
+            if is_q8 {
+                let l = self
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match &b.layer {
+                        HybridLayerType::Attention(a) => Some(a.kv_cache_len_batched[slot]),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                if l > mb * ps {
+                    candle_core::bail!("slot {slot} kv_len {l} exceeds paged window");
+                }
+                if l > 0 {
+                    let pages: Vec<u32> = (0..mb as u32)
+                        .map(|j| slot as u32 * mb as u32 + j)
+                        .collect();
+                    if let Some(ctx) = self.paged_ctx.as_mut() {
+                        ctx.stage_block_table_row(slot, &pages)?;
+                        ctx.dev.memcpy_htod(&[slot as u32], &mut ctx.slots_dev)?;
+                        let mut lens = ctx.kv_len_host.clone();
+                        lens[slot] = 0;
+                        ctx.reset_kv_len(&lens)?;
+                    }
+                }
+                Some(l)
+            } else {
+                None
+            }
+        };
+
         let mut len = 0usize;
         for block in self.blocks.iter_mut() {
             if let HybridLayerType::Attention(a) = &mut block.layer {
@@ -9700,17 +9744,20 @@ impl ModelWeights {
                     .paged_pool
                     .as_ref()
                     .ok_or_else(|| candle_core::Error::Msg("migrate: paged pool missing".into()))?;
-                if pool.k_scale.is_some() {
-                    // Миграция копирует F16 постранично; для байтового пула
-                    // нужна квантующая копия. При graph-префилле (умолчание)
-                    // миграции не бывает — KV пишется в пул сразу.
-                    candle_core::bail!(
-                        "int8-пул несовместим с миграцией из batched-кэша: \
-                         нужен graph-префилл (PGRAPH=on, это умолчание)"
-                    );
-                }
                 let n_kv = a.n_kv_head;
                 let hd = a.head_dim;
+                if pool.k_scale.is_some() {
+                    // int8-пул принимает только квантующую запись: пишем готовые
+                    // F16-строки префилла тем же ядром, которым graph-префилл
+                    // наполняет пул (оно само считает масштабы на (токен, голова)).
+                    // Это снимает требование «PGRAPH=on ради декода».
+                    let ctx_ref = self
+                        .paged_ctx
+                        .as_ref()
+                        .ok_or_else(|| candle_core::Error::Msg("migrate: ctx missing".into()))?;
+                    pool.launch_append_multi(ctx_ref, &k, &v, 1, kv_len, n_kv, hd, a.attn_window)?;
+                    continue;
+                }
                 let elem_per_token = n_kv * hd;
 
                 let (k_st, k_l) = k.storage_and_layout();
@@ -9765,6 +9812,16 @@ impl ModelWeights {
                 }
             }
         }
+        if let Some(l) = q8_len {
+            if l > 0 {
+                if let Some(ctx) = self.paged_ctx.as_mut() {
+                    let mut lens = ctx.kv_len_host.clone();
+                    lens[slot] = l as u32;
+                    ctx.reset_kv_len(&lens)?;
+                }
+            }
+        }
+
         // Освобождаем batched-кэш: после миграции авторитетная копия KV — пул.
         //
         // Ранняя правка 2026-08-24 тоже это делала и была откачена, потому что

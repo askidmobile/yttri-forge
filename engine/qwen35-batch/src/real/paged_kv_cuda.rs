@@ -145,6 +145,19 @@ impl PagedModelCtx {
         Ok(())
     }
 
+    /// Записать строку block_table_t одного слота — вне графа. Нужно миграции
+    /// KV из batched-кэша в пул: она работает вне графового прохода и не может
+    /// пользоваться `stage_inputs`, который пишет таблицу с нулевой строки.
+    pub fn stage_block_table_row(&mut self, slot: usize, pages: &[u32]) -> Result<()> {
+        let device = Device::Cuda(self.dev.clone());
+        let bt_staging = Tensor::from_vec(pages.to_vec(), (1, self.max_blocks), &Device::Cpu)?
+            .to_device(&device)?;
+        self.block_table_t
+            .narrow(0, slot, 1)?
+            .slice_set(&bt_staging, 0, 0)?;
+        Ok(())
+    }
+
     /// Сброс kv_len на device (после seed/restore) — вне графа.
     pub fn reset_kv_len(&mut self, lens: &[u32]) -> Result<()> {
         self.dev.memcpy_htod(lens, &mut self.kv_len_dev)?;
@@ -532,6 +545,7 @@ impl PagedKvPool {
         unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
         Ok(())
     }
+
 }
 
 /// MTP-голова: дописать одну строку K/V в плоский кеш `[1, cap, n_kv, hd]` F16

@@ -236,9 +236,17 @@ fn prefix_cache_checkpoint_max() -> usize {
     })
 }
 
-#[inline]
-fn is_prefix_cache_checkpoint(pos: usize) -> bool {
-    pos > 0 && pos <= prefix_cache_checkpoint_max() && pos.is_power_of_two()
+/// Сколько граничных снимков максимум хранить на один запрос. При чанке 512
+/// и промпте 25K без потолка набралось бы пять десятков снимков.
+fn prefix_cache_checkpoint_cap() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("PREFIX_CACHE_CHECKPOINT_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(8)
+    })
 }
 /// Размер пула декодных графов. Ключ — только ширина батча b (состав слотов
 /// ядра читают из стейджинга PagedModelCtx::slots_dev), так что различных
@@ -1136,12 +1144,17 @@ impl BatchModel for Qwen35BatchAdapter {
         // Снимок границы для prefix cache: состояние слота здесь отвечает
         // ровно chunk.start_pos, и эта позиция кратна размеру чанка.
         let prefix_limit = prefix_cache_max_tokens();
-        let capture_extra =
-            prefix_cache_checkpoints_enabled() && is_prefix_cache_checkpoint(chunk.start_pos);
+        // Снимок на КАЖДОЙ границе чанка: именно эти позиции лежат на стыке
+        // истории и генерационного суффикса, поэтому переиспользуются следую-
+        // щим ходом диалога. Число снимков ограничено, чтобы host RAM не рос
+        // при мелком чанке.
+        let capture_boundary = prefix_cache_checkpoints_enabled()
+            && chunk.start_pos > 0
+            && self.slot_prefix_snaps[sidx].len() < prefix_cache_checkpoint_cap();
         let capture_final = chunk.is_final && chunk.start_pos > 0;
         let capture_position = chunk.start_pos > 0
             && chunk.start_pos <= prefix_limit
-            && (capture_extra || capture_final);
+            && (capture_boundary || capture_final);
         let already_captured = self.slot_prefix_snaps[sidx].iter().any(|(pos, _)| *pos == chunk.start_pos);
         if self.capture_prefix && capture_position && !already_captured {
             let device_snap = self

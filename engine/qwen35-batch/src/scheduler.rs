@@ -239,6 +239,31 @@ impl<M: BatchModel> BatchScheduler<M> {
         }
     }
 
+    /// Как `submit`, но первый prefill-чанк режется до `first_chunk` токенов.
+    /// Так промпт получает границу на стыке истории и генерационного суффикса,
+    /// и prefix cache может переиспользовать его на следующем ходу. Без этого
+    /// промпт длиннее одного чанка не даёт ни одного cacheable-снимка, кроме
+    /// самого конца (который следующим ходом уже не является префиксом).
+    pub fn submit_with_first_chunk(
+        &mut self,
+        prompt: Vec<u32>,
+        max_new: usize,
+        first_chunk: Option<usize>,
+    ) -> Option<usize> {
+        let req = SlotRequest {
+            prompt,
+            max_new,
+            eos: self.eos,
+        };
+        if let Some(idx) = self.idle_slot() {
+            self.slots[idx].admit_with_first_chunk(req, first_chunk);
+            self.reset_slot_speculative(idx);
+            return Some(idx);
+        }
+        self.queue.push_back(req);
+        None
+    }
+
     /// Подать запрос; возвращает индекс admit'нутого слота, либо None если ставился в очередь.
     pub fn submit(&mut self, prompt: Vec<u32>, max_new: usize) -> Option<usize> {
         let req = SlotRequest {
@@ -686,7 +711,15 @@ impl<M: BatchModel> BatchScheduler<M> {
     fn next_prefill_chunk(&self) -> Option<(usize, usize)> {
         for s in &self.slots {
             if s.is_prefilling() {
-                let n = s.prefill_remaining_slice().len().min(prefill_chunk_size());
+                let remaining = s.prefill_remaining_slice().len();
+                let mut n = remaining.min(prefill_chunk_size());
+                // Первый чанк может быть ограничен вызывающим: нужная граница
+                // для prefix cache важнее максимального размера чанка.
+                if s.prefill_done == 0 {
+                    if let Some(k) = s.first_chunk {
+                        n = n.min(k);
+                    }
+                }
                 return Some((s.idx, n));
             }
         }
