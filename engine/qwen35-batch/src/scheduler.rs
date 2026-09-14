@@ -26,8 +26,8 @@ use std::time::Instant;
 use anyhow::Result;
 
 use crate::model::{
-    BatchModel, DecodeBatch, DecodeItem, GreedySampler, PrefillChunk, Sampler,
-    SpeculativeFallback, SpeculativeMetrics,
+    BatchModel, DecodeBatch, DecodeItem, GreedySampler, PrefillChunk, Sampler, SpeculativeFallback,
+    SpeculativeMetrics,
 };
 use crate::slot::{Slot, SlotRequest, SlotStatus};
 
@@ -128,13 +128,20 @@ fn mtp_adaptive_on() -> bool {
 /// Диагностический trace шагов (TRACE=1) — для расследования зависаний
 /// dispatch loop в qwen36-server. Дёшево: одна проверка env на шаг.
 fn trace_value_on(value: &str) -> bool {
-    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[inline]
 pub fn trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TRACE").map(|v| trace_value_on(&v)).unwrap_or(false))
+    *ON.get_or_init(|| {
+        std::env::var("TRACE")
+            .map(|v| trace_value_on(&v))
+            .unwrap_or(false)
+    })
 }
 
 /// Фазовый тайминг MTP-раунда (env MTP_TIMING=1) — per-round eprintln.
@@ -142,7 +149,9 @@ pub fn trace_on() -> bool {
 pub(crate) fn mtp_timing_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("MTP_TIMING").map(|v| trace_value_on(&v)).unwrap_or(false)
+        std::env::var("MTP_TIMING")
+            .map(|v| trace_value_on(&v))
+            .unwrap_or(false)
     })
 }
 
@@ -198,6 +207,18 @@ pub enum StepOutcome {
     DidPrefill { first_token_emitted: bool },
     /// Выполнен batched decode-шаг (B = batch size).
     DidDecode(usize),
+}
+
+/// Результат одной попытки спекулятивного раунда для слота.
+///
+/// Adaptive skip — не откат: транзакция ещё не открывалась, target state не
+/// менялся, поэтому текущий шаг просто уходит в обычный `decode_batch`. Держим
+/// его отдельно от [`SpeculativeFallback`], чтобы отчёт `fallback_category`
+/// содержал только реальные причины отката транзакции.
+enum SpeculativeStep {
+    Committed,
+    AdaptiveSkip,
+    Fallback(SpeculativeFallback),
 }
 
 /// Разрыв между первым и вторым логитом. Softmax не нужен: для сравнения
@@ -430,11 +451,11 @@ impl<M: BatchModel> BatchScheduler<M> {
                 fallback.push(slot);
                 continue;
             }
-            if let Some(category) = self.speculative_slot(slot, should_stop)? {
-                self.speculative[slot].fallback = Some(category);
-                if category == SpeculativeFallback::Cancelled {
-                    self.slots[slot].status = SlotStatus::Finished;
-                } else {
+            match self.speculative_slot(slot, should_stop)? {
+                SpeculativeStep::Committed => {}
+                SpeculativeStep::AdaptiveSkip => fallback.push(slot),
+                SpeculativeStep::Fallback(category) => {
+                    self.speculative[slot].fallback = Some(category);
                     fallback.push(slot);
                 }
             }
@@ -466,7 +487,7 @@ impl<M: BatchModel> BatchScheduler<M> {
         &mut self,
         slot: usize,
         should_stop: &mut dyn FnMut(usize, &[u32]) -> bool,
-    ) -> Result<Option<SpeculativeFallback>> {
+    ) -> Result<SpeculativeStep> {
         // Фазовый тайминг раунда (env MTP_TIMING=1) — host-bound decode
         // требует знать, куда уходит время, прежде чем что-то оптимизировать.
         let timing = mtp_timing_on();
@@ -483,7 +504,9 @@ impl<M: BatchModel> BatchScheduler<M> {
         // MTP мёртв до конца запроса. При включённом по умолчанию адаптиве это
         // случалось на втором-четвёртом раунде каждого запроса. Заодно пропуск
         // больше не платит чекпоинтом DeltaNet (копия всех слоёв) впустую.
-        let mut width = self.slots[slot].remaining_new_tokens().min(speculative_width());
+        let mut width = self.slots[slot]
+            .remaining_new_tokens()
+            .min(speculative_width());
         if mtp_adaptive_on() {
             let (last_m, last_k) = (self.slot_last_m[slot], self.slot_last_k[slot]);
             if last_m >= last_k {
@@ -496,7 +519,7 @@ impl<M: BatchModel> BatchScheduler<M> {
                 // Probe каждые 4 шага: не залипнуть в baseline навсегда.
                 self.skip_count[slot] += 1;
                 if self.skip_count[slot] % 4 != 3 {
-                    return Ok(Some(SpeculativeFallback::Draft));
+                    return Ok(SpeculativeStep::AdaptiveSkip);
                 }
                 self.slot_last_k[slot] = 2;
             }
@@ -508,7 +531,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             eprintln!("[mtp] начало раунда сорвалось: {e}");
             self.model.speculative_rollback(slot)?;
             self.sampler.restore(slot, sampler_checkpoint)?;
-            return Ok(Some(SpeculativeFallback::Begin));
+            return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Begin));
         }
         let t_draft = Instant::now();
 
@@ -529,7 +552,7 @@ impl<M: BatchModel> BatchScheduler<M> {
                 }
                 self.model.speculative_rollback(slot)?;
                 self.sampler.restore(slot, sampler_checkpoint)?;
-                return Ok(Some(SpeculativeFallback::Draft));
+                return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Draft));
             }
         };
         self.speculative[slot].drafted += draft.len();
@@ -562,7 +585,7 @@ impl<M: BatchModel> BatchScheduler<M> {
                 }
                 self.model.speculative_rollback(slot)?;
                 self.sampler.restore(slot, sampler_checkpoint)?;
-                return Ok(Some(SpeculativeFallback::Commit));
+                return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Commit));
             }
         };
         let t_sample = Instant::now();
@@ -586,14 +609,14 @@ impl<M: BatchModel> BatchScheduler<M> {
         if self.model.speculative_accept(slot, verified.len()).is_err() {
             self.model.speculative_rollback(slot)?;
             self.sampler.restore(slot, sampler_checkpoint)?;
-            return Ok(Some(SpeculativeFallback::Commit));
+            return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Commit));
         }
         let t_commit = Instant::now();
 
         if self.model.speculative_commit(slot).is_err() {
             self.model.speculative_rollback(slot)?;
             self.sampler.restore(slot, sampler_checkpoint)?;
-            return Ok(Some(SpeculativeFallback::Commit));
+            return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Commit));
         }
         // P0.5c: фиксируем результат раунда для adaptive width.
         let verified_len_for_pred = verified.len();
@@ -629,8 +652,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             if self.slot_prev_gap[slot].is_finite() {
                 eprintln!(
                     "[mtp-pred] slot={slot} разрыв_прошлого={:.3} m={}",
-                    self.slot_prev_gap[slot],
-                    verified_len_for_pred
+                    self.slot_prev_gap[slot], verified_len_for_pred
                 );
             }
             // Новый разрыв — с последней использованной строки проверки.
@@ -652,7 +674,7 @@ impl<M: BatchModel> BatchScheduler<M> {
                 break;
             }
         }
-        Ok(None)
+        Ok(SpeculativeStep::Committed)
     }
 
     fn baseline_decode_slots(
