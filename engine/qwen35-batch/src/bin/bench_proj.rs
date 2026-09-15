@@ -116,7 +116,38 @@ fn main() -> Result<()> {
     // Слитая проекция: qkv+z+b+a одним тензором — экономия запусков и один
     // проход по активациям вместо четырёх.
     let fused_n = 8192 + 4096 + 32 + 32;
-    if !want("fused") && !want("fusedpad") {
+    if !want("fused") && !want("fusedpad") && !want("fusedonly") && !want("split4") {
+        return Ok(());
+    }
+    // Изолированные режимы: в процессе измеряется ТОЛЬКО одна конфигурация.
+    // Комментарий ниже предупреждает, что замеры отравляют друг друга — и это
+    // подтвердилось: одна и та же форма давала 0.429 мс внутри прогона all и
+    // 0.044 мс отдельным процессом. Поэтому сравнение слитой и раздельных
+    // проекций надо делать разными запусками.
+    if want("fusedonly") || want("split4") {
+        let iso_w = mk_w(fused_n)?;
+        for (label, dtype) in [("Q4_K MMQ", GgmlDType::Q4K), ("Q8_0 MMQ", GgmlDType::Q8_0)] {
+            if want("fusedonly") {
+                let fused = qmatmul(&iso_w, dtype, &dev)?;
+                let ms = timed(&dev, ITERS, || {
+                    fused.forward(&x)?;
+                    Ok(())
+                })?;
+                println!("ISO fused  {label:<10} M={m} {ms:7.3} мс");
+            } else {
+                let parts: Vec<QMatMul> = [8192usize, 4096, 32, 32]
+                    .iter()
+                    .map(|&n| qmatmul(&mk_w(n).unwrap(), dtype, &dev))
+                    .collect::<Result<_>>()?;
+                let ms = timed(&dev, ITERS, || {
+                    for p in &parts {
+                        p.forward(&x)?;
+                    }
+                    Ok(())
+                })?;
+                println!("ISO split4 {label:<10} M={m} {ms:7.3} мс");
+            }
+        }
         return Ok(());
     }
     // Сравнивать можно только пары, снятые подряд: в одном процессе замеры
