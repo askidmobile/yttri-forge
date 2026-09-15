@@ -76,6 +76,16 @@ fn prefix_cache_tail_split() -> bool {
     std::env::var("PREFIX_CACHE_TAIL_SPLIT").as_deref() == Ok("1")
 }
 
+/// Выравнивание границы хвост-сплита: совпадает со страницей paged KV-пула,
+/// по которой prefix cache строит хеш границы записи.
+fn prefix_cache_tail_align() -> usize {
+    std::env::var("PREFIX_CACHE_TAIL_ALIGN")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(64)
+}
+
 pub fn prefill_chunk_size() -> usize {
     static SZ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SZ.get_or_init(|| {
@@ -813,8 +823,21 @@ impl<M: BatchModel> BatchScheduler<M> {
                         n = n.min(k);
                     }
                 }
-                if prefix_cache_tail_split() && n > 1 && n == remaining {
-                    n -= 1;
+                if prefix_cache_tail_split() && n == remaining {
+                    // Граница снимка обязана лечь на страницу paged-пула
+                    // (BLOCK_TOKENS = 64): prefix cache индексирует записи по
+                    // хешам ПОЛНЫХ блоков, и невыравненная позиция в find не
+                    // находится - проверено, хвост-сплит ровно на len-1 не
+                    // давал ни одного попадания. Берём наибольшее кратное
+                    // align, не превосходящее total-1, чтобы на получение
+                    // логитов остался хотя бы один токен.
+                    let align = prefix_cache_tail_align();
+                    let total = s.prefill_done + remaining;
+                    let target = (total.saturating_sub(1) / align) * align;
+                    let cut = target.saturating_sub(s.prefill_done);
+                    if cut > 0 && cut < n {
+                        n = cut;
+                    }
                 }
                 return Some((s.idx, n));
             }
