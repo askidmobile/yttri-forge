@@ -26,6 +26,7 @@ pub mod slot;
 /// Реальная GGUF-модель Qwen3.5 (порт из Yttri) — только за фичей `real-model`.
 #[cfg(feature = "real-model")]
 pub mod real;
+pub mod page_prefix_index;
 
 pub use model::{BatchModel, DecodeBatch, MultimodalPrefill, PrefillChunk};
 pub use scheduler::{BatchScheduler, SchedulerStats};
