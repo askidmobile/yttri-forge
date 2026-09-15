@@ -548,6 +548,71 @@ extern "C" __global__ void delta_rule_kernel_batched_seq_smem(
     }
 }
 
+
+// Column-split variant (decode, batch=1). Столбцы состояния независимы, поэтому
+// режем их МЕЖДУ блоками (blockIdx.z): базовый вариант при декоде стартует
+// grid=(n_v, B, 1) = 8 блоков на 28 SM.
+// Launch: grid=(n_v, B, hd/DR_COLS), block=(DR_COLS, DR_ROWGRP, 1),
+// shared = DR_COLS*DR_ROWGRP*4.
+#define DR_COLS 32
+
+extern "C" __global__ void delta_rule_kernel_batched_splitc(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ beta,
+    const float* __restrict__ gate,
+    float* __restrict__ ssm_state,
+    float* __restrict__ output,
+    const DeltaParams params,
+    const unsigned int* __restrict__ slots
+) {
+    extern __shared__ float sredc[];
+    const unsigned int hd = params.head_v_dim;
+    const unsigned int n_v = params.n_v_heads;
+    const unsigned int head = blockIdx.x;
+    const unsigned int bidx = blockIdx.y;
+    const unsigned int col = blockIdx.z * DR_COLS + threadIdx.x;
+    const unsigned int rg = threadIdx.y;
+    if (col >= hd) { return; }
+    const unsigned int rows_per = hd / DR_ROWGRP;
+    const unsigned int row0 = rg * rows_per;
+    const unsigned int real_slot = slots[bidx];
+    const unsigned int slot_head = bidx * n_v + head;
+    const unsigned int vec_base = bidx * n_v * hd + head * hd;
+    float* state = ssm_state + real_slot * n_v * hd * hd + head * hd * hd;
+    const float gate_exp = __expf(gate[slot_head]);
+    const float beta_h = beta[slot_head];
+    float st[32];
+    float sk_part = 0.0f;
+    for (unsigned int r = 0; r < rows_per; r++) {
+        const float sv = state[(row0 + r) * hd + col] * gate_exp;
+        st[r] = sv;
+        sk_part += sv * k[vec_base + row0 + r];
+    }
+    sredc[threadIdx.x * DR_ROWGRP + rg] = sk_part;
+    __syncthreads();
+    float sk_val = 0.0f;
+    #pragma unroll
+    for (unsigned int g = 0; g < DR_ROWGRP; g++) { sk_val += sredc[threadIdx.x * DR_ROWGRP + g]; }
+    const float d_col = (v[vec_base + col] - sk_val) * beta_h;
+    float out_part = 0.0f;
+    for (unsigned int r = 0; r < rows_per; r++) {
+        const float sv = st[r] + k[vec_base + row0 + r] * d_col;
+        state[(row0 + r) * hd + col] = sv;
+        out_part += sv * q[vec_base + row0 + r];
+    }
+    __syncthreads();
+    sredc[threadIdx.x * DR_ROWGRP + rg] = out_part;
+    __syncthreads();
+    if (rg == 0) {
+        float o = 0.0f;
+        #pragma unroll
+        for (unsigned int g = 0; g < DR_ROWGRP; g++) { o += sredc[threadIdx.x * DR_ROWGRP + g]; }
+        output[vec_base + col] = o;
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Kernel 4: delta_norm_gate_kernel_batched
 //

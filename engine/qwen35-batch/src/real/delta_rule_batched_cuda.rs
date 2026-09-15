@@ -411,7 +411,22 @@ pub fn dispatch_delta_rule_batched(
         const ROWGRP: u32 = 4;
         let single = std::env::var("DELTA_DECODE").as_deref() == Ok("single");
         let split_ok = !single && hvd % ROWGRP == 0 && (hvd / ROWGRP) <= 32;
-        let (name, cfg) = if split_ok {
+        // Столбцы состояния независимы: режем их между блоками (grid.z),
+        // иначе при B=1 сетка = 8 блоков на 28 SM. DELTA_DECODE=cols.
+        const COLS: u32 = 32;
+        let cols = std::env::var("DELTA_DECODE").as_deref() == Ok("cols")
+            && hvd % COLS == 0
+            && COLS * ROWGRP <= 1024;
+        let (name, cfg) = if cols {
+            (
+                "delta_rule_kernel_batched_splitc",
+                LaunchConfig {
+                    grid_dim: (n_v, b_u32, hvd / COLS),
+                    block_dim: (COLS, ROWGRP, 1),
+                    shared_mem_bytes: COLS * ROWGRP * 4,
+                },
+            )
+        } else if split_ok {
             (
                 "delta_rule_kernel_batched_split",
                 LaunchConfig {
