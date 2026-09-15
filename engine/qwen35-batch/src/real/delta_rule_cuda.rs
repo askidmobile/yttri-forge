@@ -212,15 +212,33 @@ pub fn dispatch_delta_rule(
         unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
 
-    // ── Kernel 3: delta_rule_kernel ──
-    // grid=(n_v,1,1), block=(head_v_dim,1,1)
+    // ── Kernel 3: delta_rule_kernel (или тайловый вариант) ──
+    // Обычный: grid=(n_v,1,1), block=(head_v_dim,1,1).
+    // Тайловый (YTTRI_GDN_TILED=1): grid=(n_v, ceil(hvd/32),1),
+    // block=(32,8,1) — состояние тайлится и по строкам, варпов на SM в 8 раз
+    // больше. Математика та же.
     {
-        let func = dev.get_or_load_func("delta_rule_kernel", &candle_kernels::DELTA_RULE)?;
-        let cfg = LaunchConfig {
-            grid_dim: (n_v, 1, 1),
-            block_dim: (hvd, 1, 1),
-            shared_mem_bytes: 0,
+        let tiled = std::env::var("YTTRI_GDN_TILED").as_deref() == Ok("1");
+        let (name, cfg) = if tiled {
+            (
+                "delta_rule_kernel_tiled",
+                LaunchConfig {
+                    grid_dim: (n_v, hvd.div_ceil(32), 1),
+                    block_dim: (32, 8, 1),
+                    shared_mem_bytes: 0,
+                },
+            )
+        } else {
+            (
+                "delta_rule_kernel",
+                LaunchConfig {
+                    grid_dim: (n_v, 1, 1),
+                    block_dim: (hvd, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+            )
         };
+        let func = dev.get_or_load_func(name, &candle_kernels::DELTA_RULE)?;
         let mut b = func.builder();
         b.arg(&temp.q);
         b.arg(&temp.k);

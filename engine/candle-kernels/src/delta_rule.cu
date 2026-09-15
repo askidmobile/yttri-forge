@@ -260,6 +260,88 @@ extern "C" __global__ void delta_rule_kernel(
     output[vec_base + col] = out_val;
 }
 
+
+// ===============================================================
+// Kernel 3b: delta_rule_kernel_tiled  (decode, row+column tiling)
+//
+// Тот же математически шаг, что delta_rule_kernel, но состояние тайлится и по
+// строкам: один блок покрывает все hd строк и DRT_COL столбцов. Каждый поток
+// владеет (col, row-slot) и проходит hd/DRT_ROWSLOT строк, частичные суммы
+// сворачиваются в общей памяти блока. При 8 головах сетка становится
+// (8, hd/32) = 32 блока x 256 потоков вместо 8 блоков x 128 потоков, то есть
+// в 8 раз больше варпов на тех же SM — иначе задержки глобальной памяти
+// прятать нечем (профиль: это 58 % шага декода).
+//
+// Launch: grid=(n_v_heads, ceil(hd/DRT_COL), 1), block=(DRT_COL, DRT_ROWSLOT, 1)
+// ===============================================================
+#define DRT_COL 32
+#define DRT_ROWSLOT 8
+
+extern "C" __global__ void delta_rule_kernel_tiled(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ beta,
+    const float* __restrict__ gate,
+    float* __restrict__ ssm_state,
+    float* __restrict__ output,
+    const DeltaParams params
+) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int hd = params.head_v_dim;
+    const unsigned int col = blockIdx.y * DRT_COL + threadIdx.x;
+    const unsigned int slot = threadIdx.y;
+    if (col >= hd || slot >= DRT_ROWSLOT) { return; }
+
+    const unsigned int state_base = head * hd * hd;
+    const unsigned int vec_base = head * hd;
+
+    __shared__ float sk_sh[DRT_ROWSLOT][DRT_COL];
+    __shared__ float out_sh[DRT_ROWSLOT][DRT_COL];
+    __shared__ float d_sh[DRT_COL];
+
+    const float gate_exp = __expf(gate[head]);
+
+    // 1+2: decay и частичная sk по своим строкам
+    float part = 0.0f;
+    for (unsigned int row = slot; row < hd; row += DRT_ROWSLOT) {
+        const unsigned int idx = state_base + row * hd + col;
+        const float s = ssm_state[idx] * gate_exp;
+        ssm_state[idx] = s;
+        part += s * k[vec_base + row];
+    }
+    sk_sh[slot][threadIdx.x] = part;
+    __syncthreads();
+
+    // 3: d[col] = (v[col] - sum_rows) * beta
+    if (slot == 0) {
+        float tot = 0.0f;
+#pragma unroll
+        for (int s2 = 0; s2 < DRT_ROWSLOT; s2++) { tot += sk_sh[s2][threadIdx.x]; }
+        d_sh[threadIdx.x] = (v[vec_base + col] - tot) * beta[head];
+    }
+    __syncthreads();
+
+    // 4+5: rank-1 update и частичный out
+    const float d = d_sh[threadIdx.x];
+    float out_part = 0.0f;
+    for (unsigned int row = slot; row < hd; row += DRT_ROWSLOT) {
+        const unsigned int idx = state_base + row * hd + col;
+        const float s = ssm_state[idx] + k[vec_base + row] * d;
+        ssm_state[idx] = s;
+        out_part += s * q[vec_base + row];
+    }
+    out_sh[slot][threadIdx.x] = out_part;
+    __syncthreads();
+
+    if (slot == 0) {
+        float tot = 0.0f;
+#pragma unroll
+        for (int s2 = 0; s2 < DRT_ROWSLOT; s2++) { tot += out_sh[s2][threadIdx.x]; }
+        output[vec_base + col] = tot;
+    }
+}
+
 // ===============================================================
 // Kernel 4: delta_norm_gate_kernel
 //
