@@ -72,6 +72,10 @@ pub const PREFILL_CHUNK: usize = 512;
 
 /// Размер чанка prefill с учётом env PREFILL_CHUNK (0/большое = целиком).
 #[inline]
+fn prefix_cache_tail_split() -> bool {
+    std::env::var("PREFIX_CACHE_TAIL_SPLIT").as_deref() == Ok("1")
+}
+
 pub fn prefill_chunk_size() -> usize {
     static SZ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SZ.get_or_init(|| {
@@ -808,6 +812,9 @@ impl<M: BatchModel> BatchScheduler<M> {
                     if let Some(k) = s.first_chunk {
                         n = n.min(k);
                     }
+                }
+                if prefix_cache_tail_split() && n > 1 && n == remaining {
+                    n -= 1;
                 }
                 return Some((s.idx, n));
             }
