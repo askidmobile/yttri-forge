@@ -26,17 +26,19 @@ fn main() -> Result<()> {
     println!("fa_prefill_probe: seqlen={t} h={h} h_k={h_k} d={d} iters={iters}");
 
     // Плотные Q/K/V: q [1, h, T, d], k/v [1, h_k, T, d] F16.
+    // ВАЖНО: FA2 (и серверный fa_probe.rs) ждут [b, seq, heads, d]. Раньше здесь
+    // были [1, h, t, d] и k/v [1, h_k, t, d] — ядро читало это как b=1, seq=h,
+    // heads=t и «мерило» крошечную задачу (5 мс вместо 100).
     let q = Tensor::randn(0f32, 1f32, (1, h, t, d), &dev)?.to_dtype(DType::F16)?;
-    let k = Tensor::randn(0f32, 1f32, (1, h_k, t, d), &dev)?.to_dtype(DType::F16)?;
-    let v = Tensor::randn(0f32, 1f32, (1, h_k, t, d), &dev)?.to_dtype(DType::F16)?;
+    let q_fa = q.transpose(1, 2)?.contiguous()?;
+    let k_fa = Tensor::randn(0f32, 1f32, (1, t, h_k, d), &dev)?.to_dtype(DType::F16)?;
+    let v_fa = Tensor::randn(0f32, 1f32, (1, t, h_k, d), &dev)?.to_dtype(DType::F16)?;
 
     // Пейдженный пул: [num_pages, PAGE, h_k, d] F16 + таблица страниц.
     let n_pages = t.div_ceil(PAGE);
-    let kv_flat = Tensor::randn(0f32, 1f32, (1, h_k, n_pages * PAGE, d), &dev)?
-        .to_dtype(DType::F16)?
-        .reshape((n_pages, PAGE, h_k, d))?;
-    let k_pool = kv_flat.clone();
-    let v_pool = kv_flat;
+    assert_eq!(t % PAGE, 0, "seqlen должен быть кратен странице пула");
+    let k_pool = k_fa.reshape((n_pages, PAGE, h_k, d))?;
+    let v_pool = v_fa.reshape((n_pages, PAGE, h_k, d))?;
     let table: Vec<i32> = (0..n_pages as i32).collect();
     let block_table = Tensor::from_vec(table, (1, n_pages), &dev)?;
 
@@ -49,7 +51,7 @@ fn main() -> Result<()> {
     let mut dense_ms = f64::MAX;
     for it in 0..iters + 1 {
         let t0 = Instant::now();
-        let out = candle_flash_attn::flash_attn(&q, &k, &v, scale, true)?;
+        let out = candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, scale, true)?;
         cuda.cuda_stream().synchronize()?;
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box(&out);
@@ -143,7 +145,7 @@ fn main() -> Result<()> {
     }
 
     // Проверка, что ветки вообще считают одно и то же (средняя |разница|).
-    let dense_out = candle_flash_attn::flash_attn(&q, &k, &v, scale, true)?
+    let dense_out = candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, scale, true)?
         .reshape((t, h, d))?
         .to_dtype(DType::F32)?;
     let paged_out = out_paged.to_dtype(DType::F32)?;
