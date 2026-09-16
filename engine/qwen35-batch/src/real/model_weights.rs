@@ -5540,6 +5540,7 @@ impl HybridBlock {
     ) -> Result<Tensor> {
         let (_b_sz, _seq_len, _n_embd) = x.dims3()?;
         let trace = crate::scheduler::trace_on();
+        #[cfg(feature = "cuda")]
         if trace {
             if let Ok(cd) = x.device().as_cuda_device() {
                 let _ = cd.cuda_stream().synchronize();
