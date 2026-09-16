@@ -3835,9 +3835,13 @@ impl GatedAttentionLayer {
                     }
                 }
                 let t_fa = std::time::Instant::now();
-                let q_f = q.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
-                let k_f = k.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
-                let v_f = v.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
+                // Без `.contiguous()`: candle-flash-attn принимает [b, T, h, d]
+                // как *вид* (в ядро уходят q_row_stride/q_head_stride), а
+                // транспонирование head-major → sequence-major это метаданные.
+                // Копия q/k/v в f16 стоила ~95 мс на 16k-чанк (ucopy_f16 в nsys).
+                let q_f = q.to_dtype(DType::F16)?.transpose(1, 2)?;
+                let k_f = k.to_dtype(DType::F16)?.transpose(1, 2)?;
+                let v_f = v.to_dtype(DType::F16)?.transpose(1, 2)?;
                 let out = candle_flash_attn::flash_attn(&q_f, &k_f, &v_f, scale as f32, true)?;
                 let y = out.transpose(1, 2)?.to_dtype(DType::F32)?;
                 if at_gpf3 {
