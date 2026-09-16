@@ -1008,6 +1008,72 @@ fn trim_pool_cuda(device: &candle_core::Device) {
     }
 }
 
+/// Пиннированный host-буфер под логиты (на Ornith — 248 320 f32 = 993 КБ).
+///
+/// Штатный `Tensor::to_vec1()` на CUDA копирует через pageable staging: замер
+/// `h2d_probe` дал 0.436 мс на этот объём против **0.091 мс** при копировании
+/// в pinned-память (`cuMemHostAlloc` + `cuMemcpyDtoH`). На декоде это ~0.35 мс
+/// на токен, то есть ~2 % шага. Буфер один на поток и переиспользуется.
+#[cfg(feature = "cuda")]
+mod pinned_logits {
+    use candle_core::cuda_backend::cudarc::driver::sys as csys;
+    use candle_core::{DType, Device, Result, Tensor};
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+
+    struct Buf {
+        ptr: *mut c_void,
+        bytes: usize,
+    }
+
+    impl Drop for Buf {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = csys::cuMemFreeHost(self.ptr);
+            }
+        }
+    }
+
+    thread_local! {
+        static BUF: RefCell<Option<Buf>> = const { RefCell::new(None) };
+    }
+
+    /// F32-логиты устройства → `Vec<f32>` через pinned-буфер.
+    pub fn to_vec_f32(device: &Device, t: &Tensor) -> Result<Vec<f32>> {
+        let t = t.to_dtype(DType::F32)?.flatten_all()?.contiguous()?;
+        let n = t.elem_count();
+        let bytes = n * std::mem::size_of::<f32>();
+        let src = crate::real::paged_kv_cuda::tensor_cuda_ptr(&t)?;
+        let mut out = vec![0f32; n];
+        BUF.with(|cell| -> Result<()> {
+            let mut cell = cell.borrow_mut();
+            let need_alloc = match cell.as_ref() {
+                Some(b) => b.bytes < bytes,
+                None => true,
+            };
+            if need_alloc {
+                let mut ptr: *mut c_void = std::ptr::null_mut();
+                let res = unsafe { csys::cuMemHostAlloc(&mut ptr, bytes, 0) };
+                if res != csys::CUresult::CUDA_SUCCESS {
+                    candle_core::bail!("cuMemHostAlloc({bytes}) failed: {res:?}");
+                }
+                *cell = Some(Buf { ptr, bytes });
+            }
+            let buf = cell.as_ref().expect("буфер только что выделен");
+            let res = unsafe { csys::cuMemcpyDtoH_v2(buf.ptr, src, bytes) };
+            if res != csys::CUresult::CUDA_SUCCESS {
+                candle_core::bail!("cuMemcpyDtoH({bytes}) failed: {res:?}");
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf.ptr as *const f32, out.as_mut_ptr(), n);
+            }
+            Ok(())
+        })?;
+        let _ = device;
+        Ok(out)
+    }
+}
+
 impl BatchModel for Qwen35BatchAdapter {
     /// Граница раунда для `MTP_TIMING=1` (см. `BatchModel::speculative_timing_sync`):
     /// применяется только диагностикой, поэтому в рабочем режиме не зовётся.
@@ -2798,13 +2864,8 @@ impl Qwen35BatchAdapter {
                     ctx.kv_len_host[s as usize] += 1;
                 }
             }
-            let flat = logits
-                .to_dtype(DType::F32)
-                .map_err(|e| anyhow!("graph prime logits to_dtype: {e}"))?
-                .flatten_all()
-                .map_err(|e| anyhow!("graph prime logits flatten: {e}"))?
-                .to_vec1()
-                .map_err(|e| anyhow!("graphed logits: {e}"))?;
+            let flat = pinned_logits::to_vec_f32(&self.device, &logits)
+                .map_err(|e| anyhow!("graphed logits (pinned): {e}"))?;
             let vocab = self.vocab_size();
             if flat.len() != b * vocab {
                 return Err(anyhow!("graphed logits length mismatch"));
@@ -2970,16 +3031,8 @@ impl Qwen35BatchAdapter {
             }
         }
         let _ = stream;
-        let flat = state
-            .logits_t
-            .to_dtype(DType::F32)
-            .map_err(|e| {
-                anyhow!("graph logits to_dtype (первая синхронная точка после launch): {e}")
-            })?
-            .flatten_all()
-            .map_err(|e| anyhow!("graph logits flatten: {e}"))?
-            .to_vec1()
-            .map_err(|e| anyhow!("graph logits read: {e}"))?;
+        let flat = pinned_logits::to_vec_f32(&self.device, &state.logits_t)
+            .map_err(|e| anyhow!("graph logits read (pinned): {e}"))?;
         let vocab = self.vocab_size();
         if flat.len() != b * vocab {
             return Err(anyhow!("graph logits length mismatch"));
