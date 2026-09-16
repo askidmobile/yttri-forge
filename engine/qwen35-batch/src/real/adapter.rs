@@ -1424,17 +1424,39 @@ impl BatchModel for Qwen35BatchAdapter {
         }
         let pf_fwd = pf_fwd0.elapsed();
         let pf_l0 = std::time::Instant::now();
-        let logits_f32 = match logits {
-            Some(l) => l
-                .squeeze(0)
-                .map_err(|e| anyhow!("prefill logits squeeze: {e}"))?
-                .to_dtype(DType::F32)
-                .map_err(|e| anyhow!("prefill logits to_dtype: {e}"))?
-                .to_vec1()
-                .map_err(|e| anyhow!("prefill logits to_vec1: {e}"))?,
+        // PREFILL_SKIP_MID_LOGITS=1: у промежуточных чанков логиты не нужны —
+        // их читает только финальный (scheduler.step сэмплирует первый токен
+        // лишь когда промпт исчерпан). Синхронный D2H при этом держит хост
+        // ~5 с на чанк и не даёт ставить следующие ядра заранее.
+        let skip_mid_logits = !chunk.is_final
+            && std::env::var("PREFILL_SKIP_MID_LOGITS").as_deref() == Ok("1");
+        let logits_f32 = if skip_mid_logits {
+            Vec::new()
+        } else {
+            match logits {
+            // Логиты снимаются через pinned-буфер (тот же, что в декоде):
+            // `to_vec1()` идёт через pageable staging и на этом объёме
+            // (993 КБ) стоит ~360 мс на чанк по [pfa] — 0.7 с на 30k-префил.
+            Some(l) => {
+                #[cfg(feature = "cuda")]
+                {
+                    pinned_logits::to_vec_f32(&self.device, &l)
+                        .map_err(|e| anyhow!("prefill logits (pinned): {e}"))?
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    l.squeeze(0)
+                        .map_err(|e| anyhow!("prefill logits squeeze: {e}"))?
+                        .to_dtype(DType::F32)
+                        .map_err(|e| anyhow!("prefill logits to_dtype: {e}"))?
+                        .to_vec1()
+                        .map_err(|e| anyhow!("prefill logits to_vec1: {e}"))?
+                }
+            }
             None => pg_logits
                 .clone()
                 .ok_or_else(|| anyhow!("prefill: логиты не посчитаны"))?,
+            }
         };
         let pf_logits = pf_l0.elapsed();
 

@@ -3642,13 +3642,13 @@ impl GatedAttentionLayer {
         // 2-5. Reshape + norm + RoPE
         let t0 = std::time::Instant::now();
         let qg = qg.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
-        let q = qg
-            .narrow(3, 0, self.head_dim)?
-            .contiguous()?
-            .transpose(1, 2)?;
+        // Без промежуточного `.contiguous()`: у qg срез по последней оси и так
+        // уходит в q_norm/rope, а `gate` используется как strided-множитель.
+        // Копия [T, 16, 256] f32 на слой на чанк стоила ~5 мс ×2 (ucopy_f32 в
+        // nsys), то есть ~80 мс на 16k-чанк — чистая перекладка памяти.
+        let q = qg.narrow(3, 0, self.head_dim)?.transpose(1, 2)?;
         let gate = qg
             .narrow(3, self.head_dim, self.head_dim)?
-            .contiguous()?
             .transpose(1, 2)?;
         let k = k
             .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
