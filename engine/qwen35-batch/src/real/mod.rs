@@ -6,6 +6,9 @@
 //! но standalone crate не зависит от Tauri.
 
 pub mod adapter;
+/// Слитая подготовка внимания для декода (нормы + partial RoPE + раскладка).
+#[cfg(feature = "cuda")]
+pub mod attn_prepare_cuda;
 // Выгрузка экспертов MoE (план 2026-09-04-moe-expert-offload): CUDA-модуль —
 // pinned host + таблицы указателей + след маршрутизации.
 #[cfg(feature = "cuda")]

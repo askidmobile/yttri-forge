@@ -3297,6 +3297,12 @@ pub(crate) struct GatedAttentionLayer {
     pub(crate) cos: Tensor,
     /// Предрассчитанные sin для RoPE
     pub(crate) sin: Tensor,
+    /// eps норм q/k (совпадает с `rms_norm_eps` модели) — нужен слитому ядру.
+    rms_norm_eps: f32,
+    /// Буферы слитой подготовки внимания (YTTRI_ATTN_PREP_FUSED):
+    /// q [cap,n_head,hd] F16, gate [cap,n_head,hd] F32, k/v [cap,n_kv,hd] F16.
+    #[cfg(feature = "cuda")]
+    attn_prep_scratch: Option<crate::real::attn_prepare_cuda::AttnPrepScratch>,
     kv_cache: Option<(Tensor, Tensor)>,
     /// Текущая длина заполненного KV-cache
     kv_cache_len: usize,
@@ -4076,77 +4082,114 @@ impl GatedAttentionLayer {
             .attention_wv
             .forward_with_prequant(x, prequant.as_ref())?;
 
-        // 2. Reshape + norms (как eager path).
+        // 2-4. Подготовка Q/K/V. YTTRI_ATTN_PREP_FUSED=1 — одно ядро
+        // (RMSNorm q/k + partial RoPE + раскладка head-last + gate + каст),
+        // иначе эталонная цепочка из ~15 мелких запусков на слой.
         if crate::scheduler::trace_on() {
-            eprintln!("[attn-paged] 2. norms");
-            let _ = std::io::stderr().flush();
-        }
-        let qg = qg.reshape((b_sz, 1, self.n_head, self.head_dim * 2))?;
-        let q_all = qg
-            .narrow(3, 0, self.head_dim)?
-            .contiguous()?
-            .transpose(1, 2)?;
-        let gate_all = qg
-            .narrow(3, self.head_dim, self.head_dim)?
-            .contiguous()?
-            .transpose(1, 2)?;
-        let k_all = k
-            .reshape((b_sz, 1, self.n_kv_head, self.head_dim))?
-            .transpose(1, 2)?;
-        let v_all = v
-            .reshape((b_sz, 1, self.n_kv_head, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let q_all = self.q_norm.forward(&q_all.flatten(0, 2)?)?.reshape((
-            b_sz,
-            self.n_head,
-            1,
-            self.head_dim,
-        ))?;
-        let k_all = self.k_norm.forward(&k_all.flatten(0, 2)?)?.reshape((
-            b_sz,
-            self.n_kv_head,
-            1,
-            self.head_dim,
-        ))?;
-
-        // 3. RoPE по device-позициям (один gather на весь batch).
-        if crate::scheduler::trace_on() {
-            eprintln!("[attn-paged] 3. rope");
+            eprintln!("[attn-paged] 2-4. prep");
             let _ = std::io::stderr().flush();
         }
         let rope_pos = ctx.rope_pos(b_sz)?;
-        let q_rope = self.apply_partial_rotary_emb_devpos(&q_all, &rope_pos)?;
-        let k_rope = self.apply_partial_rotary_emb_devpos(&k_all, &rope_pos)?;
-
-        // 4. head-last строки. Пул хранит f16, поэтому круговой q8 здесь только
-        //    терял точность (оставлен под KV_Q8_ROUNDTRIP=1).
-        if crate::scheduler::trace_on() {
-            eprintln!("[attn-paged] 4. rows");
-            let _ = std::io::stderr().flush();
-        }
-        let k_hl = k_rope.transpose(1, 2)?.contiguous()?;
-        let v_hl = v_all.transpose(1, 2)?.contiguous()?;
-        let (k_rows, v_rows) = if kv_exact_f16() {
-            (
-                k_hl.to_dtype(DType::F16)?
-                    .reshape((b_sz, self.n_kv_head, self.head_dim))?
-                    .contiguous()?,
-                v_hl.to_dtype(DType::F16)?
-                    .reshape((b_sz, self.n_kv_head, self.head_dim))?
-                    .contiguous()?,
-            )
+        let fused_prep = crate::real::attn_prepare_cuda::enabled()
+            && kv_exact_f16()
+            && self.head_dim == 256
+            && self.rope_dim > 0
+            && self.rope_dim < self.head_dim;
+        let (q_f16, gate_all, k_rows, v_rows): (Tensor, Tensor, Tensor, Tensor) = if fused_prep {
+            let cap = decode_capacity() as usize;
+            if self.attn_prep_scratch.as_ref().map(|s| s.cap).unwrap_or(0) < b_sz {
+                self.attn_prep_scratch =
+                    Some(crate::real::attn_prepare_cuda::AttnPrepScratch::new(
+                        cap,
+                        self.n_head,
+                        self.n_kv_head,
+                        self.head_dim,
+                        x.device(),
+                    )?);
+            }
+            let scratch = self
+                .attn_prep_scratch
+                .as_ref()
+                .expect("scratch только что выделен");
+            let qg3 = qg.reshape((b_sz, self.n_head, self.head_dim * 2))?;
+            let k3 = k.reshape((b_sz, self.n_kv_head, self.head_dim))?;
+            let v3 = v.reshape((b_sz, self.n_kv_head, self.head_dim))?;
+            let (q, g, kr, vr) = crate::real::attn_prepare_cuda::dispatch(
+                scratch,
+                &qg3,
+                &k3,
+                &v3,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                &self.cos,
+                &self.sin,
+                &rope_pos,
+                b_sz,
+                self.n_head,
+                self.n_kv_head,
+                self.head_dim,
+                self.rope_dim,
+                self.rms_norm_eps,
+            )?;
+            (q, g.reshape((b_sz, self.n_head, 1, self.head_dim))?, kr, vr)
         } else {
-            let (kq, ks) = q8_quantize_rows(&k_hl)?;
-            let (vq, vs) = q8_quantize_rows(&v_hl)?;
-            (
-                q8_dequantize_rows(&kq, &ks)?
-                    .reshape((b_sz, self.n_kv_head, self.head_dim))?
-                    .contiguous()?,
-                q8_dequantize_rows(&vq, &vs)?
-                    .reshape((b_sz, self.n_kv_head, self.head_dim))?
-                    .contiguous()?,
-            )
+            let qg = qg.reshape((b_sz, 1, self.n_head, self.head_dim * 2))?;
+            let q_all = qg
+                .narrow(3, 0, self.head_dim)?
+                .contiguous()?
+                .transpose(1, 2)?;
+            let gate_all = qg
+                .narrow(3, self.head_dim, self.head_dim)?
+                .contiguous()?
+                .transpose(1, 2)?;
+            let k_all = k
+                .reshape((b_sz, 1, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?;
+            let v_all = v
+                .reshape((b_sz, 1, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()?;
+            let q_all = self.q_norm.forward(&q_all.flatten(0, 2)?)?.reshape((
+                b_sz,
+                self.n_head,
+                1,
+                self.head_dim,
+            ))?;
+            let k_all = self.k_norm.forward(&k_all.flatten(0, 2)?)?.reshape((
+                b_sz,
+                self.n_kv_head,
+                1,
+                self.head_dim,
+            ))?;
+            let q_rope = self.apply_partial_rotary_emb_devpos(&q_all, &rope_pos)?;
+            let k_rope = self.apply_partial_rotary_emb_devpos(&k_all, &rope_pos)?;
+            // head-last строки. Пул хранит f16, поэтому круговой q8 здесь только
+            // терял точность (оставлен под KV_Q8_ROUNDTRIP=1).
+            let k_hl = k_rope.transpose(1, 2)?.contiguous()?;
+            let v_hl = v_all.transpose(1, 2)?.contiguous()?;
+            let (k_rows, v_rows) = if kv_exact_f16() {
+                (
+                    k_hl.to_dtype(DType::F16)?
+                        .reshape((b_sz, self.n_kv_head, self.head_dim))?
+                        .contiguous()?,
+                    v_hl.to_dtype(DType::F16)?
+                        .reshape((b_sz, self.n_kv_head, self.head_dim))?
+                        .contiguous()?,
+                )
+            } else {
+                let (kq, ks) = q8_quantize_rows(&k_hl)?;
+                let (vq, vs) = q8_quantize_rows(&v_hl)?;
+                (
+                    q8_dequantize_rows(&kq, &ks)?
+                        .reshape((b_sz, self.n_kv_head, self.head_dim))?
+                        .contiguous()?,
+                    q8_dequantize_rows(&vq, &vs)?
+                        .reshape((b_sz, self.n_kv_head, self.head_dim))?
+                        .contiguous()?,
+                )
+            };
+            let q_f16 = q_rope.to_dtype(DType::F16)?.squeeze(2)?.contiguous()?; // [B, n_head, hd]
+            (q_f16, gate_all, k_rows, v_rows)
         };
 
         // 5. Append в paged pool (device kv_len).
@@ -4173,7 +4216,6 @@ impl GatedAttentionLayer {
             eprintln!("[attn-paged] 6. fa2");
             let _ = std::io::stderr().flush();
         }
-        let q_f16 = q_rope.to_dtype(DType::F16)?.squeeze(2)?.contiguous()?; // [B, n_head, hd]
         let seqlens_q = ctx.seqlens_q(b_sz)?;
         let seqlens_k = ctx.seqlens_k(b_sz)?;
         let block_table = ctx.block_table(b_sz)?;
@@ -7621,6 +7663,9 @@ impl ModelWeights {
                     rope_dim,
                     cos: cos.clone(),
                     sin: sin.clone(),
+                    rms_norm_eps: rms_norm_eps as f32,
+                    #[cfg(feature = "cuda")]
+                    attn_prep_scratch: None,
                     kv_cache: None,
                     kv_cache_len: 0,
                     max_cache_len: context_length,

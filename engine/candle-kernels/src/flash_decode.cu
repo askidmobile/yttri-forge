@@ -152,3 +152,128 @@ extern "C" __global__ void flash_decode_combine(
         out[h * hd + d] = __float2half(acc * inv_l);
     }
 }
+
+// --- Fused attention-prep для paged-декода (YTTRI_ATTN_PREP_FUSED=1) -------
+// Один запуск вместо ~15 мелких: q/k RMSNorm, partial RoPE (первые rope_dim из
+// hd), раскладка head-last для FA2, извлечение gate-половины q-проекции и каст
+// v в F16. Математика идентична цепочке q_norm -> apply_partial_rotary_emb_devpos
+// -> to_dtype(F16) из model_weights.rs, отличие только в порядке суммирования.
+//
+// qg: [B, n_head, 2*hd] F32 (первая половина — q, вторая — gate)
+// k, v: [B, n_kv, hd] F32; qw/kw: [hd] F32; cos/sin: [max_pos, rope_half] F32
+// pos: [B] u32; выходы q_out [B,n_head,hd] F16, gate_out [B,n_head,hd] F32,
+// k_out/v_out [B,n_kv,hd] F16.
+// grid = (n_head + 2*n_kv, B), block = 128.
+extern "C" __global__ void attn_prepare_decode(
+    const float* __restrict__ qg,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ qw,
+    const float* __restrict__ kw,
+    const float* __restrict__ cos_t,
+    const float* __restrict__ sin_t,
+    const unsigned int* __restrict__ pos,
+    __half* __restrict__ q_out,
+    float* __restrict__ gate_out,
+    __half* __restrict__ k_out,
+    __half* __restrict__ v_out,
+    const int n_head,
+    const int n_kv,
+    const int hd,
+    const int rope_dim,
+    const int rope_half,
+    const float eps)
+{
+    __shared__ float red[8];
+    const int b = blockIdx.y;
+    const int bx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nwarp = blockDim.x >> 5;
+    const unsigned int p = pos[b];
+    const float* cs = cos_t + (size_t)p * rope_half;
+    const float* sn = sin_t + (size_t)p * rope_half;
+
+    if (bx < n_head) {
+        // ---- Q: RMSNorm + partial RoPE + каст, параллельно выгружаем gate ----
+        const int h = bx;
+        const float* x = qg + ((size_t)b * n_head + h) * (2 * hd);
+        float ssq = 0.0f;
+        for (int d = tid; d < hd; d += blockDim.x) {
+            const float t = x[d];
+            ssq = fmaf(t, t, ssq);
+        }
+        ssq = warp_sum(ssq);
+        const int warp = tid >> 5;
+        const int lane = tid & 31;
+        if (lane == 0) red[warp] = ssq;
+        __syncthreads();
+        if (warp == 0) {
+            float t = (lane < nwarp) ? red[lane] : 0.0f;
+            t = warp_sum(t);
+            if (lane == 0) red[0] = t;
+        }
+        __syncthreads();
+        const float scale = rsqrtf(red[0] / (float)hd + eps);
+        __half* yo = q_out + ((size_t)b * n_head + h) * hd;
+        float* go = gate_out + ((size_t)b * n_head + h) * hd;
+        for (int d = tid; d < hd; d += blockDim.x) {
+            float val = x[d] * scale * qw[d];
+            if (d < rope_dim) {
+                if (d < rope_half) {
+                    const float x2 = x[d + rope_half] * scale * qw[d + rope_half];
+                    val = fmaf(-x2, sn[d], val * cs[d]);
+                } else {
+                    const int e = d - rope_half;
+                    const float x1 = x[e] * scale * qw[e];
+                    val = fmaf(x1, sn[e], val * cs[e]);
+                }
+            }
+            yo[d] = __float2half(val);
+            go[d] = x[hd + d];
+        }
+    } else if (bx < n_head + n_kv) {
+        // ---- K: RMSNorm + partial RoPE + каст (та же схема, свой вес) ----
+        const int h = bx - n_head;
+        const float* x = k + ((size_t)b * n_kv + h) * hd;
+        float ssq = 0.0f;
+        for (int d = tid; d < hd; d += blockDim.x) {
+            const float t = x[d];
+            ssq = fmaf(t, t, ssq);
+        }
+        ssq = warp_sum(ssq);
+        const int warp = tid >> 5;
+        const int lane = tid & 31;
+        if (lane == 0) red[warp] = ssq;
+        __syncthreads();
+        if (warp == 0) {
+            float t = (lane < nwarp) ? red[lane] : 0.0f;
+            t = warp_sum(t);
+            if (lane == 0) red[0] = t;
+        }
+        __syncthreads();
+        const float scale = rsqrtf(red[0] / (float)hd + eps);
+        __half* yo = k_out + ((size_t)b * n_kv + h) * hd;
+        for (int d = tid; d < hd; d += blockDim.x) {
+            float val = x[d] * scale * kw[d];
+            if (d < rope_dim) {
+                if (d < rope_half) {
+                    const float x2 = x[d + rope_half] * scale * kw[d + rope_half];
+                    val = fmaf(-x2, sn[d], val * cs[d]);
+                } else {
+                    const int e = d - rope_half;
+                    const float x1 = x[e] * scale * kw[e];
+                    val = fmaf(x1, sn[e], val * cs[e]);
+                }
+            }
+            yo[d] = __float2half(val);
+        }
+    } else {
+        // ---- V: только каст в F16 ----
+        const int h = bx - n_head - n_kv;
+        const float* x = v + ((size_t)b * n_kv + h) * hd;
+        __half* yo = v_out + ((size_t)b * n_kv + h) * hd;
+        for (int d = tid; d < hd; d += blockDim.x) {
+            yo[d] = __float2half(x[d]);
+        }
+    }
+}
