@@ -3826,6 +3826,14 @@ impl GatedAttentionLayer {
             #[cfg(feature = "cuda")]
             if q.device().is_cuda() && std::env::var("DISABLE_FLASH_PREFILL").is_err() {
                 let at_gpf3 = std::env::var("GPROF").as_deref() == Ok("3");
+                if at_gpf3 {
+                    // Дренаж ДО старта: без него `fa_ms` включает ожидание всей
+                    // ранее поставленной в поток работы (замер 2026-09-16:
+                    // сумма «fa2» по слоям превышала сам префил).
+                    if let Ok(cd) = q.device().as_cuda_device() {
+                        let _ = cd.cuda_stream().synchronize();
+                    }
+                }
                 let t_fa = std::time::Instant::now();
                 let q_f = q.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
                 let k_f = k.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
@@ -5532,6 +5540,11 @@ impl HybridBlock {
     ) -> Result<Tensor> {
         let (_b_sz, _seq_len, _n_embd) = x.dims3()?;
         let trace = crate::scheduler::trace_on();
+        if trace {
+            if let Ok(cd) = x.device().as_cuda_device() {
+                let _ = cd.cuda_stream().synchronize();
+            }
+        }
         let t_mix = std::time::Instant::now();
 
         let residual = x;

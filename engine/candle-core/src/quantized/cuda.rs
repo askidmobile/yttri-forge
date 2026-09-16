@@ -1796,6 +1796,13 @@ impl QCudaStorage {
             block_dim: (WARP_SIZE as u32, MMQ_NWARPS as u32, 1),
             shared_mem_bytes: nbs as u32,
         };
+        // TRACE_MMQ: дренаж очереди ДО запуска. Без него `gpu=` включает
+        // ожидание всей ранее поставленной работы (замер 2026-09-16: сумма по
+        // вызовам одного префила 24.97 с при самом префиле 20.83 с), то есть
+        // прибор врёт в сторону увеличения и врёт по-разному для разных форм.
+        if std::env::var_os("TRACE_MMQ").is_some() {
+            let _ = dev.cuda_stream().synchronize();
+        }
         {
             let mut mb = func.builder();
             mb.arg(&self.data.inner);
