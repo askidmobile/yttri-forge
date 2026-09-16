@@ -1669,6 +1669,39 @@ impl QCudaStorage {
         }
     }
 
+    /// tile_x в int-элементах для dp4a-раскладки при mmq_y = 128 —
+    /// зеркало `mmq_get_dp4a_tile_x_sizes()` из mmq_gguf.cuh. Нужен для
+    /// точного расчёта dynamic shared-memory: dp4a-тайл заметно меньше
+    /// mma-тайла (Q4_K: 19.5 КБ против 38.9 КБ), и именно от него зависит,
+    /// сколько блоков влезет на SM.
+    fn dp4a_tile_x_ints(dtype: GgmlDType) -> usize {
+        const Y: usize = 128; // get_mmq_y_device() на VOLTA+
+        const K: usize = 32; // MMQ_TILE_NE_K
+        let (qs, dm, sc): (usize, usize, usize) = match dtype {
+            GgmlDType::Q4_0 | GgmlDType::Q4_1 => (Y * K + Y, Y * K / 4 + Y / 4, 0),
+            GgmlDType::Q5_0 | GgmlDType::Q8_0 | GgmlDType::Q5_1 | GgmlDType::Q8_1 => {
+                (Y * 2 * K + Y, Y * 2 * K / 8 + Y / 4, 0)
+            }
+            GgmlDType::Q2K => (Y * 2 * K + Y, Y * K + Y, 0),
+            GgmlDType::Q3K => (Y * 2 * K + Y, Y, Y * K / 8 + Y / 8),
+            GgmlDType::Q4K => (Y * K + Y, Y * K / 32, Y * K / 8 + Y / 8),
+            GgmlDType::Q5K => (Y * 2 * K + Y, Y * K / 32 + Y / 32, Y * K / 8 + Y / 8),
+            GgmlDType::Q6K => (Y * 2 * K + Y, Y * K / 32 + Y / 32, Y * K / 8 + Y / 8),
+            // IQ2_XS/IQ2_S в dp4a-раскладке — MMQ_DP4A_TXS_Q8_0_16,
+            // остальные IQ — Q8_0. В dp4a-ветку они сейчас не ходят
+            // (инстансов нет), но расчёт обязан остаться безопасным.
+            GgmlDType::IQ2XS | GgmlDType::IQ2S => (Y * 2 * K + Y, Y * K / 2 + Y / 2, 0),
+            GgmlDType::IQ2XXS
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ4XS => (Y * 2 * K + Y, Y * 2 * K / 8 + Y / 4, 0),
+            // Верхняя граница по всем раскладкам (Q2_K): пере-выделение smem
+            // безопасно, недо-выделение — нет.
+            _ => (Y * 2 * K + Y, Y * K + Y, Y * K / 8 + Y / 8),
+        };
+        qs + dm + sc
+    }
+
     /// Tensor-Core MMA MMQ (llama.cpp mul_mat_q) для плотного prefill (m>8).
     /// Возвращает None, если dtype/форма не поддержаны — caller фолбэчится.
     pub fn mul_mat_q_mma(
@@ -1723,11 +1756,40 @@ impl QCudaStorage {
             None => return Ok(None),
         };
 
+        // dp4a-ветка (см. candle_mmq_dp4a.cu): инстансы собраны только для
+        // типов ниже — ровно те, что есть в таблице dtype выше.
+        let dp4a_available = matches!(
+            self.dtype,
+            GgmlDType::Q4_0
+                | GgmlDType::Q4_1
+                | GgmlDType::Q8_0
+                | GgmlDType::Q2K
+                | GgmlDType::Q3K
+                | GgmlDType::Q4K
+                | GgmlDType::Q5K
+                | GgmlDType::Q6K
+        );
+        // dp4a по умолчанию ВЫКЛЮЧЕН: замер 2026-09-16 (mmq_probe, sm_86,
+        // [12288,4096] Q4K) дал 5.46/5.56/5.85 мс на M=16/32/64 против
+        // 2.94/3.72/4.04 у mma, то есть dp4a в 1.3-1.9 раза медленнее.
+        // Причина: тайл всё равно 128 строк по весам, а dp4a считает его на
+        // SIMT-конвейере вместо тензорных ядер — выигрыша в чтении весов нет.
+        // Живой сервер: 30k-префил 20.227 с с dp4a против 19.965 без него.
+        // Ветка остаётся под MMQ_DP4A=1 для замеров и для pre-Turing карт.
+        let dp4a_enabled = std::env::var("MMQ_DP4A").map(|v| v == "1").unwrap_or(false);
+        let use_dp4a = dp4a_available && dp4a_enabled && m_total <= 64;
+        // Раскладка tile_x у dp4a своя (меньше mma), от неё зависит smem —
+        // а значит и число блоков на SM.
+        let tile_x_ints = if use_dp4a {
+            Self::dp4a_tile_x_ints(self.dtype)
+        } else {
+            MMQ_Y * tile_x_k
+        };
         // mmq_x: наибольший из {128,64,32} с shared-mem <= optin лимита.
         let pad_to = |a: usize, al: usize| ((a + al - 1) / al) * al;
         let nbs_for = |mmq_x: usize| {
             let nbs_ids = mmq_x * 4;
-            let nbs_x = MMQ_Y * tile_x_k * 4;
+            let nbs_x = tile_x_ints * 4;
             let nbs_y = pad_to(mmq_x * BLOCK_Q8_1_MMQ, MMQ_NWARPS * WARP_SIZE * 4);
             nbs_ids + nbs_x + nbs_y
         };
@@ -1737,13 +1799,18 @@ impl QCudaStorage {
         // x128 упирается в регистры и shared-память: 1 блок на SM, занятость
         // 16.7 % при 50 % загрузки SM — то есть шаг держит латентность, а не
         // пропускная способность тензорных ядер.
+        // Потолок x-тайла: у dp4a он MMQ_DP4A_MAX_BATCH_SIZE — ядро с
+        // mmq_x=128 уходит в NO_DEVICE_CODE, который делает __trap() и
+        // роняет весь CUDA-контекст сервера (CUDA_ERROR_LAUNCH_FAILED).
+        let x_cap = if use_dp4a { 64usize } else { 128 };
         let mmq_x = std::env::var("MMQ_X")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|x| [32usize, 64, 128].contains(x))
+            .filter(|x| [32usize, 64, 128].contains(x) && *x <= x_cap)
             .unwrap_or_else(|| {
-                [128usize, 64, 32]
+                [x_cap, 64, 32]
                     .into_iter()
+                    .filter(|x| *x <= x_cap)
                     .find(|&x| nbs_for(x) <= smpbo)
                     .unwrap_or(32)
             });
@@ -1777,8 +1844,21 @@ impl QCudaStorage {
         // 2) MMQ Tensor-Core GEMM: dst = weight[n,k] @ act[k,m] → [m,n].
         // stride_row_x в блоках кванта (block_size = qk: 256 для K-quants, 32 для legacy).
         let stride_row_x = k / self.dtype.block_size();
-        let kernel_name = format!("candle_mmq_{tag}_x{mmq_x}");
-        let func = dev.get_or_load_func(&kernel_name, &candle_kernels::CANDLE_MMQ_DENSE)?;
+        // Малые батчи — на dp4a-ветку (candle_mmq_dp4a.cu): у mma-варианта
+        // тайл всегда 128 столбцов, и на 16 занятых форма даёт 2.4–3.8 TFLOPS
+        // (ncu: 96 CTA по 406 мкс). llama.cpp для batches ≤ 64 берёт dp4a.
+        let (kernel_name, module) = if use_dp4a {
+            (
+                format!("candle_mmq_dp4a_{tag}_x{mmq_x}"),
+                &candle_kernels::CANDLE_MMQ_DP4A,
+            )
+        } else {
+            (
+                format!("candle_mmq_{tag}_x{mmq_x}"),
+                &candle_kernels::CANDLE_MMQ_DENSE,
+            )
+        };
+        let func = dev.get_or_load_func(&kernel_name, module)?;
         if nbs > 48 * 1024 {
             func.set_attribute(
                 cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -1823,8 +1903,16 @@ impl QCudaStorage {
 
         if std::env::var_os("TRACE_MMQ").is_some() {
             eprintln!(
-                "[mmq] dtype={:?} m={} n={} k={} mmq_x={} nbs={} tiles={}x{}",
-                self.dtype, m_total, n, k, mmq_x, nbs, nty, ntx,
+                "[mmq] dtype={:?} m={} n={} k={} path={} mmq_x={} nbs={} tiles={}x{}",
+                self.dtype,
+                m_total,
+                n,
+                k,
+                if use_dp4a { "dp4a" } else { "mma" },
+                mmq_x,
+                nbs,
+                nty,
+                ntx,
             );
         }
         let t_mmq = std::time::Instant::now();

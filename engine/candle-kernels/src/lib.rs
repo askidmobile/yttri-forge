@@ -27,9 +27,13 @@ pub enum Id {
     Sort,
     Ternary,
     Unary,
+    /// MMQ на dp4a-пути (без тензорных ядер) для малых батчей: см.
+    /// candle_mmq_dp4a.cu. Отдельный модуль, потому что выбор mma/dp4a в
+    /// mmq_common.cuh сделан на этапе компиляции.
+    MmqDp4a,
 }
 
-pub const ALL_IDS: [Id; 18] = [
+pub const ALL_IDS: [Id; 19] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -48,6 +52,7 @@ pub const ALL_IDS: [Id; 18] = [
     Id::Sort,
     Id::Ternary,
     Id::Unary,
+    Id::MmqDp4a,
 ];
 
 pub struct Module {
@@ -98,6 +103,7 @@ mdl!(MOE, Moe);
 mdl!(MOE_ROUTER, MoeRouter);
 mdl!(MOE_QUANTIZED, MoeQuantized);
 mdl!(CANDLE_MMQ_DENSE, MmqDense);
+mdl!(CANDLE_MMQ_DP4A, MmqDp4a);
 mdl!(QUANTIZED, Quantized);
 mdl!(REDUCE, Reduce);
 mdl!(SORT, Sort);

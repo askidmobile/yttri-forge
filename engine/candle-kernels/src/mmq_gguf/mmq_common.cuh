@@ -278,7 +278,12 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 #define VOLTA_MMA_AVAILABLE
 #endif
 
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
+// YTTRI_MMQ_DP4A: собрать инстанс MMQ на dp4a-пути (без тензорных ядер).
+// Нужен для малого M: у mma-варианта тайл всегда 128 столбцов и 96 n-блоков,
+// из-за чего на 16 занятых столбцах форма [12288,4096] даёт 2.4–3.8 TFLOPS
+// (ncu: 96 CTA, 406 мкс на запуск). llama.cpp в этой же ситуации уходит на
+// dp4a-ветку (MMQ_DP4A_MAX_BATCH_SIZE = 64).
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && !defined(YTTRI_MMQ_DP4A)
 #define TURING_MMA_AVAILABLE
 #endif
 
