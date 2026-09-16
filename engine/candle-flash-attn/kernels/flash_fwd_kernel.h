@@ -211,13 +211,23 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     typename Kernel_traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
+    // fp16-накопление (Kernel_traits::Use_f16_acc): на GA10x конвейер
+    // f16.f16.f16.f16 вдвое быстрее f32.f16.f16.f32. C-раскладки обеих
+    // инструкций совпадают, поэтому acc пересчитывается поэлементно.
+    // Когда флаг выключен, TiledMmaCalc == TiledMma и пересчёт — копия
+    // float→float.
+    using TiledMmaCalc = std::conditional_t<Kernel_traits::Use_f16_acc,
+                                            typename Kernel_traits::TiledMma16,
+                                            typename Kernel_traits::TiledMma>;
+    TiledMmaCalc tiled_mma_calc;
+    auto thr_mma_calc = tiled_mma_calc.get_thread_slice(tidx);
     Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
     Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
 
     Tensor tSgS  = thr_mma.partition_C(gP);
 
-    Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
+    Tensor acc_o = partition_fragment_C(tiled_mma_calc, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
 
     //
     // Copy Atom retiling
@@ -336,8 +346,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
-        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
-        clear(acc_s);
+        Tensor acc_s_raw = partition_fragment_C(tiled_mma_calc, Shape<Int<kBlockM>, Int<kBlockN>>{});
+        clear(acc_s_raw);
         flash::cp_async_wait<0>();
         __syncthreads();
 
@@ -353,9 +363,20 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         cute::cp_async_fence();
 
         flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+            acc_s_raw, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_calc, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
+        Tensor acc_s = make_fragment_like<float>(acc_s_raw);
+        #pragma unroll
+        for (int i = 0; i < size<0>(acc_s_raw); ++i) {
+            #pragma unroll
+            for (int mi = 0; mi < size<1>(acc_s_raw); ++mi) {
+                #pragma unroll
+                for (int ni = 0; ni < size<2>(acc_s_raw); ++ni) {
+                    acc_s(i, mi, ni) = static_cast<float>(acc_s_raw(i, mi, ni));
+                }
+            }
+        }
         // if (cute::thread0()) { print(acc_s); }
         if constexpr (Is_softcap){
             flash::apply_softcap(acc_s, params.softcap);
@@ -400,7 +421,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
         // if (cute::thread0()) { print(tOrP); }
-        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_calc, smem_tiled_copy_V, smem_thr_copy_V);
         // if (cute::thread0()) { print(scores); }
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -412,17 +433,28 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // These are the iterations where we don't need masking on S
     for (; n_block >= n_block_min; --n_block) {
-        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
-        clear(acc_s);
+        Tensor acc_s_raw = partition_fragment_C(tiled_mma_calc, Shape<Int<kBlockM>, Int<kBlockN>>{});
+        clear(acc_s_raw);
         flash::cp_async_wait<0>();
         __syncthreads();
         flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         cute::cp_async_fence();
 
         flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+            acc_s_raw, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_calc, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
+        Tensor acc_s = make_fragment_like<float>(acc_s_raw);
+        #pragma unroll
+        for (int i = 0; i < size<0>(acc_s_raw); ++i) {
+            #pragma unroll
+            for (int mi = 0; mi < size<1>(acc_s_raw); ++mi) {
+                #pragma unroll
+                for (int ni = 0; ni < size<2>(acc_s_raw); ++ni) {
+                    acc_s(i, mi, ni) = static_cast<float>(acc_s_raw(i, mi, ni));
+                }
+            }
+        }
         if constexpr (Is_softcap){
             flash::apply_softcap(acc_s, params.softcap);
         }
@@ -461,15 +493,22 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_calc, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
     // Epilogue
 
     Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
 
-    // Convert acc_o from fp32 to fp16/bf16
-    Tensor rO = flash::convert_type<Element>(acc_o);
+    // Convert acc_o from fp32 to fp16/bf16. При fp16-накоплении acc_o уже
+    // имеет тип Element, и конвертер не нужен.
+    auto rO = [&] {
+        if constexpr (std::is_same_v<typename decltype(acc_o)::value_type, Element>) {
+            return acc_o;
+        } else {
+            return flash::convert_type<Element>(acc_o);
+        }
+    }();
     Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (SMEM_M,SMEM_N)
     // Partition sO to match the accumulator partitioning
     auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);

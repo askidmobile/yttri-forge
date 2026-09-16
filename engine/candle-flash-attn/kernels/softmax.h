@@ -148,6 +148,10 @@ struct Softmax {
             // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
             Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
             static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
+            // acc_o может быть в half (fp16-накопление, Kernel_traits::Use_f16_acc):
+            // умножаем в float и возвращаем приведением — иначе для half
+            // компилятор теряет точность посреди выражения.
+            using EltO = typename decltype(acc_o_rowcol)::value_type;
             #pragma unroll
             for (int mi = 0; mi < size(row_max); ++mi) {
                 float scores_max_cur = !Check_inf
@@ -156,7 +160,10 @@ struct Softmax {
                 float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
                 row_sum(mi) *= scores_scale;
                 #pragma unroll
-                for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
+                for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+                    acc_o_rowcol(mi, ni) = static_cast<EltO>(
+                        static_cast<float>(acc_o_rowcol(mi, ni)) * scores_scale);
+                }
             }
             flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
             // We don't do the reduce across threads here since we don't need to use the row_sum.
@@ -178,8 +185,12 @@ struct Softmax {
             float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
             lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : row_max(mi) * softmax_scale + __logf(sum);
             float scale = !Is_dropout ? inv_sum : inv_sum * rp_dropout;
+            using EltO = typename decltype(acc_o_rowcol)::value_type;
             #pragma unroll
-            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scale; }
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+                acc_o_rowcol(mi, ni) = static_cast<EltO>(
+                    static_cast<float>(acc_o_rowcol(mi, ni)) * scale);
+            }
         }
         return lse;
     };

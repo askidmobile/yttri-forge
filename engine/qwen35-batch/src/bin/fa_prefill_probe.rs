@@ -152,6 +152,47 @@ fn main() -> Result<()> {
     let diff = (&dense_out - &paged_out)?.abs()?.mean_all()?.to_scalar::<f32>()?;
     println!("mean|dense-paged| = {diff:.5}");
 
+    // ── Численная сверка с референсом в f32 (matmul + softmax) на малом T ──
+    // Нужна потому, что плотная и пейдженная ветки выше считают одним и тем же
+    // ядром, и их сравнение не ловит ошибку раскладки. Здесь референс считается
+    // обычными операциями candle в f32.
+    let t_ref: usize = std::env::var("FA_REF_T").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+    if t_ref >= 16 {
+        let qr = Tensor::randn(0f32, 1f32, (1, h, t_ref, d), &dev)?.to_dtype(DType::F16)?;
+        let kr = Tensor::randn(0f32, 1f32, (1, t_ref, h_k, d), &dev)?.to_dtype(DType::F16)?;
+        let vr = Tensor::randn(0f32, 1f32, (1, t_ref, h_k, d), &dev)?.to_dtype(DType::F16)?;
+        let qr_fa = qr.transpose(1, 2)?.contiguous()?;
+        let out_k = candle_flash_attn::flash_attn(&qr_fa, &kr, &vr, scale, true)?.to_dtype(DType::F32)?;
+
+        let reps = h / h_k;
+        let k_f = kr.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?; // [1,h_k,t,d]
+        let v_f = vr.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?;
+        let k_exp = k_f
+            .unsqueeze(2)?
+            .broadcast_as((1, h_k, reps, t_ref, d))?
+            .contiguous()?
+            .reshape((1, h, t_ref, d))?;
+        let v_exp = v_f
+            .unsqueeze(2)?
+            .broadcast_as((1, h_k, reps, t_ref, d))?
+            .contiguous()?
+            .reshape((1, h, t_ref, d))?;
+        let qf = qr.to_dtype(DType::F32)?;
+        let scores = (qf.matmul(&k_exp.transpose(2, 3)?.contiguous()?)? * scale as f64)?;
+        let mask = Tensor::tril2(t_ref, DType::F32, &dev)?;
+        let mask_add = ((mask - 1.0)? * 1e9)?;
+        let scores = scores.broadcast_add(&mask_add.unsqueeze(0)?.unsqueeze(0)?)?;
+        let attn = candle_nn::ops::softmax_last_dim(&scores)?;
+        let ref_out = attn.matmul(&v_exp)?.transpose(1, 2)?.contiguous()?; // [1,t,h,d]
+        let diff = (out_k - ref_out.clone())?.abs()?;
+        let mean = diff.mean_all()?.to_scalar::<f32>()?;
+        let max = diff.max_all()?.to_scalar::<f32>()?;
+        let ref_abs = ref_out.abs()?.mean_all()?.to_scalar::<f32>()?;
+        println!(
+            "точность (T={t_ref}, F16-ядро против f32-референса): mean|Δ|={mean:.5} max|Δ|={max:.4} при mean|ref|={ref_abs:.3}"
+        );
+    }
+
     println!("dense  : {dense_ms:.1} ms");
     println!("paged  : {paged_ms:.1} ms");
     println!("paged/dense = {:.2}x", paged_ms / dense_ms);

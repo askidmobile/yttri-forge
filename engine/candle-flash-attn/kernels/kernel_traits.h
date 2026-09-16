@@ -32,8 +32,25 @@ struct Flash_kernel_traits {
         MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
         MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>
     >;
+
+    // Второй вариант атома — с FP16-накоплением (f16.f16.f16.f16). Зачем:
+    // на потребительском Ampere (GA10x) конвейер с fp16-аккумулятором вдвое
+    // быстрее, чем с fp32 (51 против 25.5 TFLOPS у RTX 3060), и префильное
+    // внимание упирается именно в 25.5. llama.cpp по этой же причине держит
+    // аккумуляторы VKQ в half2 (fattn-mma-f16), а KQ — в float.
+    // CLayout у F16- и F32-версий инструкции один и тот же
+    // (mma_traits_sm80.hpp: F32-версия наследует C-раскладку F16-версии),
+    // поэтому фрагменты пересчитываются поэлементно, без переупаковки.
+    static constexpr bool Has_f16_acc = std::is_same_v<elem_type, cutlass::half_t>;
+    using MMA_Atom_Arch16 = std::conditional_t<
+        Has_f16_acc,
+        MMA_Atom<SM80_16x8x16_F16F16F16F16_TN>,
+        MMA_Atom_Arch
+    >;
 #else
     using MMA_Atom_Arch = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
+    static constexpr bool Has_f16_acc = false;
+    using MMA_Atom_Arch16 = MMA_Atom_Arch;
 #endif
 
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 750
@@ -47,6 +64,7 @@ struct Flash_kernel_traits {
 
 // If Share_Q_K_smem is true, that forces Is_Q_in_regs to be true
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t,
+         bool Use_f16_acc_=false,
          typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
 struct Flash_fwd_kernel_traits : public Base {
     using Element = typename Base::Element;
@@ -75,6 +93,15 @@ struct Flash_fwd_kernel_traits : public Base {
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
         Tile<Int<16 * kNWarps>, _16, _16>>;
+
+    // Тот же тайл, но с fp16-аккумулятором (см. MMA_Atom_Arch16).
+    using TiledMma16 = TiledMMA<
+        typename Base::MMA_Atom_Arch16,
+        Layout<Shape<Int<kNWarps>,_1,_1>>,
+        Tile<Int<16 * kNWarps>, _16, _16>>;
+
+    /// Использовать fp16-накопление в плотном префильном ядре.
+    static constexpr bool Use_f16_acc = Use_f16_acc_ && Base::Has_f16_acc;
 
     using SmemLayoutAtomQ = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
