@@ -1732,10 +1732,21 @@ impl QCudaStorage {
             nbs_ids + nbs_x + nbs_y
         };
         let smpbo = 100 * 1024; // optin shared-mem лимит (sm_86 ~99KB, берём с запасом)
-        let mmq_x = [128usize, 64, 32]
-            .into_iter()
-            .find(|&x| nbs_for(x) <= smpbo)
-            .unwrap_or(32);
+        // MMQ_X: ручной выбор тайла для A/B (32/64/128). По умолчанию — прежний
+        // «наибольший, что влезает в smem». Профиль ncu 2026-09-16 показал, что
+        // x128 упирается в регистры и shared-память: 1 блок на SM, занятость
+        // 16.7 % при 50 % загрузки SM — то есть шаг держит латентность, а не
+        // пропускная способность тензорных ядер.
+        let mmq_x = std::env::var("MMQ_X")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|x| [32usize, 64, 128].contains(x))
+            .unwrap_or_else(|| {
+                [128usize, 64, 32]
+                    .into_iter()
+                    .find(|&x| nbs_for(x) <= smpbo)
+                    .unwrap_or(32)
+            });
         let nbs = nbs_for(mmq_x);
 
         // 1) Квантизация активаций в q8_1_mmq.

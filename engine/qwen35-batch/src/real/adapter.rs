@@ -975,6 +975,21 @@ impl Qwen35BatchAdapter {
     }
 }
 
+/// Trim пула драйвера (возврат освобождённых страниц ОС). Вызов блокирующий и
+/// дорогой, а в prefill-пути он попадает прямо в TTFT запроса. `YTTRI_TRIM=0`
+/// выключает его для A/B — по умолчанию поведение прежнее.
+#[cfg(feature = "cuda")]
+fn trim_pool_cuda(device: &candle_core::Device) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("YTTRI_TRIM").map(|v| v != "0").unwrap_or(true));
+    if !on {
+        return;
+    }
+    if let candle_core::Device::Cuda(c) = device {
+        let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+    }
+}
+
 impl BatchModel for Qwen35BatchAdapter {
     /// Граница раунда для `MTP_TIMING=1` (см. `BatchModel::speculative_timing_sync`):
     /// применяется только диагностикой, поэтому в рабочем режиме не зовётся.
@@ -1181,9 +1196,11 @@ impl BatchModel for Qwen35BatchAdapter {
                 .map_err(|e| anyhow!("prefix snapshot to host: {e}"))?;
             drop(device_snap);
             #[cfg(feature = "cuda")]
-            if let Device::Cuda(c) = &self.device {
-                let _ = c.cuda_stream().synchronize();
-                let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+            {
+                if let Device::Cuda(c) = &self.device {
+                    let _ = c.cuda_stream().synchronize();
+                }
+                trim_pool_cuda(&self.device);
             }
             self.slot_prefix_snaps[sidx].push((chunk.start_pos, host_snap));
         }
@@ -1456,9 +1473,11 @@ impl BatchModel for Qwen35BatchAdapter {
             // в driver pool (release threshold=512 MiB). Trim возвращает ОС
             // страницы сверх текущего usage → VRAM освобождается для decode.
             #[cfg(feature = "cuda")]
-            if let Device::Cuda(c) = &self.device {
-                let _ = c.cuda_stream().synchronize();
-                let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+            {
+                if let Device::Cuda(c) = &self.device {
+                    let _ = c.cuda_stream().synchronize();
+                }
+                trim_pool_cuda(&self.device);
             }
         } else {
             self.slot_seeded[sidx] = false;
@@ -1544,9 +1563,7 @@ impl BatchModel for Qwen35BatchAdapter {
                     // Prefill оставил в пуле пиковые страницы интермедиатов
                     // (512-token chunk buffers). Trim при первом decode после
                     // prefill — иначе retained slack добивает VRAM на 27B.
-                    if let Device::Cuda(c) = &self.device {
-                        let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
-                    }
+                    trim_pool_cuda(&self.device);
                 }
             }
         }
