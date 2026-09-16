@@ -209,6 +209,24 @@ fn prefix_cache_max_tokens() -> usize {
 /// Дополнительные checkpoint'ы для branch-point prefix cache.
 /// По умолчанию включены; `PREFIX_CACHE_CHECKPOINTS=0` возвращает прежнее
 /// поведение — только последняя граница чанка.
+/// Минимальная позиция, на которой вообще имеет смысл снимать снимок границы.
+///
+/// Блок префикс-кэша — 64 токена (страница paged-пула), и `put` отвергает
+/// снимки короче. На коротких промптах чанк всё равно кончается на позиции
+/// меньше блока, а снимок стоит ~30 мс D2H состояния DeltaNet: замер
+/// 2026-09-16 показал ровно эти 30 мс в фазе restore на 164-токенном
+/// промпте при включённом кэше и 0 при выключенном.
+fn prefix_cache_min_pos() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("PREFIX_CACHE_MIN_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(64)
+    })
+}
+
 fn prefix_cache_checkpoints_enabled() -> bool {
     static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -1179,7 +1197,7 @@ impl BatchModel for Qwen35BatchAdapter {
             && chunk.start_pos > 0
             && self.slot_prefix_snaps[sidx].len() < prefix_cache_checkpoint_cap();
         let capture_final = chunk.is_final && chunk.start_pos > 0;
-        let capture_position = chunk.start_pos > 0
+        let capture_position = chunk.start_pos >= prefix_cache_min_pos()
             && chunk.start_pos <= prefix_limit
             && (capture_boundary || capture_final);
         let already_captured = self.slot_prefix_snaps[sidx].iter().any(|(pos, _)| *pos == chunk.start_pos);
