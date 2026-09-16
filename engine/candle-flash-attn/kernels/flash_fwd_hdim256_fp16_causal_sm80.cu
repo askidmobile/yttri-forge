@@ -17,13 +17,14 @@
 //   0 (по умолчанию) — штатная ветка, 1 — 128x32x8.
 template<>
 void run_mha_fwd_<cutlass::half_t, 256, true>(Flash_fwd_params &params, cudaStream_t stream) {
-    // По умолчанию — вариант 6 (fp16-аккумулятор, см. ниже): изолированный
-    // замер 2026-09-16 дал 56.6 мс против 88.5 у f32 на T=16384 (38.9 против
-    // 24.9 TFLOPS), ошибка относительно f32-референса выросла с 3e-5 до 1.5e-4
-    // при среднем |выходе| 0.104. Откат — QWEN36_FA_PREFILL_TILE=1 (или 0).
+    // По умолчанию — вариант 7: fp16-аккумулятор (см. ниже) плюс крупный
+    // N-тайл (kBlockN=64) с Q в регистрах и общим буфером Q/K. Изолированные
+    // замеры 2026-09-16 на T=16384: f32 88.5 мс, fp16 56.6 мс, fp16+64×N
+    // **52.5 мс** (41.9 TFLOPS). Откат — QWEN36_FA_PREFILL_TILE=6 (fp16,
+    // тайл 32) или =1 (fp32).
     static const int variant = [] {
         const char *e = std::getenv("QWEN36_FA_PREFILL_TILE");
-        return e != nullptr ? std::atoi(e) : 6;
+        return e != nullptr ? std::atoi(e) : 7;
     }();
     if (variant == 1) {
         DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -38,6 +39,26 @@ void run_mha_fwd_<cutlass::half_t, 256, true>(Flash_fwd_params &params, cudaStre
     if (variant == 6) {
         DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
             run_flash_fwd<Flash_fwd_kernel_traits<256, 128, 32, 8, false, false, cutlass::half_t, true>,
+                          Is_dropout, true>(params, stream);
+        });
+        return;
+    }
+    // Вариант 7 — крупнее N-тайл (kBlockN=64) при том же smem: Q живёт в
+    // регистрах (Is_Q_in_regs), а его shared-буфер переиспользуется под K
+    // (Share_Q_K_smem), поэтому kSmemSize = max(Q, K+V) = 2*d*(128+2*64) =
+    // 128 КБ... нет: при Share_Q_K это max(64, 64) = 64 КБ. Итераций вдвое
+    // меньше, значит вдвое меньше ожиданий памяти на том же объёме работы.
+    if (variant == 7) {
+        DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+            run_flash_fwd<Flash_fwd_kernel_traits<256, 128, 64, 8, true, true, cutlass::half_t, true>,
+                          Is_dropout, true>(params, stream);
+        });
+        return;
+    }
+    // Вариант 8 — тот же приём, но M-тайл 64 и 4 варпа.
+    if (variant == 8) {
+        DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+            run_flash_fwd<Flash_fwd_kernel_traits<256, 64, 64, 4, true, true, cutlass::half_t, true>,
                           Is_dropout, true>(params, stream);
         });
         return;
