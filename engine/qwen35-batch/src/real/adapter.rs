@@ -1652,8 +1652,16 @@ impl BatchModel for Qwen35BatchAdapter {
                 && prefix_cache_full_hit_enabled()
                 && new_pos > 0
             {
+                let t_full = std::time::Instant::now();
                 if let Some(full) = self.slot_snaps[sidx].as_ref() {
                     self.slot_prefix_snaps[sidx].push((new_pos, full.clone()));
+                }
+                if crate::scheduler::trace_on() {
+                    eprintln!(
+                        "[pfull] pos={} clone={:.1}ms",
+                        new_pos,
+                        t_full.elapsed().as_secs_f64() * 1e3
+                    );
                 }
             }
             let t_seed0 = std::time::Instant::now();
