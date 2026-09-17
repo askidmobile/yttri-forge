@@ -65,7 +65,8 @@ struct Flash_kernel_traits {
 // If Share_Q_K_smem is true, that forces Is_Q_in_regs to be true
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t,
          bool Use_f16_acc_=false,
-         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
+         typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type>,
+         bool Is_oaccum_fp16_=false >
 struct Flash_fwd_kernel_traits : public Base {
     using Element = typename Base::Element;
     using ElementAccum = typename Base::ElementAccum;
@@ -75,6 +76,8 @@ struct Flash_fwd_kernel_traits : public Base {
     using SmemCopyAtomTransposed = typename Base::SmemCopyAtomTransposed;
 
     static constexpr bool Share_Q_K_smem = Share_Q_K_smem_;
+    static constexpr bool Is_oaccum_fp16 = Is_oaccum_fp16_;
+    using ElementOaccum = std::conditional_t<Is_oaccum_fp16_, Element, ElementAccum>;
     static constexpr bool Is_Q_in_regs = Is_Q_in_regs_ || Share_Q_K_smem;
 
     // The number of threads.
@@ -129,7 +132,7 @@ struct Flash_fwd_kernel_traits : public Base {
         SmemLayoutAtomO{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
     using SmemCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
-    using SmemCopyAtomOaccum = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>;
+    using SmemCopyAtomOaccum = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementOaccum>;
 
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
@@ -178,7 +181,7 @@ struct Flash_fwd_kernel_traits : public Base {
                Stride< _16, _1>>
     >;
     using GmemTiledCopyOaccum = decltype(
-        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementOaccum>{},
                         GmemLayoutAtomOaccum{},
                         Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
     using GmemLayoutAtomRotcossin = GmemLayoutAtom;

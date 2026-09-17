@@ -61,6 +61,22 @@ const KERNEL_FILES: [&str; 53] = [
     "kernels/flash_fwd_hdim96_bf16_causal_sm80.cu",
 ];
 
+/// Минимальная сборка для отладки декодного/префильного ядра hdim=256:
+/// CANDLE_FLASH_ATTN_MINIMAL=1 — девять файлов вместо 53, сборка ~7–9 минут
+/// вместо ~50 (см. §61/§64 research-доков). Требует, чтобы flash_api.cu
+/// собирался с -DCANDLE_FA_MINIMAL (диспатч остальных голов выбрасывается).
+const KERNEL_FILES_MIN: [&str; 9] = [
+    "kernels/flash_api.cu",
+    "kernels/flash_fwd_splitkv_hdim256_fp16_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim256_fp16_causal_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim256_bf16_sm80.cu",
+    "kernels/flash_fwd_splitkv_hdim256_bf16_causal_sm80.cu",
+    "kernels/flash_fwd_hdim256_fp16_sm80.cu",
+    "kernels/flash_fwd_hdim256_fp16_causal_sm80.cu",
+    "kernels/flash_fwd_hdim256_bf16_sm80.cu",
+    "kernels/flash_fwd_hdim256_bf16_causal_sm80.cu",
+];
+
 const HEADER_FILES: [&str; 18] = [
     "kernels/alibi.h",
     "kernels/block_info.h",
@@ -133,7 +149,12 @@ fn header_hash() -> Result<u64> {
 
 fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=build.rs");
-    for kernel_file in KERNEL_FILES.iter() {
+    // Смена режима (минимальная/полная сборка) обязана перезапускать скрипт:
+    // без этой строки cargo оставлял старый libflashattention.a.
+    println!("cargo::rerun-if-env-changed=CANDLE_FLASH_ATTN_MINIMAL");
+    let minimal = std::env::var("CANDLE_FLASH_ATTN_MINIMAL").is_ok();
+    let kernel_files: &[&str] = if minimal { &KERNEL_FILES_MIN } else { &KERNEL_FILES };
+    for kernel_file in kernel_files.iter() {
         println!("cargo::rerun-if-changed={kernel_file}");
     }
     for header_file in HEADER_FILES.iter() {
@@ -156,7 +177,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let kernels: Vec<_> = KERNEL_FILES.iter().collect();
+    let kernels: Vec<_> = kernel_files.iter().collect();
     let header_hash_arg = format!("-DCANDLE_FLASH_ATTN_HEADER_HASH=0x{:016x}", header_hash()?);
     let mut builder = KernelBuilder::new()
         .source_files(kernels)
@@ -174,6 +195,9 @@ fn main() -> Result<()> {
         .arg("--verbose")
         .arg(&header_hash_arg)
         .thread_percentage(0.5); // Use up to 50% of available threads
+    if minimal {
+        builder = builder.arg("-DCANDLE_FA_MINIMAL");
+    }
 
     let mut is_target_msvc = false;
     if let Ok(target) = std::env::var("TARGET") {

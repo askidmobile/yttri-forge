@@ -8,6 +8,21 @@
 #include "flash_fwd_launch_template.h"
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+#ifdef CANDLE_FA_MINIMAL
+  // Отладочная сборка (CANDLE_FLASH_ATTN_MINIMAL=1): скомпилированы только
+  // ядра hdim=256, диспатч остальных голов выбрасывается на этапе
+  // препроцессинга — директивы #ifdef нельзя ставить внутрь аргументов
+  // макросов FP16_SWITCH/BOOL_SWITCH, поэтому ветка дублирует каркас.
+  FP16_SWITCH(!params.is_bf16, [&] {
+      BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+          if (params.block_table != nullptr) {
+              run_mha_fwd_splitkv_paged_<elem_type, 256, Is_causal>(params, stream);
+          } else {
+              run_mha_fwd_<elem_type, 256, Is_causal>(params, stream);
+          }
+      });
+  });
+#else
   FP16_SWITCH(!params.is_bf16, [&] {
       BOOL_SWITCH(params.is_causal, Is_causal, [&] {
           if (params.block_table != nullptr) {
@@ -28,6 +43,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
           }
       });
   });
+#endif
 }
 
 
@@ -342,8 +358,9 @@ extern "C" void run_mha(
         if (ns > 1) {
             const size_t lse_elems = (size_t)ns * params.b * params.h * params.seqlen_q;
             const size_t o_elems = lse_elems * d_rounded;
+            const size_t o_elem_size = (params.block_table != nullptr) ? sizeof(uint16_t) : sizeof(float);
             if (cudaMallocAsync(&lseaccum, lse_elems * sizeof(float), stream) == cudaSuccess &&
-                cudaMallocAsync(&oaccum, o_elems * sizeof(float), stream) == cudaSuccess) {
+                cudaMallocAsync(&oaccum, o_elems * o_elem_size, stream) == cudaSuccess) {
                 params.num_splits = ns;
                 params.softmax_lseaccum_ptr = lseaccum;
                 params.oaccum_ptr = oaccum;

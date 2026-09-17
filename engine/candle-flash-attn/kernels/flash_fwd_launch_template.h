@@ -100,8 +100,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
 template<typename Kernel_traits, bool Is_causal>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
-    static_assert(!Kernel_traits::Is_Q_in_regs, "SplitKV implementation does not support Is_Q_in_regs");
-    static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
@@ -188,7 +186,12 @@ void run_mha_fwd_splitkv_paged_dispatch(Flash_fwd_params &params, cudaStream_t s
     constexpr static int kBlockM = 64;
     // kBlockN must divide page_block_size so a K/V tile never straddles two pages.
     constexpr static int kBlockN = 32;
-    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
+    // kBlockN=32 + Q-в-регистрах + общий буфер Q/K + fp16-эпилог:
+    // smem = max(Q 32К, K+V 32К) = 32 КБ (staging 32 КБ) → 3 CTA на SM.
+    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, true, true, T,
+                                                  /*Use_f16_acc=*/false,
+                                                  Flash_kernel_traits<Headdim, kBlockM, kBlockN, 4, T>,
+                                                  /*Is_oaccum_fp16=*/true>, Is_causal>(params, stream);
 }
 
 template<typename T, bool Is_causal>

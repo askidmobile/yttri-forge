@@ -593,7 +593,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         typename Kernel_traits::GmemTiledCopyO,
         typename Kernel_traits::GmemTiledCopyOaccum
     >;
-    using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
+    using ElementO = std::conditional_t<Kernel_traits::Is_oaccum_fp16, Element,
+                      std::conditional_t<!Split, Element, ElementAccum>>;
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("Is_even_MN = %d, is_cumulativ = %d, seqlen_k_cache = %d, actual_seqlen_k = %d\n", Is_even_MN, params.is_seqlens_k_cumulative, binfo.seqlen_k_cache, binfo.actual_seqlen_k); }
@@ -739,7 +740,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
-    Tensor sK = make_tensor(sQ.data() + size(sQ), typename Kernel_traits::SmemLayoutKV{});
+    // При Share_Q_K_smem буфер Q отдаётся под K (Q уже в регистрах), как в
+    // плотном ядре: иначе K/V пишутся за пределы выделенного smem.
+    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
+                            typename Kernel_traits::SmemLayoutKV{});
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
@@ -982,6 +986,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
     }
 
+    // Q в регистрах + общий буфер Q/K: smem = max(Q,KV) вместо Q+KV.
+    static_assert(!Kernel_traits::Is_Q_in_regs || Kernel_traits::Share_Q_K_smem,
+                  "split-KV: Is_Q_in_regs только вместе с Share_Q_K_smem");
+    if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
+    if (Kernel_traits::Share_Q_K_smem) {
+        flash::cp_async_wait<0>();
+        __syncthreads();
+        Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+        CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
+        cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+        __syncthreads();
+    }
+
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     if constexpr (Is_kv_q8) {
@@ -1073,7 +1090,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 binfo.actual_seqlen_k - n_block * kBlockN);
             __syncthreads();  // K готов в smem, дальше его читает MMA
         }
-        flash::gemm(
+        flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
@@ -1183,7 +1200,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 binfo.actual_seqlen_k - n_block * kBlockN);
             __syncthreads();  // K готов в smem, дальше его читает MMA
         }
-        flash::gemm(
+        flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
@@ -1464,20 +1481,21 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     __syncthreads();
 
     const index_t row_offset_oaccum = bidx * kBlockM * params.d_rounded;
-    Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.oaccum_ptr) + row_offset_oaccum),
+    using ElementOaccum = std::conditional_t<Kernel_traits::Is_oaccum_fp16, Element, ElementAccum>;
+    Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementOaccum *>(params.oaccum_ptr) + row_offset_oaccum),
                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                  Stride<Int<kHeadDim>, _1>{});
     constexpr int kBlockN = kNThreads / kBlockM;
     using GmemLayoutAtomOaccum = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<Int<kBlockN>, _1>>;
     using GmemTiledCopyOaccum = decltype(
-        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementOaccum>{},
                         GmemLayoutAtomOaccum{},
                         Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
     GmemTiledCopyOaccum gmem_tiled_copy_Oaccum;
     auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
     Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_S(gOaccum);
     Tensor tOrO = make_tensor<ElementAccum>(shape(tOgOaccum));
-    Tensor tOrOaccum = make_tensor<ElementAccum>(shape(tOgOaccum));
+    Tensor tOrOaccum = make_tensor<ElementOaccum>(shape(tOgOaccum));
     clear(tOrO);
 
     // Predicates
@@ -1502,7 +1520,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             for (int k = 0; k < size<2>(tOrOaccum); ++k) {
                 #pragma unroll
                 for (int i = 0; i < size<0>(tOrOaccum); ++i) {
-                    tOrO(i, m, k) += lse_scale * tOrOaccum(i, m, k);
+                    tOrO(i, m, k) += lse_scale * static_cast<ElementAccum>(tOrOaccum(i, m, k));
                 }
             }
         // if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE[split][0], sLSE[split][1]); print(tOrOaccum); }
