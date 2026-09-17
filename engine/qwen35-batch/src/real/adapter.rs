@@ -1238,6 +1238,15 @@ impl BatchModel for Qwen35BatchAdapter {
             .seed_slot_batched(&self.device, sidx, snap)
             .map_err(|e| anyhow!("prime_slot seed: {e}"))?;
         self.slot_seeded[sidx] = true;
+        // restore_slot_state двигает хостовое зеркало kv_len_host, но декод
+        // читает ДЛИНУ С УСТРОЙСТВА (kv_len_dev) — без переноса там остаётся
+        // длина прошлого запроса, и внимание уходит за границу префила.
+        #[cfg(feature = "cuda")]
+        if let Some(ctx) = self.model.paged_ctx.as_mut() {
+            let lens = ctx.kv_len_host.clone();
+            ctx.reset_kv_len(&lens)
+                .map_err(|e| anyhow!("prime_slot reset_kv_len: {e}"))?;
+        }
         #[cfg(feature = "cuda")]
         self.model.set_kv_len_batched(sidx, position);
         #[cfg(not(feature = "cuda"))]
