@@ -147,6 +147,10 @@ extern "C" void run_mha(
     // раскладка; >1 — причинная граница по позиции (см. mask.h).
     int rows_per_position,
 
+    // int8-QK: nullptr → прежний путь (распаковка K + f16-MMA).
+    void *q_int8_ptr,
+    void *q_scale_ptr,
+
     void *stream_ptr
 ) {
     Flash_fwd_params params;
@@ -228,11 +232,15 @@ extern "C" void run_mha(
     params.k_scale_batch_stride = k_scale_batch_stride;
     params.k_scale_row_stride = k_scale_row_stride;
     params.k_scale_head_stride = 1;
+    params.q_int8_ptr = nullptr;
+    params.q_scale_ptr = nullptr;
     params.v_scale_batch_stride = v_scale_batch_stride;
     params.v_scale_row_stride = v_scale_row_stride;
     params.v_scale_head_stride = 1;
     params.kv_is_q8 = kv_is_q8 != 0;
     params.rows_per_position = rows_per_position;
+    params.q_int8_ptr = q_int8_ptr;
+    params.q_scale_ptr = q_scale_ptr;
 
     params.is_seqlens_k_cumulative = true;
     params.unpadded_lse = unpadded_lse;

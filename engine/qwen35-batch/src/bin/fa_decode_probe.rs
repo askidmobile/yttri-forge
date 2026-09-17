@@ -118,6 +118,8 @@ fn run_paged(
             scale_row_stride,
             kv_is_q8,
             rows_per_position as i32,
+            std::ptr::null(),
+            std::ptr::null(),
             stream.cu_stream() as *mut std::ffi::c_void,
         );
     }

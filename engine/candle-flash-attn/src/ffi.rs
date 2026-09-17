@@ -71,6 +71,11 @@ extern "C" {
         // Строк запроса на позицию (свёртка GQA, one-pass verify). 0/1 — выкл.
         rows_per_position: c_int,
 
+        // int8-QK (спайк §91): nullptr → прежний путь.
+        // q_int8_ptr — U8-тензор [total_q, h, d], q_scale_ptr — f16 [total_q, h].
+        q_int8_ptr: *const c_void,
+        q_scale_ptr: *const c_void,
+
         stream_ptr: *mut c_void,
     );
 

@@ -126,6 +126,8 @@ fn main() -> Result<()> {
                 0,
                 0,
                 0,
+                std::ptr::null(),
+                std::ptr::null(),
                 cuda.cuda_stream().cu_stream() as *mut std::ffi::c_void,
             );
         }

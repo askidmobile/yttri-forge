@@ -221,6 +221,8 @@ impl FlashAttn {
                 /* v_scale_row_stride */ 0,
                 /* kv_is_q8 */ 0,
                 /* rows_per_position */ 0,
+                /* q_int8_ptr */ std::ptr::null(),
+                /* q_scale_ptr */ std::ptr::null(),
                 /* stream_ptr */ stream.cu_stream() as *mut core::ffi::c_void,
             )
         }
@@ -833,6 +835,8 @@ impl FlashAttnVarLen {
                 /* v_scale_row_stride */ 0,
                 /* kv_is_q8 */ 0,
                 /* rows_per_position */ 0,
+                /* q_int8_ptr */ std::ptr::null(),
+                /* q_scale_ptr */ std::ptr::null(),
                 /* stream_ptr */ stream.cu_stream() as *mut core::ffi::c_void,
             )
         }

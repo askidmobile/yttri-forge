@@ -208,6 +208,8 @@ impl PagedAttn<'_> {
                 scale_row_stride,
                 kv_is_q8,
                 self.rows_per_position as i32,
+                std::ptr::null(), // q_int8_ptr: int8-QK ещё не подключён
+                std::ptr::null(), // q_scale_ptr
                 stream.cu_stream() as *mut std::ffi::c_void,
             );
         }

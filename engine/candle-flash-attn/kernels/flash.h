@@ -158,6 +158,11 @@ struct Flash_fwd_params : public Qkv_params {
     index_t v_scale_row_stride;
     index_t v_scale_head_stride;
     bool kv_is_q8;
+    // ── int8-QK (спайк §91): Q приходит уже квантованным, K читается байтами
+    // из staging-буфера. q_int8_ptr == nullptr → прежний путь (распаковка K
+    // в smem + f16-MMA), поведение не меняется.
+    void *__restrict__ q_int8_ptr;
+    void *__restrict__ q_scale_ptr;   // f16 [b*ngroups, h_k] после свопа GQA
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
