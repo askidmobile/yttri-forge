@@ -1348,7 +1348,15 @@ impl BatchModel for Qwen35BatchAdapter {
         let capture_boundary = prefix_cache_checkpoints_enabled()
             && chunk.start_pos > 0
             && self.slot_prefix_snaps[sidx].len() < prefix_cache_checkpoint_cap();
-        let capture_final = chunk.is_final && chunk.start_pos > 0 && !prefix_cache_full_hit_enabled();
+        // Граничный снимок (начало хвостового чанка) нужен кешу для следующего
+        // хода диалога: токенизатор сдвигает границу на несколько токенов, и
+        // запись во всю длину перестаёт быть префиксом (проверено). При
+        // включённом full-hit он не снимается только там, где хвоста нет —
+        // иначе это был бы бесполезный снимок на 16k внутри полного чанка.
+        let tail_chunk = chunk.tokens.len() < crate::scheduler::prefill_chunk_size();
+        let capture_final = chunk.is_final
+            && chunk.start_pos > 0
+            && (tail_chunk || !prefix_cache_full_hit_enabled());
         let capture_position = chunk.start_pos >= prefix_cache_min_pos()
             && chunk.start_pos <= prefix_limit
             && (capture_boundary || capture_final);
