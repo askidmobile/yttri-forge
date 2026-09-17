@@ -8341,6 +8341,93 @@ impl ModelWeights {
         Ok(())
     }
 
+    /// D2D-засев batched-состояния слота из только что посчитанного
+    /// single-slot состояния префилла (graph-префилл, pg_used).
+    ///
+    /// Отличие от `seed_slot_batched` — перенос рекуррентного состояния идёт
+    /// device→device, без пары dtoh+htod. Замер 2026-09-17 на 30k-предикате
+    /// (`[pfin]`): полный seed стоил 162 мс, dominated htod по pageable-памяти.
+    /// Snapshot (`snap`) нужен только для host-зеркала CPU-fallback.
+    #[cfg(feature = "cuda")]
+    pub fn seed_slot_batched_from_device(
+        &mut self,
+        slot: usize,
+        snap: &StateSnapshot,
+    ) -> Result<()> {
+        if snap.blocks.len() != self.blocks.len() {
+            candle_core::bail!(
+                "seed_slot_batched_from_device: blocks length mismatch: snap={} vs model={}",
+                snap.blocks.len(),
+                self.blocks.len()
+            );
+        }
+        for (block, block_snap) in self.blocks.iter_mut().zip(snap.blocks.iter()) {
+            match (&mut block.layer, block_snap) {
+                (HybridLayerType::DeltaNet(d), BlockStateSnap::DeltaNet(s)) => {
+                    if let Some(batched) = d.cuda_ctx_batched.as_mut() {
+                        if let Some(single) = d.cuda_ctx.as_ref() {
+                            let dev = batched.dev.clone();
+                            delta_rule_batched_cuda::seed_slot_cuda_state_from_single(
+                                &dev,
+                                &mut batched.layer_state,
+                                slot,
+                                &single.layer_state,
+                            )?;
+                        }
+                    }
+                    // Host-зеркало CPU-fallback: оно и есть смысл snapshot'а.
+                    if slot < d.cpu_state_batched.len() {
+                        d.cpu_state_batched[slot].restore_from(s);
+                    }
+                }
+                (HybridLayerType::Attention(a), BlockStateSnap::Attention(kv_opt)) => {
+                    match kv_opt {
+                        // Пул — авторитет (graph-префилл): batched q8-кэш не
+                        // материализуем, храним только длину.
+                        #[cfg(feature = "cuda")]
+                        Some(kv) if kv.from_pool && self.paged_ctx.is_some() => {
+                            a.kv_cache_batched[slot] = None;
+                            a.kv_cache_len_batched[slot] = kv.cache_len;
+                        }
+                        Some(kv) => {
+                            let k =
+                                kv.k.narrow(2, 0, kv.cache_len)?
+                                    .transpose(1, 2)?
+                                    .contiguous()?;
+                            let v =
+                                kv.v.narrow(2, 0, kv.cache_len)?
+                                    .transpose(1, 2)?
+                                    .contiguous()?;
+                            let (k_q, k_s) = q8_quantize_rows(&k)?;
+                            let (v_q, v_s) = q8_quantize_rows(&v)?;
+                            a.kv_cache_batched[slot] = Some(if a.use_q8_f16_kv_cache {
+                                BatchedKvCache::F16(F16KvCache {
+                                    k: q8_dequantize_rows(&k_q, &k_s)?,
+                                    v: q8_dequantize_rows(&v_q, &v_s)?,
+                                })
+                            } else {
+                                BatchedKvCache::Q8(Q8KvCache { k_q, k_s, v_q, v_s })
+                            });
+                            a.kv_cache_len_batched[slot] = kv.cache_len;
+                        }
+                        None => {
+                            a.kv_cache_batched[slot] = None;
+                            a.kv_cache_len_batched[slot] = 0;
+                        }
+                    }
+                }
+                (HybridLayerType::DeltaNet(_), BlockStateSnap::Attention(_))
+                | (HybridLayerType::Attention(_), BlockStateSnap::DeltaNet(_)) => {
+                    candle_core::bail!(
+                        "seed_slot_batched_from_device: snapshot variant mismatch at slot {slot}"
+                    );
+                }
+            }
+        }
+        self.invalidate_mirror(slot);
+        Ok(())
+    }
+
     /// Упреждающее выделение f16-зеркала слота 0 на всех attention-слоях.
     /// Вызывается сразу после загрузки модели, пока dedicated VRAM свободна:
     /// страницы закрепляются в дискретке до того, как префилл выест запас

@@ -1268,23 +1268,37 @@ impl BatchModel for Qwen35BatchAdapter {
             && (capture_boundary || capture_final);
         let already_captured = self.slot_prefix_snaps[sidx].iter().any(|(pos, _)| *pos == chunk.start_pos);
         if self.capture_prefix && capture_position && !already_captured {
+            let t_cap = std::time::Instant::now();
             let device_snap = self
                 .model
                 .snapshot_slot_state(&self.device, sidx, chunk.start_pos)
                 .map_err(|e| anyhow!("prefix snapshot: {e}"))?;
+            let t_dev = t_cap.elapsed();
             // Переносим в RAM сразу, до forward финального чанка. Раньше
             // device-снимок границы пересекался по времени с финальным
             // slot-snapshot той же длины, удваивая пик VRAM.
+            let t_h0 = std::time::Instant::now();
             let host_snap = device_snap
                 .to_host()
                 .map_err(|e| anyhow!("prefix snapshot to host: {e}"))?;
+            let t_host = t_h0.elapsed();
             drop(device_snap);
+            let t_t0 = std::time::Instant::now();
             #[cfg(feature = "cuda")]
             {
                 if let Device::Cuda(c) = &self.device {
                     let _ = c.cuda_stream().synchronize();
                 }
                 trim_pool_cuda(&self.device);
+            }
+            if crate::scheduler::trace_on() {
+                eprintln!(
+                    "[pcap] pos={} dev={:.1}ms host={:.1}ms sync_trim={:.1}ms",
+                    chunk.start_pos,
+                    t_dev.as_secs_f64() * 1e3,
+                    t_host.as_secs_f64() * 1e3,
+                    t_t0.elapsed().as_secs_f64() * 1e3
+                );
             }
             self.slot_prefix_snaps[sidx].push((chunk.start_pos, host_snap));
         }
@@ -1540,6 +1554,7 @@ impl BatchModel for Qwen35BatchAdapter {
             // При graph-prefill attention K/V уже находится в paged pool.
             // Полный снимок создавал ещё одну копию, линейную по контексту,
             // хотя seed использовал из неё только recurrent-state и длину.
+            let t_fin = std::time::Instant::now();
             let snap = if pg_used {
                 self.model
                     .snapshot_slot_recurrent_state(&self.device, new_pos)
@@ -1549,16 +1564,35 @@ impl BatchModel for Qwen35BatchAdapter {
                     .snapshot_slot_state(&self.device, sidx, new_pos)
                     .map_err(|e| anyhow!("prefill snapshot: {e}"))?
             };
+            let t_snap_done = t_fin.elapsed();
             self.slot_snaps[sidx] = Some(snap);
-            self.model
-                .seed_slot_batched(
-                    &self.device,
-                    sidx,
-                    self.slot_snaps[sidx]
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("prefill snapshot disappeared"))?,
-                )
-                .map_err(|error| anyhow!("prefill seed slot {sidx}: {error}"))?;
+            let t_seed0 = std::time::Instant::now();
+            let snap_ref = self.slot_snaps[sidx]
+                .as_ref()
+                .ok_or_else(|| anyhow!("prefill snapshot disappeared"))?;
+            // Рекуррентное состояние уже на устройстве (single-slot ctx
+            // префилла), поэтому seed идёт D2D: полный путь через host стоил
+            // 162 мс на 30k ([pfin], 2026-09-17).
+            #[cfg(feature = "cuda")]
+            let seeded_device = {
+                // Откат для A/B: QWEN36_D2D_SEED=0 возвращает host-путь seed'а.
+                if std::env::var("QWEN36_D2D_SEED").map(|v| v != "0").unwrap_or(true) {
+                    self.model
+                        .seed_slot_batched_from_device(sidx, snap_ref)
+                        .map_err(|error| anyhow!("prefill seed(from device) slot {sidx}: {error}"))?;
+                    true
+                } else {
+                    false
+                }
+            };
+            #[cfg(not(feature = "cuda"))]
+            let seeded_device = false;
+            if !seeded_device {
+                self.model
+                    .seed_slot_batched(&self.device, sidx, snap_ref)
+                    .map_err(|error| anyhow!("prefill seed slot {sidx}: {error}"))?;
+            }
+            let t_seed = t_seed0.elapsed();
             #[cfg(feature = "cuda")]
             if pg_used {
                 // Attention payload намеренно отсутствует: пул уже содержит
@@ -1578,12 +1612,24 @@ impl BatchModel for Qwen35BatchAdapter {
             // Trim CUDA memory pool: prefill оставил пиковые F16/KV транзиенты
             // в driver pool (release threshold=512 MiB). Trim возвращает ОС
             // страницы сверх текущего usage → VRAM освобождается для decode.
+            let t_trim0 = std::time::Instant::now();
             #[cfg(feature = "cuda")]
             {
                 if let Device::Cuda(c) = &self.device {
                     let _ = c.cuda_stream().synchronize();
                 }
                 trim_pool_cuda(&self.device);
+            }
+            if crate::scheduler::trace_on() {
+                eprintln!(
+                    "[pfin] pos={} pg={} d2d={} snap={:.1}ms seed={:.1}ms sync_trim={:.1}ms",
+                    new_pos,
+                    pg_used,
+                    seeded_device,
+                    t_snap_done.as_secs_f64() * 1e3,
+                    t_seed.as_secs_f64() * 1e3,
+                    t_trim0.elapsed().as_secs_f64() * 1e3
+                );
             }
         } else {
             self.slot_seeded[sidx] = false;

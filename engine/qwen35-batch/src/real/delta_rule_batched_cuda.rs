@@ -966,6 +966,38 @@ pub fn restore_slot_cuda_state(
     Ok(())
 }
 
+/// D2D-засев слота из persistent-состояния single-slot контекста префилла.
+///
+/// Заменяет пару dtoh+htod полного `seed_slot_batched`. Замер 2026-09-17
+/// (`[pfin]`, 30k-предикат): htod-путь стоит 162 мс на 24 слоя — pageable
+/// копии по ~2 МБ идут на ~0.3 ГБ/с. Те же ~50 МБ device→device уходят за
+/// единицы миллисекунд.
+pub fn seed_slot_cuda_state_from_single(
+    dev: &CudaDevice,
+    state: &mut DeltaNetCudaStateBatched,
+    slot: usize,
+    single: &crate::real::delta_rule_cuda::DeltaNetCudaState,
+) -> Result<()> {
+    let ssm_len = single.ssm_state.len();
+    let conv_len = single.conv_state.len();
+    let ssm_off = slot * ssm_len;
+    let conv_off = slot * conv_len;
+    if ssm_off + ssm_len > state.ssm_state.len() || conv_off + conv_len > state.conv_state.len() {
+        candle_core::bail!(
+            "seed_slot_cuda_state_from_single: slot {slot} вне ёмкости (ssm {ssm_off}+{ssm_len}, conv {conv_off}+{conv_len})"
+        );
+    }
+    {
+        let mut dst = state.ssm_state.slice_mut(ssm_off..ssm_off + ssm_len);
+        dev.memcpy_dtod(&single.ssm_state, &mut dst)?;
+    }
+    {
+        let mut dst = state.conv_state.slice_mut(conv_off..conv_off + conv_len);
+        dev.memcpy_dtod(&single.conv_state, &mut dst)?;
+    }
+    Ok(())
+}
+
 /// Достаёт `&CudaDevice` из CUDA-тензора.
 pub fn cuda_device_of(t: &Tensor) -> Result<CudaDevice> {
     match t.device() {
