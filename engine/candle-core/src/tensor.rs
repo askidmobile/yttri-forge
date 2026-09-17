@@ -702,6 +702,100 @@ impl Tensor {
         self.silu()? * rhs
     }
 
+    /// Фьюжн «остаточная сумма + RMSNorm» одним ядром (CUDA, f32).
+    ///
+    /// Возвращает `(sum, normed)`: `sum = self + rhs` (нужен как следующий
+    /// residual), `normed = sum * rsqrt(mean(sum²) + eps) * weight`.
+    /// `Ok(None)` — путь не поддержан (не CUDA / не f32 / не contiguous /
+    /// shape не совпадают), вызывающий делает обычные два шага.
+    ///
+    /// Зачем: в декодном шаге на каждый слой приходится две пары
+    /// «add → rmsnorm», это ~64 запуска из 745 на шаг (см. §56/§58 в
+    /// docs/research/2026-09-16-head-to-head-llamacpp-and-phase-profile.md).
+    #[cfg(feature = "cuda")]
+    pub fn add_rmsnorm_pair(
+        &self,
+        rhs: &Self,
+        weight: &Self,
+        eps: f64,
+    ) -> Result<Option<(Self, Self)>> {
+        use crate::cuda_backend::WrapErr;
+        use cudarc::driver::PushKernelArg;
+        if self.dtype() != DType::F32
+            || rhs.dtype() != DType::F32
+            || weight.dtype() != DType::F32
+            || self.shape() != rhs.shape()
+        {
+            return Ok(None);
+        }
+        let dims = self.dims().to_vec();
+        if dims.len() < 2 {
+            return Ok(None);
+        }
+        let cols = dims[dims.len() - 1];
+        if cols == 0 || weight.elem_count() != cols {
+            return Ok(None);
+        }
+        let rows = self.elem_count() / cols;
+        let (a_st, a_l) = self.storage_and_layout();
+        let (b_st, b_l) = rhs.storage_and_layout();
+        let (w_st, w_l) = weight.storage_and_layout();
+        if !a_l.is_contiguous() || !b_l.is_contiguous() || !w_l.is_contiguous() {
+            return Ok(None);
+        }
+        let (Storage::Cuda(a_c), Storage::Cuda(b_c), Storage::Cuda(w_c)) =
+            (&*a_st, &*b_st, &*w_st)
+        else {
+            return Ok(None);
+        };
+        let Device::Cuda(dev) = self.device() else {
+            return Ok(None);
+        };
+        let a = a_c.as_cuda_slice::<f32>()?.slice(a_l.start_offset()..);
+        let b = b_c.as_cuda_slice::<f32>()?.slice(b_l.start_offset()..);
+        let w = w_c.as_cuda_slice::<f32>()?.slice(w_l.start_offset()..);
+        let shape = self.shape().clone();
+        let sum_storage = unsafe { self.device().alloc_uninit(&shape, DType::F32)? };
+        let norm_storage = unsafe { self.device().alloc_uninit(&shape, DType::F32)? };
+        {
+            let (Storage::Cuda(sum_c), Storage::Cuda(norm_c)) = (&sum_storage, &norm_storage) else {
+                crate::bail!("add_rmsnorm_pair: alloc_uninit вернул не-CUDA storage");
+            };
+            let sum_s = sum_c.as_cuda_slice::<f32>()?;
+            let norm_s = norm_c.as_cuda_slice::<f32>()?;
+            let func = dev.get_or_load_func("add_rmsnorm_f32", &candle_kernels::ADD_RMSNORM)?;
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (rows as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut bld = func.builder();
+            bld.arg(&a);
+            bld.arg(&b);
+            bld.arg(&w);
+            let cols_i = cols as i32;
+            let eps_f = eps as f32;
+            bld.arg(sum_s);
+            bld.arg(norm_s);
+            bld.arg(&cols_i);
+            bld.arg(&eps_f);
+            unsafe { bld.launch(cfg) }.w()?;
+        }
+        let sum_t = crate::tensor::from_storage(
+            sum_storage,
+            shape.clone(),
+            crate::op::BackpropOp::none(),
+            false,
+        );
+        let norm_t = crate::tensor::from_storage(
+            norm_storage,
+            shape,
+            crate::op::BackpropOp::none(),
+            false,
+        );
+        Ok(Some((sum_t, norm_t)))
+    }
+
     unary_op!(ceil, Ceil);
     unary_op!(floor, Floor);
     unary_op!(round, Round);

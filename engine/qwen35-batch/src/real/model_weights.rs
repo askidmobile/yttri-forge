@@ -5478,6 +5478,39 @@ pub(crate) struct HybridBlock {
     ff: FeedForward,
 }
 
+/// Фьюжн «остаточная сумма + RMSNorm» одним ядром (CUDA f32).
+/// `None` — путь не поддержан, вызывающий делает обычные два шага.
+#[cfg(feature = "cuda")]
+fn try_add_rmsnorm(
+    a: &Tensor,
+    residual: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+) -> Option<(Tensor, Tensor)> {
+    // ADD_RMSNORM_FUSED=0 — принудительно обычный путь (для сверки PPL).
+    if std::env::var("ADD_RMSNORM_FUSED").as_deref() == Ok("0") {
+        return None;
+    }
+    match a.add_rmsnorm_pair(residual, weight, eps) {
+        Ok(Some(pair)) => Some(pair),
+        Ok(None) => None,
+        Err(e) => {
+            log::warn!("add_rmsnorm_pair: {e}; обычный путь");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn try_add_rmsnorm(
+    _a: &Tensor,
+    _residual: &Tensor,
+    _weight: &Tensor,
+    _eps: f64,
+) -> Option<(Tensor, Tensor)> {
+    None
+}
+
 impl HybridBlock {
     /// Forward pass для одного блока.
     ///
@@ -5501,18 +5534,29 @@ impl HybridBlock {
                 attn.forward_attn(&normed, index_pos)?
             }
         };
-        let x = (layer_out + residual)?;
-
-        // FFN norm → MLP → residual
+        // FFN norm → MLP → residual. Пару «add + rmsnorm» считаем одним ядром,
+        // когда это поддержано (CUDA f32): −1 запуск на слой на шаг (§56/§58).
         let t0 = std::time::Instant::now();
-        let residual = &x;
-        let normed = self.ffn_norm.forward(&x)?;
+        let (x, normed) = match try_add_rmsnorm(
+            &layer_out,
+            residual,
+            self.ffn_norm.weight(),
+            self.ffn_norm.eps(),
+        ) {
+            Some(pair) => pair,
+            None => {
+                let x = (layer_out + residual)?;
+                let normed = self.ffn_norm.forward(&x)?;
+                (x, normed)
+            }
+        };
         let t_norm2 = t0.elapsed();
 
         let t0 = std::time::Instant::now();
         let ffn_out = self.ff.forward(&normed)?;
         let t_mlp = t0.elapsed();
 
+        let residual = &x;
         let x = (ffn_out + residual)?;
 
         // Аккумулируем norm + MLP
