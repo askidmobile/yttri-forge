@@ -1858,21 +1858,60 @@ impl QCudaStorage {
                 &candle_kernels::CANDLE_MMQ_DENSE,
             )
         };
-        let func = dev.get_or_load_func(&kernel_name, module)?;
-        if nbs > 48 * 1024 {
-            func.set_attribute(
-                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                nbs as i32,
-            )
-            .map_err(|e| crate::Error::Msg(format!("mmq set_attribute: {e:?}")))?;
-        }
-        let dst = unsafe { dev.alloc::<f32>(n * m_total)? };
-        // stream-k ветка ядра: grid.x = число тайлов (nty*ntx), grid.y/z=1.
-        // Каждый блок ведёт один output-тайл по всему k (fixup не нужен).
         let ntx = ceil_div(m_total, mmq_x);
         let nty = ceil_div(n, MMQ_Y);
+        let ntiles = ntx * nty;
+        // stream-k: сетка из nSM блоков вместо ntiles (как llama.cpp на Volta+).
+        // Непрерывная раскладка работы живёт в самом ядре, но при grid.x ==
+        // ntiles она вырождается в обычную тайловую схему, поэтому у нас ни разу
+        // не включалась. MMQ_STREAMK=1 включает, MMQ_NBLOCKS=N задаёт число
+        // блоков (по умолчанию nSM).
+        const SK_TAGS: [&str; 7] = ["q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q4_0", "q8_0"];
+        let sk_want = !use_dp4a
+            && std::env::var("MMQ_STREAMK").map(|v| v == "1").unwrap_or(false)
+            && SK_TAGS.contains(&tag);
+        let nsm = dev
+            .context
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .unwrap_or(28) as usize;
+        let nblocks = std::env::var("MMQ_NBLOCKS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(nsm)
+            .clamp(1, ntiles);
+        let use_sk = sk_want && nblocks < ntiles;
+        let set_smem = |f: &cudarc::driver::CudaFunction| -> Result<()> {
+            if nbs > 48 * 1024 {
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    nbs as i32,
+                )
+                .map_err(|e| crate::Error::Msg(format!("mmq set_attribute: {e:?}")))?;
+            }
+            Ok(())
+        };
+        let (func, fixup_func) = if use_sk {
+            let f = dev.get_or_load_func(&format!("candle_mmq_sk_{tag}_x{mmq_x}"), module)?;
+            set_smem(&f)?;
+            let ff = dev.get_or_load_func(&format!("candle_mmq_fixup_{tag}_x{mmq_x}"), module)?;
+            (f, Some(ff))
+        } else {
+            let f = dev.get_or_load_func(&kernel_name, module)?;
+            set_smem(&f)?;
+            (f, None)
+        };
+        let dst = unsafe { dev.alloc::<f32>(n * m_total)? };
+        let tmp_fixup = if use_sk {
+            Some(unsafe { dev.alloc::<f32>(nblocks * mmq_x * MMQ_Y)? })
+        } else {
+            None
+        };
+        // Обычная схема: grid.x = число тайлов (nty*ntx), grid.y/z=1, каждый
+        // блок ведёт один output-тайл по всему k (fixup не нужен).
         let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: ((nty * ntx) as u32, 1, 1),
+            grid_dim: (if use_sk { nblocks } else { ntiles } as u32, 1, 1),
             block_dim: (WARP_SIZE as u32, MMQ_NWARPS as u32, 1),
             shared_mem_bytes: nbs as u32,
         };
@@ -1888,6 +1927,9 @@ impl QCudaStorage {
             mb.arg(&self.data.inner);
             mb.arg(&y_mmq);
             mb.arg(&dst);
+            if let Some(tf) = tmp_fixup.as_ref() {
+                mb.arg(tf);
+            }
             barg!(
                 mb,
                 /* ncols_x      */ k as i32,
@@ -1899,6 +1941,27 @@ impl QCudaStorage {
                 /* ncols_max    */ m_total as i32
             );
             unsafe { mb.launch(cfg) }.w()?;
+        }
+        if let (Some(tf), Some(ff)) = (tmp_fixup.as_ref(), fixup_func.as_ref()) {
+            if ntiles % nblocks != 0 {
+                let fcfg = cudarc::driver::LaunchConfig {
+                    grid_dim: (nblocks as u32, 1, 1),
+                    block_dim: (WARP_SIZE as u32, MMQ_NWARPS as u32, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut fb = ff.builder();
+                fb.arg(&dst);
+                fb.arg(tf);
+                barg!(
+                    fb,
+                    /* ncols_x       */ k as i32,
+                    /* nrows_x       */ n as i32,
+                    /* ncols_dst     */ m_total as i32,
+                    /* stride_col_dst */ n as i32,
+                    /* ncols_max     */ m_total as i32
+                );
+                unsafe { fb.launch(fcfg) }.w()?;
+            }
         }
 
         if std::env::var_os("TRACE_MMQ").is_some() {
@@ -1914,6 +1977,9 @@ impl QCudaStorage {
                 nty,
                 ntx,
             );
+            if use_sk {
+                eprintln!("[mmq]   stream-k: nblocks={nblocks} (nSM={nsm}, tiles={ntiles})");
+            }
         }
         let t_mmq = std::time::Instant::now();
         let trace_mmq = std::env::var_os("TRACE_MMQ").is_some();

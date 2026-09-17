@@ -3766,7 +3766,7 @@ static __device__ __forceinline__ void mul_mat_q_impl(
 }
 
 template <ggml_type type, int mmq_x, bool need_check>
-static __global__ void mul_mat_q_stream_k_fixup(const int32_t * ids_dst,
+static __device__ __forceinline__ void mul_mat_q_stream_k_fixup_impl(const int32_t * ids_dst,
                                                 const int32_t * expert_bounds,
                                                 float * __restrict__ dst,
                                                 const float * __restrict__ tmp_last_tile,
@@ -3925,6 +3925,26 @@ static __global__ void mul_mat_q_stream_k_fixup(const int32_t * ids_dst,
             dst[ids_dst_shared[j]*stride_col_dst + i] += sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
         }
     }
+}
+
+template <ggml_type type, int mmq_x, bool need_check>
+static __global__ void mul_mat_q_stream_k_fixup(const int32_t * ids_dst,
+                                                const int32_t * expert_bounds,
+                                                float * __restrict__ dst,
+                                                const float * __restrict__ tmp_last_tile,
+                                                const int    ncols_x,
+                                                const int    nrows_x,
+                                                const int    ncols_dst,
+                                                const size_t stride_col_dst,
+                                                const int    nchannels_y,
+                                                const size_t stride_channel_dst,
+                                                const int    nsamples_y,
+                                                const size_t stride_sample_dst,
+                                                const int    ncols_max) {
+    mul_mat_q_stream_k_fixup_impl<type, mmq_x, need_check>(
+        ids_dst, expert_bounds, dst, tmp_last_tile,
+        ncols_x, nrows_x, ncols_dst, stride_col_dst, nchannels_y, stride_channel_dst,
+        nsamples_y, stride_sample_dst, ncols_max);
 }
 
 struct mmq_args {

@@ -2,7 +2,8 @@
 // ВНИМАНИЕ: cudaforge кэширует nvcc-компиляцию по mtime/содержимому самого
 // .cu — изменения в инклюдах (mmq_common.cuh/mmq_gguf.cuh) кэш НЕ сбрасывают,
 // даже при сработавшем rerun-if-changed. Меняешь .cuh — бампни этот файл.
-// cache-bust: 2026-08-31 IQ1_S native (full 2048-grid in mmq_common.cuh)
+// cache-bust: 2026-09-17 stream-k обёртки (mmq_gguf.cuh: fixup вынесен
+// в __device__ impl — правка .cuh без бампа этого файла не пересоберётся)
 // extern "C" __global__ обёртки над llama.cpp mul_mat_q (Tensor-Core MMA) для
 // плотного prefill. Вызываются из candle-core fast_mmq.rs через cudarc.
 // Включён в PTX-сборку (имя не совпадает с exclude "mmq_*.cu").
@@ -191,3 +192,51 @@ DEFINE_MMQ_DENSE(GGML_TYPE_IQ1_S, iq1_s, 128)
 DEFINE_MMQ_DENSE(GGML_TYPE_IQ4_XS, iq4_xs, 32)
 DEFINE_MMQ_DENSE(GGML_TYPE_IQ4_XS, iq4_xs, 64)
 DEFINE_MMQ_DENSE(GGML_TYPE_IQ4_XS, iq4_xs, 128)
+
+// ---------------------------------------------------------------------------
+// DENSE stream-k: сетка nblocks < ntiles (как у llama.cpp для Volta+), работа
+// режется непрерывно по (it, jt, k-блокам), хвостовые частичные суммы идут в
+// tmp_fixup, их досчитывает candle_mmq_fixup_<tag>_x<N>. ids/expert = null.
+// ---------------------------------------------------------------------------
+#define DEFINE_MMQ_DENSE_SK(ggml_type_const, tag, MMQX) \
+    extern "C" __global__ void __launch_bounds__(256) \
+    candle_mmq_sk_##tag##_x##MMQX( \
+        const char * __restrict__ x, const int * __restrict__ y, float * __restrict__ dst, \
+        float * __restrict__ tmp_fixup, \
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x, \
+        const int ncols_y, const int stride_col_dst, const int ncols_max) { \
+        mul_mat_q_impl<ggml_type_const, MMQX, false>( \
+            x, y, nullptr, nullptr, dst, tmp_fixup, \
+            ncols_x, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst, \
+            1, 1, 0, 0, 0, \
+            1, 1, 0, 0, 0, \
+            ncols_max); \
+    }
+
+#define DEFINE_MMQ_FIXUP(ggml_type_const, tag, MMQX) \
+    extern "C" __global__ void __launch_bounds__(256) \
+    candle_mmq_fixup_##tag##_x##MMQX( \
+        float * __restrict__ dst, const float * __restrict__ tmp_fixup, \
+        const int ncols_x, const int nrows_x, const int ncols_dst, \
+        const int stride_col_dst, const int ncols_max) { \
+        mul_mat_q_stream_k_fixup_impl<ggml_type_const, MMQX, false>( \
+            nullptr, nullptr, dst, tmp_fixup, \
+            ncols_x, nrows_x, ncols_dst, (size_t) stride_col_dst, \
+            1, 0, 1, 0, ncols_max); \
+    }
+
+#define DEFINE_MMQ_SK_PAIR(ggml_type_const, tag) \
+    DEFINE_MMQ_DENSE_SK(ggml_type_const, tag, 32) \
+    DEFINE_MMQ_DENSE_SK(ggml_type_const, tag, 64) \
+    DEFINE_MMQ_DENSE_SK(ggml_type_const, tag, 128) \
+    DEFINE_MMQ_FIXUP(ggml_type_const, tag, 32) \
+    DEFINE_MMQ_FIXUP(ggml_type_const, tag, 64) \
+    DEFINE_MMQ_FIXUP(ggml_type_const, tag, 128)
+
+DEFINE_MMQ_SK_PAIR(GGML_TYPE_Q2_K, q2_k)
+DEFINE_MMQ_SK_PAIR(GGML_TYPE_Q3_K, q3_k)
+DEFINE_MMQ_SK_PAIR(GGML_TYPE_Q4_K, q4_k)
+DEFINE_MMQ_SK_PAIR(GGML_TYPE_Q5_K, q5_k)
+DEFINE_MMQ_SK_PAIR(GGML_TYPE_Q6_K, q6_k)
+DEFINE_MMQ_SK_PAIR(GGML_TYPE_Q4_0, q4_0)
+DEFINE_MMQ_SK_PAIR(GGML_TYPE_Q8_0, q8_0)

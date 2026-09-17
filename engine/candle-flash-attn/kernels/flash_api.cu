@@ -327,14 +327,28 @@ extern "C" void run_mha(
             // 1 сплит 45.0 ток/с, 3 — 46.0, 8 — 52.0, 14 — 53.0, 16 — 55.4,
             // 32 — 53.0. Целимся в 9 волн (на b=1 h=16 это ровно 16 сплитов),
             // оставляя каждому сплиту не меньше двух блоков ключей.
-            const int target = 9 * num_sms;
             // Слитая MTP-проверка подаёт позиции как batch с общей page table
             // (нулевой batch-stride). Чтобы редукция совпадала с построчным
             // эталоном, оставляем то же число K-сплитов на каждую позицию.
             const int scheduling_b = params.block_table != nullptr
                 && params.block_table_batch_stride == 0 ? 1 : params.b;
             const int denom = std::max(1, scheduling_b * params.h * num_m_blocks);
-            ns = fa_ceildiv(target, denom);
+            if (is_decode && params.rows_per_position <= 1) {
+                // Волновая эвристика (2026-09-17, fa_decode_probe 1k…91k
+                // токенов): минимум времени у сетки из ОДНОЙ волны по два
+                // блока на SM — num_sms*2/h = 14 сплитов на 28 SM при h=4
+                // после GQA-свёртки. Прежние 9 волн (63 сплита) давали на
+                // 30232 токенах 0.445 мс против 0.401 (−10 %), на 4096 —
+                // 0.107 против 0.081 (−24 %), на 16384 — 0.268 против 0.231
+                // (−14 %). Дробные волны (21/63/84) систематически хуже
+                // соседних целых, отсюда и выбор «ровно одна волна».
+                // Очень длинные KV (60k+) чуть лучше на половине волны, но
+                // разница 1.4 % на ядре — не стоит отдельного правила.
+                ns = (num_sms * 2 + denom - 1) / denom;
+            } else {
+                const int target = 9 * num_sms;
+                ns = fa_ceildiv(target, denom);
+            }
             ns = std::min(ns, num_n_blocks / 2);
             ns = std::min(ns, 128);
             ns = std::max(ns, 1);
