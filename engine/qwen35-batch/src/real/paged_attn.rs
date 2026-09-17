@@ -214,3 +214,78 @@ impl PagedAttn<'_> {
         Ok(())
     }
 }
+
+/// Квантование Q в int8 для QK на int8-тензорных ядрах (спайк §91, план §92).
+///
+/// Масштаб считается на строку `(token, head)`: `s = max|q| / 127` (для пустой
+/// строки — минимальный положительный, чтобы деление не давало inf), значения
+/// округляются и зажимаются в `[-127, 127]`, после чего упаковываются в `U8`
+/// как дополнительный код (`x < 0` → `x + 256`) — ровно так их читает ядро
+/// через `reinterpret_cast<const int8_t *>`.
+///
+/// Возвращает `(q_int8, scale_f16)`; форма `q_int8` совпадает с входной,
+/// `scale` сохраняет последнюю ось (годится для broadcast при проверках).
+pub fn quantize_q_int8(q: &Tensor) -> Result<(Tensor, Tensor)> {
+    let q32 = q.to_dtype(DType::F32)?;
+    let amax = q32.abs()?.max_keepdim(candle_core::D::Minus1)?;
+    // +1e-8: пустая строка (все нули) не должна давать деление на ноль.
+    let scale = (amax / 127.0)?;
+    let scale = (scale + 1e-8)?.to_dtype(DType::F16)?;
+    let scaled = q32.broadcast_div(&scale.to_dtype(DType::F32)?)?;
+    let rounded = scaled.round()?.clamp(-127.0, 127.0)?;
+    // Дополнительный код: отрицательные -> x + 256, получаем 0..255 в U8.
+    let as_u8 = rounded
+        .lt(0.0)?
+        .where_cond(&(rounded.clone() + 256.0)?, &rounded)?;
+    Ok((as_u8.to_dtype(DType::U8)?, scale))
+}
+
+#[cfg(test)]
+mod q_int8_tests {
+    use super::quantize_q_int8;
+    use candle_core::{DType, Device, Result, Tensor};
+
+    /// Эталонное квантование строки: s = max|q|/127, x8 = round(q/s).
+    fn reference(vals: &[f32]) -> (f32, Vec<i32>) {
+        let amax = vals.iter().fold(0f32, |m, v| m.max(v.abs()));
+        // Как в реализации: +1e-8 и приведение к F16 (иначе 63.5 округляется
+        // по-разному: f32 даёт 63, f16-масштаб сдвигает границу).
+        let s = half::f16::from_f32(amax / 127.0 + 1e-8).to_f32();
+        let q8 = vals
+            .iter()
+            .map(|v| (v / s).round().clamp(-127.0, 127.0) as i32)
+            .collect();
+        (s, q8)
+    }
+
+    #[test]
+    fn quantize_matches_reference_and_is_int8_encoded() -> Result<()> {
+        let dev = Device::Cpu;
+        let vals: Vec<f32> = vec![1.0, -2.0, 0.5, 0.0, 3.0, -0.25, 0.75, -1.5];
+        let q = Tensor::from_vec(vals.clone(), (2, 4), &dev)?;
+        let (q8, scale) = quantize_q_int8(&q)?;
+        assert_eq!(q8.dtype(), DType::U8);
+        assert_eq!(q8.dims(), &[2, 4]);
+        assert_eq!(scale.dtype(), DType::F16);
+        let bytes = q8.flatten_all()?.to_vec1::<u8>()?;
+        let scales = scale.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        for (row, chunk) in vals.chunks(4).enumerate() {
+            let (s_ref, q8_ref) = reference(chunk);
+            assert!((scales[row] - s_ref as f32).abs() < 1e-3, "масштаб строки {row}");
+            for (i, expect) in q8_ref.iter().enumerate() {
+                let got = bytes[row * 4 + i] as i8 as i32;
+                assert_eq!(got, *expect, "строка {row}, элемент {i}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_row_does_not_divide_by_zero() -> Result<()> {
+        let dev = Device::Cpu;
+        let q = Tensor::zeros((1, 8), DType::F32, &dev)?;
+        let (q8, _scale) = quantize_q_int8(&q)?;
+        assert!(q8.flatten_all()?.to_vec1::<u8>()?.iter().all(|b| *b == 0));
+        Ok(())
+    }
+}
