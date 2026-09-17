@@ -3030,6 +3030,10 @@ pub struct KvCacheSnap {
     /// batched q8-кэш слота: при авторитетном пуле он дублировал бы данные
     /// (~512 МБ на слот @32K) — класс регрессии WDDM 2026-08-23.
     pub(crate) from_pool: bool,
+    /// Запись ссылается на строки пула, а не несёт их копию: восстанавливать
+    /// нечего (строки уже на месте), важно лишь выставить длину. Валидность
+    /// проверяет `pool_backed_valid` (поколение слота + окно пула).
+    pub(crate) pool_ref_only: bool,
 }
 
 impl KvCacheSnap {
@@ -4984,6 +4988,7 @@ impl GatedAttentionLayer {
             v_scale: None,
             cache_len: self.kv_cache_len,
             from_pool: false,
+            pool_ref_only: false,
         }))
     }
 
@@ -5160,6 +5165,7 @@ impl GatedAttentionLayer {
             v_scale,
             cache_len: len,
             from_pool: true,
+            pool_ref_only: false,
         }))
     }
 
@@ -5405,6 +5411,8 @@ impl StateSnapshot {
                             .transpose()?,
                         cache_len: kv.cache_len,
                         from_pool: kv.from_pool,
+                        // Флаг обязан пережить перенос в host и обратно.
+                        pool_ref_only: kv.pool_ref_only,
                     }),
                 })),
             })
@@ -7998,6 +8006,44 @@ impl ModelWeights {
         })
     }
 
+    /// Снимок состояния на позиции `position` без копии KV: внимание
+    /// помечается как pool-backed (`pool_ref_only`), строки уже лежат в
+    /// страничном пуле слота. Валидность такой записи проверяет
+    /// `pool_backed_valid` перед использованием.
+    pub fn snapshot_slot_state_pool_backed(
+        &self,
+        device: &Device,
+        slot: usize,
+        position: usize,
+    ) -> Result<StateSnapshot> {
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            blocks.push(match &block.layer {
+                HybridLayerType::DeltaNet(d) => BlockStateSnap::DeltaNet(d.snapshot_state(device)?),
+                HybridLayerType::Attention(_) => {
+                    // Ранг 4 и нулевая длина по токенам: заглушка обязана
+                    // проходить проверки формы, но данных не несёт — строки
+                    // лежат в пуле (`pool_ref_only`).
+                    let dummy = Tensor::zeros((1, 0, 1, 1), DType::F16, &Device::Cpu)?;
+                    BlockStateSnap::Attention(Some(KvCacheSnap {
+                        k: dummy.clone(),
+                        v: dummy,
+                        k_scale: None,
+                        v_scale: None,
+                        cache_len: position,
+                        from_pool: true,
+                        pool_ref_only: true,
+                    }))
+                }
+            });
+        }
+        Ok(StateSnapshot {
+            model_nonce: self.instance_nonce,
+            position,
+            blocks,
+        })
+    }
+
     /// Slot-aware вариант snapshot_state для prefix cache (paged-путь).
     ///
     /// Отличие от `snapshot_state`: attention-слой с пустым single-slot кэшем
@@ -8146,8 +8192,13 @@ impl ModelWeights {
                                 "restore_slot_state: Q8 attention snapshot должен быть взят из paged-пула"
                             );
                         }
+                        // pool-backed запись (pool_ref_only): строки [0, cache_len)
+                        // уже лежат в пуле этого слота, копировать нечего — валидность
+                        // проверена `pool_backed_valid` до вызова.
                         #[cfg(feature = "cuda")]
-                        let restored_to_pool = if let Some(ctx) = &self.paged_ctx {
+                        let restored_to_pool = if s.pool_ref_only {
+                            self.paged_ctx.is_some()
+                        } else if let Some(ctx) = &self.paged_ctx {
                             a.restore_kv_to_pool(slot, s, ctx.max_blocks)?
                         } else {
                             false
@@ -8155,7 +8206,26 @@ impl ModelWeights {
                         #[cfg(not(feature = "cuda"))]
                         let restored_to_pool = false;
 
-                        if q8_snapshot {
+                        if s.pool_ref_only {
+                            // Строки промпта лежат в пуле: забираем их в
+                            // single-slot кэш (device→device, ~16 мс) — eager-
+                            // префилу нужен именно он, а не пустая копия.
+                            #[cfg(feature = "cuda")]
+                            {
+                                let pool_snap = match &self.paged_ctx {
+                                    Some(ctx) => {
+                                        a.snapshot_kv_from_pool(slot, s.cache_len, ctx.max_blocks)?
+                                    }
+                                    None => None,
+                                };
+                                match pool_snap {
+                                    Some(pool_snap) => a.restore_kv(Some(&pool_snap))?,
+                                    None => a.restore_kv(None)?,
+                                }
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            a.restore_kv(None)?;
+                        } else if q8_snapshot {
                             if !restored_to_pool {
                                 candle_core::bail!(
                                     "restore_slot_state: Q8 snapshot невозможно восстановить без Q8 paged-пула"
@@ -10765,6 +10835,7 @@ mod tests {
             v_scale: None,
             cache_len: 4,
             from_pool: false,
+            pool_ref_only: false,
         };
 
         // Имитация restore: получить новые тензоры из snap
@@ -10930,6 +11001,7 @@ mod tests {
             v_scale: Some(Tensor::zeros(scale_shape, DType::F16, &device)?),
             cache_len: 4,
             from_pool: true,
+            pool_ref_only: false,
         };
         assert!(kv.is_q8());
 
@@ -11052,6 +11124,7 @@ mod snapshot_host_device_tests {
                     v_scale: None,
                     cache_len: 4,
                     from_pool: false,
+                    pool_ref_only: false,
                 })),
             ],
         }
@@ -11103,6 +11176,7 @@ mod snapshot_host_device_tests {
                 v_scale: Some(Tensor::zeros((1, 2, 4), DType::F16, &dev)?),
                 cache_len: 4,
                 from_pool: true,
+                pool_ref_only: false,
             }))],
         };
         assert!(matches!(&snap.blocks[0], BlockStateSnap::Attention(Some(kv)) if kv.is_q8()));
