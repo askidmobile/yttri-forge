@@ -314,22 +314,57 @@ __forceinline__ __device__ void copy_dequant_q8(
     const int max_MN = 0)
 {
     using ElemD = typename EngineD::value_type;
-    // Простой цикл без развёртки и без локального массива: источник лежит в
-    // разделяемой памяти, широкая загрузка там ничего не даёт, а развёрнутый
-    // вариант раздувал ядро настолько, что ptxas уходил в часы и три гигабайта
-    // на распределении регистров.
+    // Атом копии — 16 байт и в источнике (16 int8), и в приёмнике (8 половин),
+    // поэтому подряд идущие элементы группы лежат подряд с обеих сторон. Это
+    // даёт векторный путь: 4 элемента — одна 32-битная загрузка из smem и одна
+    // 32-битная запись half2. Раскладку проверяем по первой группе (свойство
+    // атома одинаково для всех групп); если что-то не сходится — остаётся
+    // прежний скалярный цикл, он корректен при любой раскладке.
+    constexpr int kAtom = decltype(size<0>(D))::value;
+    bool vec_ok = (kAtom % 4 == 0);
+    if (vec_ok) {
+        const int c0 = get<1>(identity_MN(0, 0, 0));
+        const int d0 = D.layout()(0, 0, 0);
+        vec_ok = (get<1>(identity_MN(1, 0, 0)) == c0 + 1)
+              && (get<1>(identity_MN(2, 0, 0)) == c0 + 2)
+              && (get<1>(identity_MN(3, 0, 0)) == c0 + 3)
+              && (D.layout()(1, 0, 0) == d0 + 1)
+              && (D.layout()(2, 0, 0) == d0 + 2)
+              && (D.layout()(3, 0, 0) == d0 + 3);
+    }
     for (int m = 0; m < size<1>(D); ++m) {
         const int row = get<0>(identity_MN(0, m, 0));
         const bool row_ok = Is_even_MN || row < max_MN;
         const float s = row_ok ? static_cast<float>(scales(row)) : 0.f;
+        const __half2 s2 = __half2half2(__float2half(s));
         for (int k = 0; k < size<2>(D); ++k) {
             const bool ok = row_ok && (Is_even_K || predicate_K(k));
-            for (int i = 0; i < size<0>(D); ++i) {
-                if (ok) {
+            if (ok && vec_ok) {
+                #pragma unroll
+                for (int i = 0; i < kAtom; i += 4) {
                     const int col = get<1>(identity_MN(i, m, k));
-                    D(i, m, k) = static_cast<ElemD>(static_cast<float>(src_i8(row, col)) * s);
-                } else if (Clear_OOB_MN) {
-                    D(i, m, k) = ElemD(0.f);
+                    const uint32_t packed =
+                        *reinterpret_cast<const uint32_t *>(&src_i8(row, col));
+                    const int b0 = static_cast<int>(static_cast<int8_t>(packed & 0xFFu));
+                    const int b1 = static_cast<int>(static_cast<int8_t>((packed >> 8) & 0xFFu));
+                    const int b2 = static_cast<int>(static_cast<int8_t>((packed >> 16) & 0xFFu));
+                    const int b3 = static_cast<int>(static_cast<int8_t>((packed >> 24) & 0xFFu));
+                    const __half2 h01 = __hmul2(__floats2half2_rn((float)b0, (float)b1), s2);
+                    const __half2 h23 = __hmul2(__floats2half2_rn((float)b2, (float)b3), s2);
+                    *reinterpret_cast<uint32_t *>(&D(i, m, k)) =
+                        *reinterpret_cast<const uint32_t *>(&h01);
+                    *reinterpret_cast<uint32_t *>(&D(i + 2, m, k)) =
+                        *reinterpret_cast<const uint32_t *>(&h23);
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < kAtom; ++i) {
+                    if (ok) {
+                        const int col = get<1>(identity_MN(i, m, k));
+                        D(i, m, k) = static_cast<ElemD>(static_cast<float>(src_i8(row, col)) * s);
+                    } else if (Clear_OOB_MN) {
+                        D(i, m, k) = ElemD(0.f);
+                    }
                 }
             }
         }

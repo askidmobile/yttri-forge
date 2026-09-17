@@ -3433,6 +3433,15 @@ fn kv_exact_f16() -> bool {
     *V.get_or_init(|| std::env::var("KV_Q8_ROUNDTRIP").as_deref() != Ok("1"))
 }
 
+/// Пойдёт ли префил слота по страничному пулу (paged-префилл). От этого
+/// зависит, можно ли оставить int8-строки только в пуле: eager-префил читает
+/// single-slot F16-кэш и без копии потерял бы весь префикс промпта.
+/// FR-007: при выгрузке экспертов paged-прогрев идёт даже с PGRAPH=off.
+#[cfg(feature = "cuda")]
+fn prefill_reads_pool(experts_ram: bool) -> bool {
+    experts_ram || std::env::var("PGRAPH").map(|v| v != "off").unwrap_or(false)
+}
+
 /// Graph-префилл пишет в paged pool чистый F16 (пул и так F16) — с q8
 /// round-trip логиты расходились с eager на MAE 0.42, без него — бит-в-бит.
 /// PGRAPH_Q8KV=1 возвращает round-trip (точность как у батчевого q8-кэша).
@@ -8179,6 +8188,10 @@ impl ModelWeights {
         }
         #[cfg(feature = "cuda")]
         let mut pool_restored_len: Option<usize> = None;
+        // Считаем ДО цикла: внутри держится mutable-заём self.blocks, а
+        // experts_ram() берёт self иммутабельно.
+        #[cfg(feature = "cuda")]
+        let prefill_paged = prefill_reads_pool(self.experts_ram());
         for (block, block_snap) in self.blocks.iter_mut().zip(snap.blocks.iter()) {
             match (&mut block.layer, block_snap) {
                 (HybridLayerType::DeltaNet(d), BlockStateSnap::DeltaNet(s)) => {
@@ -8207,9 +8220,13 @@ impl ModelWeights {
                         let restored_to_pool = false;
 
                         if s.pool_ref_only {
-                            // Строки промпта лежат в пуле: забираем их в
-                            // single-slot кэш (device→device, ~16 мс) — eager-
-                            // префилу нужен именно он, а не пустая копия.
+                            // Строки промпта лежат в пуле. F16-пул забираем в
+                            // single-slot кэш копией (device→device, ~16 мс) —
+                            // eager-префилу нужен именно он. Int8-пул так забрать
+                            // нельзя: копия потребовала бы декванта (двойная
+                            // память и потеря побитового паритета), поэтому при
+                            // paged-префилле пул остаётся авторитетным, а
+                            // single-slot кэш просто очищается.
                             #[cfg(feature = "cuda")]
                             {
                                 let pool_snap = match &self.paged_ctx {
@@ -8218,9 +8235,27 @@ impl ModelWeights {
                                     }
                                     None => None,
                                 };
-                                match pool_snap {
-                                    Some(pool_snap) => a.restore_kv(Some(&pool_snap))?,
-                                    None => a.restore_kv(None)?,
+                                let pool_is_q8 = match pool_snap.as_ref() {
+                                    Some(sn) => sn.q8_scales()?.is_some(),
+                                    None => false,
+                                };
+                                if pool_is_q8 {
+                                    // Eager-префил прочёл бы внимание из пустого
+                                    // single-slot кэша и молча потерял префикс —
+                                    // это хуже честного отказа.
+                                    if !prefill_paged {
+                                        candle_core::bail!(
+                                            "restore_slot_state: int8-пул требует paged-префилла \
+                                             (PGRAPH=on или выгрузка экспертов): с PGRAPH=off \
+                                             int8-строки нечем отдать eager-префилу"
+                                        );
+                                    }
+                                    a.restore_kv(None)?;
+                                } else {
+                                    match pool_snap {
+                                        Some(pool_snap) => a.restore_kv(Some(&pool_snap))?,
+                                        None => a.restore_kv(None)?,
+                                    }
                                 }
                             }
                             #[cfg(not(feature = "cuda"))]
