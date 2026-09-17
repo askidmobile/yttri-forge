@@ -20,7 +20,7 @@
 //! через single-slot scheduler — baseline. Greedy детерминирован ⇒ одинаковые
 //! логиты ⇒ одинаковые токены ⇒ batched == sequential.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -208,6 +208,9 @@ pub struct BatchScheduler<M: BatchModel> {
     /// 47 мс при сумме фаз 41, то есть 6 мс шли мимо разбивки.
     slot_last_round_end: Vec<Option<Instant>>,
     skip_count: Vec<usize>,
+    /// Логиты последней позиции для слотов, чей промпт целиком лежит в
+    /// prefix-кеше (попадание «ровно в длину»): prefill = 0 токенов.
+    fully_primed_logits: HashMap<usize, Vec<f32>>,
     stats: SchedulerStats,
     eos: u32,
 }
@@ -269,6 +272,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             slot_prev_gap: vec![f32::NAN; num_slots],
             slot_last_round_end: vec![None; num_slots],
             skip_count: vec![0; num_slots],
+            fully_primed_logits: HashMap::new(),
             stats: SchedulerStats::default(),
             eos,
         }
@@ -313,6 +317,36 @@ impl<M: BatchModel> BatchScheduler<M> {
         }
         self.queue.push_back(req);
         None
+    }
+
+    /// Prefix-cache admit «ровно в длину»: снимок покрывает ВЕСЬ промпт,
+    /// логиты последней позиции пришли из записи кеша, prefill не нужен
+    /// вовсе (0 токенов). Освобождает примированный слот от хвостового чанка.
+    ///
+    /// Caller обязан внедрить snapshot через `model_mut().inject_slot_snapshot`
+    /// сразу после возврата индекса слота.
+    pub fn submit_fully_primed(
+        &mut self,
+        prompt: Vec<u32>,
+        max_new: usize,
+        logits: Vec<f32>,
+    ) -> Option<usize> {
+        let len = prompt.len();
+        if len == 0 {
+            return None;
+        }
+        let idx = self.idle_slot()?;
+        let req = SlotRequest {
+            prompt,
+            max_new,
+            eos: self.eos,
+        };
+        self.slots[idx].admit(req);
+        self.reset_slot_speculative(idx);
+        self.slots[idx].prefill_done = len;
+        self.slots[idx].index_pos = len;
+        self.fully_primed_logits.insert(idx, logits);
+        Some(idx)
     }
 
     /// Prefix-cache admit: snapshot уже покрывает `primed_prefix_len` токенов
@@ -383,6 +417,40 @@ impl<M: BatchModel> BatchScheduler<M> {
         should_stop: &mut dyn FnMut(usize, &[u32]) -> bool,
     ) -> Result<StepOutcome> {
         self.admit_from_queue();
+
+        // 0. Полностью примированный слот (попадание prefix-кеша ровно в
+        // длину): prefill'ить нечего, состояние восстанавливаем из снимка,
+        // логиты последней позиции берём из записи кеша и сразу сэмплируем.
+        if let Some(sidx) = self
+            .slots
+            .iter()
+            .position(|s| s.is_prefilling() && s.prefill_remaining() == 0)
+        {
+            if let Some(logits) = self.fully_primed_logits.remove(&sidx) {
+                let t0 = Instant::now();
+                if let Err(err) = self.model.prime_slot(sidx) {
+                    eprintln!("[pcache] prime_slot {sidx}: {err}");
+                    self.slots[sidx].status = SlotStatus::Finished;
+                    return Ok(StepOutcome::DidPrefill {
+                        first_token_emitted: false,
+                    });
+                }
+                self.stats.prefill_ns += t0.elapsed().as_nanos();
+                self.slots[sidx].advance_prefill(0);
+                let gen = self.slots[sidx].generated_tokens().to_vec();
+                let tok = self.sampler.sample_indexed(sidx, &gen, &logits);
+                self.stats.total_decode_tokens += 1;
+                self.slots[sidx].push_token(tok);
+                let mut first_emitted = true;
+                if should_stop(sidx, &self.slots[sidx].generated) {
+                    self.slots[sidx].status = SlotStatus::Finished;
+                }
+                let _ = &mut first_emitted;
+                return Ok(StepOutcome::DidPrefill {
+                    first_token_emitted: true,
+                });
+            }
+        }
 
         // 1. Prefill phase: один чанк для одного Prefilling-слота.
         if let Some((sidx, chunk_size)) = self.next_prefill_chunk() {

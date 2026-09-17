@@ -231,6 +231,15 @@ fn prefix_cache_min_pos() -> usize {
     })
 }
 
+/// Полный промпт как запись prefix-кеша вместе с логитами последней позиции:
+/// попадание «ровно в длину» не требует ни одного токена prefill'а. Включается
+/// `PREFIX_CACHE_FULL_HIT=1`; при этом граничный снимок в начале финального
+/// чанка не снимается — запись во всю длину его заменяет.
+fn prefix_cache_full_hit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PREFIX_CACHE_FULL_HIT").as_deref() == Ok("1"))
+}
+
 fn prefix_cache_checkpoints_enabled() -> bool {
     static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -445,6 +454,9 @@ pub struct Qwen35BatchAdapter {
     /// Per-slot snapshot после prefill — источник state для seed в batched buffers.
     /// Хранится и для time-multiplexed fallback (если batched decode disabled).
     slot_snaps: Vec<Option<StateSnapshot>>,
+    /// Логиты последнего чанка префила слота — для записи в prefix-кеш
+    /// (нужны, чтобы попадание «ровно в длину» не требовало prefill'а).
+    slot_prefill_logits: Vec<Option<Vec<f32>>>,
     /// Снимки на границах чанков префила — для prefix cache.
     /// Раньше хранили только последнюю границу; этого мало для divergent
     /// branch, где расхождение происходит раньше последнего чанка. Теперь
@@ -713,6 +725,7 @@ impl Qwen35BatchAdapter {
             device,
             profile,
             slot_snaps: (0..num_slots).map(|_| None).collect(),
+            slot_prefill_logits: (0..num_slots).map(|_| None).collect(),
             slot_prefix_snaps: (0..num_slots).map(|_| Vec::new()).collect(),
             capture_prefix: false,
             slot_seeded: vec![false; num_slots],
@@ -811,6 +824,13 @@ impl Qwen35BatchAdapter {
             .get_mut(slot)
             .map(std::mem::take)
             .unwrap_or_default()
+    }
+
+    /// Забрать логиты последнего чанка префила (одноразово) — их кладёт в
+    /// запись prefix-кеша вызывающий, чтобы попадание «ровно в длину» не
+    /// требовало ни одного токена prefill'а.
+    pub fn take_prefill_logits(&mut self, slot: usize) -> Option<Vec<f32>> {
+        self.slot_prefill_logits.get_mut(slot).and_then(|l| l.take())
     }
 
     /// Внедрить snapshot слоту (prefix-cache hit): при следующем prefill_chunk
@@ -1178,6 +1198,58 @@ impl BatchModel for Qwen35BatchAdapter {
         Ok(())
     }
 
+    /// Восстановить состояние слота из снимка без forward'а: попадание
+    /// prefix-кеша «ровно в длину» (см. `BatchScheduler::submit_fully_primed`).
+    /// Повторяет ту часть `prefill_chunk`, что делает restore + seed, минуя
+    /// сам проход по модели: префил уже посчитан, логиты пришли из кеша.
+    fn prime_slot(&mut self, sidx: usize) -> Result<()> {
+        let snap = self
+            .slot_snaps
+            .get(sidx)
+            .and_then(|s| s.as_ref())
+            .ok_or_else(|| anyhow!("prime_slot {sidx}: нет снимка"))?;
+        let position = snap.position;
+        let pool_ok = self
+            .model
+            .restore_slot_state(&self.device, sidx, snap)
+            .map_err(|e| anyhow!("prime_slot restore: {e}"))?;
+        #[cfg(feature = "cuda")]
+        {
+            self.paged_dirty[sidx] = !pool_ok;
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = &pool_ok;
+        if pool_ok {
+            if let Some(snap) = self.slot_snaps[sidx].as_mut() {
+                snap.clear_attention_payloads();
+            }
+            #[cfg(feature = "cuda")]
+            if let Device::Cuda(c) = &self.device {
+                let _ = c.cuda_stream().synchronize();
+                trim_pool_cuda(&self.device);
+            }
+        }
+        let snap = self
+            .slot_snaps
+            .get(sidx)
+            .and_then(|s| s.as_ref())
+            .ok_or_else(|| anyhow!("prime_slot {sidx}: снимок пропал после restore"))?;
+        self.model
+            .seed_slot_batched(&self.device, sidx, snap)
+            .map_err(|e| anyhow!("prime_slot seed: {e}"))?;
+        self.slot_seeded[sidx] = true;
+        #[cfg(feature = "cuda")]
+        self.model.set_kv_len_batched(sidx, position);
+        #[cfg(not(feature = "cuda"))]
+        let _ = position;
+        #[cfg(feature = "cuda")]
+        {
+            self.prefill_path[sidx] = PrefillPath::Eager;
+        }
+        self.state_owner = None;
+        Ok(())
+    }
+
     fn prefill_chunk(&mut self, chunk: &PrefillChunk) -> Result<Vec<f32>> {
         let sidx = chunk.slot_idx;
         let pf_t0 = std::time::Instant::now();
@@ -1192,6 +1264,7 @@ impl BatchModel for Qwen35BatchAdapter {
             self.state_owner = None;
             self.model.clear_state();
             self.slot_snaps[sidx] = None;
+            self.slot_prefill_logits[sidx] = None;
             self.slot_prefix_snaps[sidx].clear();
             self.slot_seeded[sidx] = false;
             if let Some(mtp) = self.mtp.as_mut() {
@@ -1266,7 +1339,7 @@ impl BatchModel for Qwen35BatchAdapter {
         let capture_boundary = prefix_cache_checkpoints_enabled()
             && chunk.start_pos > 0
             && self.slot_prefix_snaps[sidx].len() < prefix_cache_checkpoint_cap();
-        let capture_final = chunk.is_final && chunk.start_pos > 0;
+        let capture_final = chunk.is_final && chunk.start_pos > 0 && !prefix_cache_full_hit_enabled();
         let capture_position = chunk.start_pos >= prefix_cache_min_pos()
             && chunk.start_pos <= prefix_limit
             && (capture_boundary || capture_final);
@@ -1554,6 +1627,18 @@ impl BatchModel for Qwen35BatchAdapter {
             };
             let t_snap_done = t_fin.elapsed();
             self.slot_snaps[sidx] = Some(snap);
+            // Полный промпт — отдельная запись кеша (см. prefix_cache_full_hit_enabled):
+            // KV едет как Arc-вид на single-slot кэш, воркер копирует его в host
+            // асинхронно, поэтому на критическом пути остаётся только клон Arc.
+            if self.capture_prefix
+                && !pg_used
+                && prefix_cache_full_hit_enabled()
+                && new_pos > 0
+            {
+                if let Some(full) = self.slot_snaps[sidx].as_ref() {
+                    self.slot_prefix_snaps[sidx].push((new_pos, full.clone()));
+                }
+            }
             let t_seed0 = std::time::Instant::now();
             let snap_ref = self.slot_snaps[sidx]
                 .as_ref()
@@ -1658,6 +1743,10 @@ impl BatchModel for Qwen35BatchAdapter {
             );
         }
         let _ = pf_restore_ms;
+        if chunk.is_final && self.capture_prefix {
+            // 1 МБ на слот: нужен только до записи в prefix-кеш.
+            self.slot_prefill_logits[sidx] = Some(logits_f32.clone());
+        }
         Ok(logits_f32)
     }
 

@@ -171,6 +171,15 @@ pub trait BatchModel {
     /// токена prompt'а в рекуррентном state).
     fn prefill_chunk(&mut self, chunk: &PrefillChunk) -> Result<Vec<f32>>;
 
+    /// Восстановить состояние слота из уже внедрённого снимка БЕЗ forward'а.
+    ///
+    /// Нужно для попадания prefix-кеша «ровно в длину»: снимок покрывает весь
+    /// промпт, логиты последней позиции лежат в записи кеша, prefill'ить
+    /// нечего — но пул/batched-состояние всё равно должны быть готовы к декоду.
+    fn prime_slot(&mut self, _slot: usize) -> Result<()> {
+        anyhow::bail!("model does not support priming without prefill")
+    }
+
     /// Batched decode step: один токен на каждый активный слот, одним батчем.
     /// Возвращает логиты per-item (в порядке `batch.items`).
     fn decode_batch(&mut self, batch: &DecodeBatch) -> Result<Vec<Vec<f32>>>;
