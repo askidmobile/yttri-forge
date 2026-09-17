@@ -1808,7 +1808,14 @@ impl QCudaStorage {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|x| [32usize, 64, 128].contains(x) && *x <= x_cap)
             .unwrap_or_else(|| {
-                [x_cap, 64, 32]
+                // Короткие батчи (хвостовой чанк префила, верификация MTP):
+                // тайл x128 паддит работу в m/128 раз, а веса всё равно
+                // читаются один раз за тайл. Для m <= 64 узкий тайл дешевле —
+                // включается MMQ_SMALL_TILE=1 (замер: хвост 24 токена).
+                let small_batch = m_total <= 64
+                    && std::env::var("MMQ_SMALL_TILE").map(|v| v != "0").unwrap_or(true);
+                let order: [usize; 3] = if small_batch { [32, 64, x_cap] } else { [x_cap, 64, 32] };
+                order
                     .into_iter()
                     .filter(|x| *x <= x_cap)
                     .find(|&x| nbs_for(x) <= smpbo)
