@@ -220,8 +220,18 @@ fn main() -> Result<()> {
         .contiguous()?
         .reshape((ngroups, H_K, D))?;
 
+    // 5-й аргумент: гонять только один вариант (для ncu: 0 = f16 no-fold,
+    // 1 = q8 no-fold, 2 = f16 fold, 3 = q8 fold; -1 = все).
+    let only: i32 = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(-1);
+    let variants: Vec<(bool, bool)> = vec![(false, false), (true, false), (false, true), (true, true)];
     let mut results: Vec<Bench> = Vec::new();
-    for &(q8, fold) in &[(false, false), (true, false), (false, true), (true, true)] {
+    let mut idx = 0usize;
+    for &(q8, fold) in variants.iter() {
+        let this = idx as i32;
+        idx += 1;
+        if only >= 0 && only != this {
+            continue;
+        }
         let (h, rows, rpp, q_t) = if fold {
             (H_K, ngroups, ngroups, q_fold.clone())
         } else {
@@ -284,6 +294,9 @@ fn main() -> Result<()> {
     // Сверка типов пула: int8-пул — квантованная копия тех же данных, значит
     // выход должен совпадать с f16-путём с точностью до ошибки квантования.
     // Расхождение в разы = ядро читает байты как half (или наоборот).
+    if results.len() < 2 {
+        return Ok(());
+    }
     let out_f16 = results[0].out.to_dtype(DType::F32)?.reshape((1, H, D))?;
     let out_q8 = results[1].out.to_dtype(DType::F32)?.reshape((1, H, D))?;
     let d_q = (&out_q8 - &out_f16)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;

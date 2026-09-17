@@ -321,16 +321,16 @@ __forceinline__ __device__ void copy_dequant_q8(
     // атома одинаково для всех групп); если что-то не сходится — остаётся
     // прежний скалярный цикл, он корректен при любой раскладке.
     constexpr int kAtom = decltype(size<0>(D))::value;
-    bool vec_ok = (kAtom % 4 == 0);
+    constexpr int kVec = 8;   // 8 int8 = 64-битная загрузка, 8 половин = 128-битная запись
+    bool vec_ok = (kAtom % kVec == 0);
     if (vec_ok) {
         const int c0 = get<1>(identity_MN(0, 0, 0));
         const int d0 = D.layout()(0, 0, 0);
-        vec_ok = (get<1>(identity_MN(1, 0, 0)) == c0 + 1)
-              && (get<1>(identity_MN(2, 0, 0)) == c0 + 2)
-              && (get<1>(identity_MN(3, 0, 0)) == c0 + 3)
-              && (D.layout()(1, 0, 0) == d0 + 1)
-              && (D.layout()(2, 0, 0) == d0 + 2)
-              && (D.layout()(3, 0, 0) == d0 + 3);
+        #pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+            vec_ok = vec_ok && (get<1>(identity_MN(i, 0, 0)) == c0 + i)
+                           && (D.layout()(i, 0, 0) == d0 + i);
+        }
     }
     for (int m = 0; m < size<1>(D); ++m) {
         const int row = get<0>(identity_MN(0, m, 0));
@@ -341,20 +341,24 @@ __forceinline__ __device__ void copy_dequant_q8(
             const bool ok = row_ok && (Is_even_K || predicate_K(k));
             if (ok && vec_ok) {
                 #pragma unroll
-                for (int i = 0; i < kAtom; i += 4) {
+                for (int i = 0; i < kAtom; i += kVec) {
                     const int col = get<1>(identity_MN(i, m, k));
-                    const uint32_t packed =
-                        *reinterpret_cast<const uint32_t *>(&src_i8(row, col));
-                    const int b0 = static_cast<int>(static_cast<int8_t>(packed & 0xFFu));
-                    const int b1 = static_cast<int>(static_cast<int8_t>((packed >> 8) & 0xFFu));
-                    const int b2 = static_cast<int>(static_cast<int8_t>((packed >> 16) & 0xFFu));
-                    const int b3 = static_cast<int>(static_cast<int8_t>((packed >> 24) & 0xFFu));
-                    const __half2 h01 = __hmul2(__floats2half2_rn((float)b0, (float)b1), s2);
-                    const __half2 h23 = __hmul2(__floats2half2_rn((float)b2, (float)b3), s2);
-                    *reinterpret_cast<uint32_t *>(&D(i, m, k)) =
-                        *reinterpret_cast<const uint32_t *>(&h01);
-                    *reinterpret_cast<uint32_t *>(&D(i + 2, m, k)) =
-                        *reinterpret_cast<const uint32_t *>(&h23);
+                    const uint64_t packed =
+                        *reinterpret_cast<const uint64_t *>(&src_i8(row, col));
+                    const __half2 h01 = __hmul2(__floats2half2_rn(
+                        (float)(int)(int8_t)(packed & 0xFFu), (float)(int)(int8_t)((packed >> 8) & 0xFFu)), s2);
+                    const __half2 h23 = __hmul2(__floats2half2_rn(
+                        (float)(int)(int8_t)((packed >> 16) & 0xFFu), (float)(int)(int8_t)((packed >> 24) & 0xFFu)), s2);
+                    const __half2 h45 = __hmul2(__floats2half2_rn(
+                        (float)(int)(int8_t)((packed >> 32) & 0xFFu), (float)(int)(int8_t)((packed >> 40) & 0xFFu)), s2);
+                    const __half2 h67 = __hmul2(__floats2half2_rn(
+                        (float)(int)(int8_t)((packed >> 48) & 0xFFu), (float)(int)(int8_t)((packed >> 56) & 0xFFu)), s2);
+                    *reinterpret_cast<uint2 *>(&D(i, m, k)) =
+                        make_uint2(*reinterpret_cast<const uint32_t *>(&h01),
+                                   *reinterpret_cast<const uint32_t *>(&h23));
+                    *reinterpret_cast<uint2 *>(&D(i + 4, m, k)) =
+                        make_uint2(*reinterpret_cast<const uint32_t *>(&h45),
+                                   *reinterpret_cast<const uint32_t *>(&h67));
                 }
             } else {
                 #pragma unroll
