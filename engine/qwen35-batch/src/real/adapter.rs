@@ -1269,38 +1269,22 @@ impl BatchModel for Qwen35BatchAdapter {
         let already_captured = self.slot_prefix_snaps[sidx].iter().any(|(pos, _)| *pos == chunk.start_pos);
         if self.capture_prefix && capture_position && !already_captured {
             let t_cap = std::time::Instant::now();
+            // Снимок остаётся device-side: перенос в host-память (~186 мс и
+            // ~1 ГиБ на 30k, замер [pcap] 2026-09-17) делает поток
+            // `pcache-to-host` на стороне сервера — он не держит forward
+            // финального чанка и первый токен ответа.
             let device_snap = self
                 .model
                 .snapshot_slot_state(&self.device, sidx, chunk.start_pos)
                 .map_err(|e| anyhow!("prefix snapshot: {e}"))?;
-            let t_dev = t_cap.elapsed();
-            // Переносим в RAM сразу, до forward финального чанка. Раньше
-            // device-снимок границы пересекался по времени с финальным
-            // slot-snapshot той же длины, удваивая пик VRAM.
-            let t_h0 = std::time::Instant::now();
-            let host_snap = device_snap
-                .to_host()
-                .map_err(|e| anyhow!("prefix snapshot to host: {e}"))?;
-            let t_host = t_h0.elapsed();
-            drop(device_snap);
-            let t_t0 = std::time::Instant::now();
-            #[cfg(feature = "cuda")]
-            {
-                if let Device::Cuda(c) = &self.device {
-                    let _ = c.cuda_stream().synchronize();
-                }
-                trim_pool_cuda(&self.device);
-            }
             if crate::scheduler::trace_on() {
                 eprintln!(
-                    "[pcap] pos={} dev={:.1}ms host={:.1}ms sync_trim={:.1}ms",
+                    "[pcap] pos={} dev={:.1}ms host=async",
                     chunk.start_pos,
-                    t_dev.as_secs_f64() * 1e3,
-                    t_host.as_secs_f64() * 1e3,
-                    t_t0.elapsed().as_secs_f64() * 1e3
+                    t_cap.elapsed().as_secs_f64() * 1e3,
                 );
             }
-            self.slot_prefix_snaps[sidx].push((chunk.start_pos, host_snap));
+            self.slot_prefix_snaps[sidx].push((chunk.start_pos, device_snap));
         }
 
         let pf_restore = pf_t0.elapsed();
@@ -1612,22 +1596,25 @@ impl BatchModel for Qwen35BatchAdapter {
             // Trim CUDA memory pool: prefill оставил пиковые F16/KV транзиенты
             // в driver pool (release threshold=512 MiB). Trim возвращает ОС
             // страницы сверх текущего usage → VRAM освобождается для decode.
-            let t_trim0 = std::time::Instant::now();
+            let t_sync0 = std::time::Instant::now();
             #[cfg(feature = "cuda")]
             {
                 if let Device::Cuda(c) = &self.device {
                     let _ = c.cuda_stream().synchronize();
                 }
-                trim_pool_cuda(&self.device);
             }
+            let t_sync = t_sync0.elapsed();
+            let t_trim0 = std::time::Instant::now();
+            trim_pool_cuda(&self.device);
             if crate::scheduler::trace_on() {
                 eprintln!(
-                    "[pfin] pos={} pg={} d2d={} snap={:.1}ms seed={:.1}ms sync_trim={:.1}ms",
+                    "[pfin] pos={} pg={} d2d={} snap={:.1}ms seed={:.1}ms sync={:.1}ms trim={:.1}ms",
                     new_pos,
                     pg_used,
                     seeded_device,
                     t_snap_done.as_secs_f64() * 1e3,
                     t_seed.as_secs_f64() * 1e3,
+                    t_sync.as_secs_f64() * 1e3,
                     t_trim0.elapsed().as_secs_f64() * 1e3
                 );
             }
