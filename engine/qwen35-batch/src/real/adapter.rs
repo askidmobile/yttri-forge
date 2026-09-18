@@ -681,6 +681,15 @@ impl Qwen35BatchAdapter {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(c) = &device {
             let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+            if std::env::var("VRAM_TRACE").as_deref() == Ok("1") {
+                if let Ok((used, reserved)) =
+                    candle_core::cuda_backend::mem_pool::default_mempool_usage(c)
+                {
+                    eprintln!(
+                        "[vram-trace] after weights: default used={used}MiB reserved={reserved}MiB"
+                    );
+                }
+            }
         }
         // PD-010: при выгрузке экспертов пул KV и стейджинг создаются сразу
         // при загрузке — иначе кэш (фаза 4) заберёт память пула.
@@ -3224,6 +3233,18 @@ impl Qwen35BatchAdapter {
                     self.decode_graphs.push(state);
                     if crate::scheduler::trace_on() {
                         eprintln!("[graphs] captured decode graph B={b} slots={slots:?}");
+                    }
+                    // VRAM_TRACE=1 — разбор постоянного оверхеда: сколько держит
+                    // default-пул после захвата. Помогает отличить память графа
+                    // (приватный пул, сюда не попадает) от внешних буферов.
+                    if std::env::var("VRAM_TRACE").as_deref() == Ok("1") {
+                        if let Ok((used, reserved)) =
+                            candle_core::cuda_backend::mem_pool::default_mempool_usage(cuda_dev)
+                        {
+                            eprintln!(
+                                "[vram-trace] after decode-graph: default used={used}MiB reserved={reserved}MiB"
+                            );
+                        }
                     }
                 }
                 Err(e) => {
