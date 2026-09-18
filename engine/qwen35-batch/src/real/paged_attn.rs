@@ -143,13 +143,14 @@ impl PagedAttn<'_> {
         let scale_batch_stride = (self.page_block_size * h_k) as u32;
 
         // QK на int8-тензорах: Q квантуется в int8 + построчные масштабы.
-        // Гейт QK_INT8=1 (A/B и откат); иначе прежний путь с распаковкой K.
-        // Декод (max_seqlen_q=1) и MTP-проверка (rows_per_position, 4): только они
-        // идут через split-KV ядро с int8-QK. Префил (тысячи строк) квантует Q
-        // зря — плотное ядро q_int8_ptr всё равно не читает.
+        // QK_INT8=1 — декод и MTP-проверка; QK_INT8_PREFILL=1 — ещё и префил
+        // (тот же split-KV kernel: seqlen_q большой, но Q-тайл читается так же).
         let qk_int8_on = self.kv_scales.is_some()
-            && std::env::var("QK_INT8").as_deref() == Ok("1")
-            && self.max_seqlen_q <= 8;
+            && if self.max_seqlen_q <= 8 {
+                std::env::var("QK_INT8").as_deref() == Ok("1")
+            } else {
+                std::env::var("QK_INT8_PREFILL").as_deref() == Ok("1")
+            };
         let (q8, qs) = if qk_int8_on {
             let (q8, qs) = quantize_q_int8_fast(self.q)?;
             (Some(q8), Some(qs))
