@@ -143,13 +143,22 @@ impl PagedAttn<'_> {
         let scale_batch_stride = (self.page_block_size * h_k) as u32;
 
         // QK на int8-тензорах: Q квантуется в int8 + построчные масштабы.
-        // QK_INT8=1 — декод и MTP-проверка; QK_INT8_PREFILL=1 — ещё и префил
-        // (тот же split-KV kernel: seqlen_q большой, но Q-тайл читается так же).
+        // QK_INT8=1 — декод и MTP-проверка (остаётся opt-in: на шаге декода
+        // выигрыша нет, а лишнее квантование Q стоит времени).
+        //
+        // Префил при int8-пуле — другое дело: он идёт тем же split-KV ядром,
+        // K читается из int8-staging без распаковки, а Q квантуется ядром.
+        // Замер 2026-09-18 на Qwen3.8-27B Q8_0 / RTX 4090 (f16-QK → int8-QK):
+        // 8K 2066 → 2090, 32K 2156 → 2226, 131072 1617 → 1796,
+        // 262144 1167 → 1388 t/s. На 128K/256K это выше llama.cpp на тех же
+        // точках (1788/1356); greedy-выдача совпала побайтово (443 символа).
+        // Поэтому для префила int8-QK — поведение по умолчанию, откат
+        // QK_INT8_PREFILL=0 оставлен для A/B и отладки.
         let qk_int8_on = self.kv_scales.is_some()
             && if self.max_seqlen_q <= 8 {
                 std::env::var("QK_INT8").as_deref() == Ok("1")
             } else {
-                std::env::var("QK_INT8_PREFILL").as_deref() == Ok("1")
+                std::env::var("QK_INT8_PREFILL").as_deref() != Ok("0")
             };
         let (q8, qs) = if qk_int8_on {
             let (q8, qs) = quantize_q_int8_fast(self.q)?;
