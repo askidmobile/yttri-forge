@@ -142,7 +142,11 @@ struct Flash_fwd_kernel_traits : public Base {
     // конвейер FA2 — замер показал потерю 15% декода при вдвое меньшем трафике.
     // Занятость от добавки не страдает: при 100 КБ на мультипроцессор здесь и
     // так помещается один блок.
-    static constexpr int kSmemKV8Size = size(SmemLayoutKV{}) * 2 * sizeof(int8_t);
+    // Строку int8-staging выравниваем с запасом +16 Б: при шаге ровно 256 Б
+    // строки попадают в одни и те же банки (256 Б = 64 слова), и распаковка
+    // читает их с конфликтами; +16 Б сдвигает банк каждой строки на 4.
+    static constexpr int kSmemKV8RowStride = kHeadDim + 16;
+    static constexpr int kSmemKV8Size = kBlockN * kSmemKV8RowStride * 2 * sizeof(int8_t);
     static constexpr int kSmemSizeSplitKV = kSmemSize + kSmemKV8Size;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);

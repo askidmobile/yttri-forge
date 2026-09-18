@@ -778,12 +778,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // разворачивает их в sK/sV. Асинхронность обязательна — синхронное чтение
     // встаёт в критический путь и рвёт конвейер FA2.
     int8_t *smem_kv8 = reinterpret_cast<int8_t *>(sV.data().get() + size(sV));
+    // Шаг строки — kSmemKV8RowStride (kHeadDim+16), а не kHeadDim: см. комментарий
+    // в kernel_traits.h (конфликты банков при ровно 256 Б).
     Tensor sK8 = make_tensor(
         make_smem_ptr(smem_kv8),
-        Layout<Shape<Int<kBlockN>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
+        Layout<Shape<Int<kBlockN>, Int<kHeadDim>>, Stride<Int<Kernel_traits::kSmemKV8RowStride>, _1>>{});
     Tensor sV8 = make_tensor(
-        make_smem_ptr(smem_kv8 + kBlockN * kHeadDim),
-        Layout<Shape<Int<kBlockN>, Int<kHeadDim>>, Stride<Int<kHeadDim>, _1>>{});
+        make_smem_ptr(smem_kv8 + kBlockN * Kernel_traits::kSmemKV8RowStride),
+        Layout<Shape<Int<kBlockN>, Int<kHeadDim>>, Stride<Int<Kernel_traits::kSmemKV8RowStride>, _1>>{});
 
     // 128 бит на поток = 16 байт int8.
     constexpr int kElemsPerLoadQ8 = 16;
