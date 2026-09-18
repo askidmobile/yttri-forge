@@ -322,6 +322,29 @@ fn graph_max_b() -> usize {
     })
 }
 
+/// Минимальная позиция в контексте, при которой имеет смысл захватывать
+/// декод-граф. `0` (умолчание) — захватывать всегда, как было.
+///
+/// Замер 2026-09-18 (Qwen3.8-27B Q8_0, RTX 4090 48 ГБ, int8-пул, PGRAPH=on,
+/// трасса `VRAM_TRACE=1`): захват графа добавляет в default-пул +262 МиБ.
+/// На коротком промпте это чистая переплата — без графов yforge занимает
+/// 26783 МиБ, ровно как llama.cpp (26783); с графами 27113. На длинном
+/// промпте картина обратная: графы держат 27145 против 27327 без них, потому
+/// что графовый пул переиспользует крупные активации префила, а eager их
+/// копит. Поэтому на больших картах графы выгодны всегда, а на картах с
+/// малым запасом VRAM этот порог позволяет коротким диалогам идти eager и
+/// не платить 262 МиБ. Цена переключения — декод короткого запроса на
+/// eager-пути (замер: 30.6 → 24.0 t/s на 8K), поэтому умолчание — 0.
+fn graph_min_ctx() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("GRAPH_MIN_CTX")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 fn dgraph_lru() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -2916,6 +2939,15 @@ impl Qwen35BatchAdapter {
         // Батч больше гейта уходит на eager: многослотовый граф-путь не готов.
         if b > graph_max_b() {
             return Ok(None);
+        }
+        // Короткий контекст на карте с малым запасом: eager без 262 МиБ
+        // графового пула (GRAPH_MIN_CTX, умолчание 0 = не гейтить).
+        let min_ctx = graph_min_ctx();
+        if min_ctx > 0 {
+            let cur_ctx = positions.iter().copied().max().unwrap_or(0);
+            if cur_ctx < min_ctx {
+                return Ok(None);
+            }
         }
         let Device::Cuda(cuda_dev) = &self.device else {
             return Ok(None);
