@@ -276,6 +276,7 @@ fn q8_cache() -> &'static Mutex<HashMap<(usize, usize, usize), (Tensor, Tensor)>
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+
 /// Быстрое квантование Q в int8 одним CUDA-ядром (`q_int8_quantize_rows`).
 /// Форма входа [rows, h, d] F16; результат — (U8 [rows, h, d], F16 [rows, h])
 /// в переиспользуемых буферах (см. `q8_cache`).
@@ -283,8 +284,12 @@ fn q8_cache() -> &'static Mutex<HashMap<(usize, usize, usize), (Tensor, Tensor)>
 pub fn quantize_q_int8_fast(q: &Tensor) -> Result<(Tensor, Tensor)> {
     let (rows, h, d) = q.dims3()?;
     let dev = q.device().as_cuda_device()?;
-    let key = (rows, h, d);
-    let (q8, scales) = {
+    // Декодные размеры (граф) кэшируем: адрес буфера должен быть стабилен
+    // между replay. Префильные тайлы (сотни+ строк) НЕ кэшируем: их форма
+    // зависит от длины промпта, и кэш рос бы без границ (найдено 2026-09-18 —
+    // +11 записей за пять промптов, вплоть до 33 МиБ каждая).
+    let (q8, scales) = if rows <= 256 {
+        let key = (rows, h, d);
         let mut cache = q8_cache().lock().expect("q8 cache");
         match cache.get(&key) {
             Some((a, b)) => (a.clone(), b.clone()),
@@ -295,6 +300,11 @@ pub fn quantize_q_int8_fast(q: &Tensor) -> Result<(Tensor, Tensor)> {
                 (q8, scales)
             }
         }
+    } else {
+        (
+            Tensor::zeros((rows, h, d), DType::U8, q.device())?,
+            Tensor::zeros((rows, h), DType::F16, q.device())?,
+        )
     };
     let q_ptr = tensor_cuda_ptr(q)?;
     let q8_ptr = tensor_cuda_ptr(&q8)?;

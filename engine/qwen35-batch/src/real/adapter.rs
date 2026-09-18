@@ -1311,6 +1311,34 @@ impl BatchModel for Qwen35BatchAdapter {
         if sidx >= self.slot_snaps.len() || chunk.tokens.is_empty() {
             return Err(anyhow!("prefill slot is out of range or chunk is empty"));
         }
+        // Страховка от OOM на пейдженном префиле: у пула драйвера остаётся
+        // retained-слак от пиковых транзиентов прошлых чанков, и при низком
+        // free чанк ловит CUDA_ERROR_OUT_OF_MEMORY уже после того, как промпт
+        // пошёл по пулу (наблюдалось 2026-09-18). Перед чанком проверяем free
+        // и, если его мало, синхронизируемся и возвращаем слак ОС.
+        #[cfg(feature = "cuda")]
+        if let candle_core::Device::Cuda(c) = &self.device {
+            let min_free: usize = std::env::var("PREFILL_MIN_FREE_MIB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3072);
+            if let Ok((free, _)) = c.cuda_stream().context().mem_get_info() {
+                if free < min_free * 1024 * 1024 {
+                    let _ = c.cuda_stream().synchronize();
+                    let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+                    let after = c
+                        .cuda_stream()
+                        .context()
+                        .mem_get_info()
+                        .map(|(f, _)| f / (1024 * 1024))
+                        .unwrap_or(0);
+                    eprintln!(
+                        "[prefill] free={}MiB < {min_free}MiB → trim пула, free={after}MiB",
+                        free / (1024 * 1024)
+                    );
+                }
+            }
+        }
         if chunk.reset_first {
             self.slot_gen[sidx] = self.slot_gen[sidx].wrapping_add(1);
             #[cfg(feature = "cuda")]
