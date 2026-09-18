@@ -28,6 +28,7 @@ fn run_paged(
     k_pool: &Tensor,
     v_pool: &Tensor,
     scales: Option<(&Tensor, &Tensor)>,
+    q8_qk: Option<(&Tensor, &Tensor)>,
     out: &Tensor,
     lse: &Tensor,
     block_table: &Tensor,
@@ -60,6 +61,13 @@ fn run_paged(
             0u32,
             0,
         ),
+    };
+    let (q_int8_ptr, q_scale_ptr) = match q8_qk {
+        Some((a, b)) => (
+            tensor_cuda_ptr(a)? as *const std::ffi::c_void,
+            tensor_cuda_ptr(b)? as *const std::ffi::c_void,
+        ),
+        None => (std::ptr::null(), std::ptr::null()),
     };
     let stream = dev.cuda_stream();
     let kv_row_stride = (h_k * d) as u32;
@@ -118,8 +126,8 @@ fn run_paged(
             scale_row_stride,
             kv_is_q8,
             rows_per_position as i32,
-            std::ptr::null(),
-            std::ptr::null(),
+            q_int8_ptr,
+            q_scale_ptr,
             stream.cu_stream() as *mut std::ffi::c_void,
         );
     }
@@ -199,7 +207,9 @@ fn main() -> Result<()> {
 
     println!(
         "fa_decode_probe: kv_len={kv_len} pages={n_pages} h={H} h_k={H_K} d={D} \
-         ngroups={ngroups} iters={iters} splits(pin)={splits} prod_mode={prod_mode}"
+         ngroups={ngroups} iters={iters} splits(pin)={splits} prod_mode={prod_mode} \
+         QK_INT8={}"
+        , std::env::var("QK_INT8").unwrap_or_else(|_| "0".into())
     );
 
     // Пул: [n_tokens, h_k, d] F16 (страницы подряд).
@@ -239,6 +249,12 @@ fn main() -> Result<()> {
         } else {
             (H, 1usize, 0usize, q_base.reshape((1usize, H, D))?)
         };
+        // QK на int8: Q квантуется один раз на вариант (вне замера).
+        let q8_qk = if std::env::var("QK_INT8").as_deref() == Ok("1") {
+            Some(qwen35_batch::real::paged_attn::quantize_q_int8_fast(&q_t)?)
+        } else {
+            None
+        };
         let out = Tensor::zeros((rows, h, D), DType::F16, &dev)?;
         let lse = Tensor::zeros((h, rows), DType::F32, &dev)?;
         let sq = Tensor::from_vec(vec![0i32, rows as i32], (2,), &dev)?;
@@ -254,7 +270,9 @@ fn main() -> Result<()> {
             cuda.cuda_stream().synchronize()?;
             let t0 = Instant::now();
             run_paged(
-                &cuda, &q_t, k_pool, v_pool, scales, &out, &lse, &block_table, &sq, &sk, 1, h,
+                &cuda, &q_t, k_pool, v_pool, scales,
+                q8_qk.as_ref().map(|(a, b)| (a, b)),
+                &out, &lse, &block_table, &sq, &sk, 1, h,
                 H_K, D, rows, kv_len, PAGE, scale, rpp, window_right,
             )?;
             cuda.cuda_stream().synchronize()?;
@@ -296,6 +314,16 @@ fn main() -> Result<()> {
     // Сверка типов пула: int8-пул — квантованная копия тех же данных, значит
     // выход должен совпадать с f16-путём с точностью до ошибки квантования.
     // Расхождение в разы = ядро читает байты как half (или наоборот).
+    if std::env::var("QK_DEBUG").as_deref() == Ok("1") && results.len() >= 2 {
+        let a = results[1].out.to_dtype(DType::F32)?.reshape((H, D))?;
+        let b = results[0].out.to_dtype(DType::F32)?.reshape((H, D))?;
+        let diff = (&a - &b)?.abs()?;
+        let per_head = diff.max(1)?.to_vec1::<f32>()?;
+        println!("QK_DEBUG per-head max|Δ| (q8 no-fold vs f16): {:?}", per_head);
+        let o0 = a.narrow(0, 0, 1)?.flatten_all()?.narrow(0, 0, 4)?.to_vec1::<f32>()?;
+        let o0f = b.narrow(0, 0, 1)?.flatten_all()?.narrow(0, 0, 4)?.to_vec1::<f32>()?;
+        println!("QK_DEBUG head0 out[0..4]: q8={:?} f16={:?}", o0, o0f);
+    }
     if results.len() < 2 {
         return Ok(());
     }

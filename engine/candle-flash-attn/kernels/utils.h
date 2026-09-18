@@ -375,6 +375,112 @@ __forceinline__ __device__ void copy_dequant_q8(
     }
 }
 
+
+// Масштаб по индексу: принимает и (N) и (N,1) — тайлы пула и Q-масштабов
+// приходят в обеих формах.
+template <typename Engine, typename Layout>
+__forceinline__ __device__ float scale_row_col(Tensor<Engine, Layout> const &t, const int i) {
+    if constexpr (decltype(rank(t))::value == 2) {
+        return static_cast<float>(t(i, 0));
+    } else {
+        return static_cast<float>(t(i));
+    }
+}
+
+// Tiled-MMA для QK на s8: те же варпы вдоль M, что у f16-пути.
+template <int kNWarps>
+using TiledMmaQK8 = decltype(make_tiled_mma(
+    SM80_16x8x32_S32S8S8S32_TN{},
+    Layout<Shape<Int<kNWarps>, _1, _1>>{}));
+
+// S = Q_int8·K_int8ᵀ (int32) → float, с построчными (Q) и постолбцовыми (K)
+// масштабами. A-фрагмент Q загружается один раз на CTA вызывающим; K —
+// row-major [kBlockN, kHeadDim] int8, как staging-тайл пагинированного пула.
+// Раскладка C у f16- и s8-атомов структурно совпадает (харнес qk_layouts:
+// ((_2,_2),_1,_4):((_1,_2),_0,_4)), поэтому acc_s — общий f32-фрагмент.
+// extra_scale в ядре 1.0f: softmax_scale_log2 применяет softmax_rescale_o.
+template <int kBlockM, int kBlockN, int kHeadDim, int kNWarps,
+          typename EngineA, typename LayoutA,
+          typename EngineK, typename LayoutK,
+          typename EngineQS, typename LayoutQS,
+          typename EngineKS, typename LayoutKS,
+          typename TensorS>
+__forceinline__ __device__ void qk_int8_gemm(
+    Tensor<EngineA, LayoutA> const &tArQ8,     // (MMA,MMA_M,MMA_K) int8
+    Tensor<EngineK, LayoutK> const &tK8,       // (kBlockN, kHeadDim) int8
+    Tensor<EngineQS, LayoutQS> const &q_scale, // (kBlockM) f16
+    Tensor<EngineKS, LayoutKS> const &k_scale, // (kBlockN) f16
+    TensorS &acc_s,                            // (MMA,MMA_M,MMA_N) float
+    const int tidx,
+    const int row0,
+    const int col0,
+    const int nrows,
+    const float extra_scale = 1.0f)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    TiledMmaQK8<kNWarps> mma8;
+    auto thr = mma8.get_thread_slice(tidx);
+    Tensor tBrK = thr.partition_fragment_B(tK8);
+    copy(thr.partition_B(tK8), tBrK);
+    Tensor acc32 = partition_fragment_C(mma8, Shape<Int<kBlockM>, Int<kBlockN>>{});
+    clear(acc32);
+    gemm(mma8, tArQ8, tBrK, acc32);
+    // Раскладку C приводим к (nrow=(2,MMA_M), ncol=(2,MMA_N)) — как mask/softmax.
+    Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
+    Tensor acc32_rc = make_tensor(acc32.data(), convert_layout_acc_rowcol(acc32.layout()));
+    const int lane = tidx % 32;
+    const int lm_warp = (tidx / 32) * 16 + (lane / 4);
+    const int ln_pair = (lane % 4) * 2;
+    #pragma unroll
+    for (int mi = 0; mi < size<0, 1>(scores); ++mi) {
+        #pragma unroll
+        for (int i = 0; i < size<0, 0>(scores); ++i) {
+            const int lm = lm_warp + i * 8 + mi * (kNWarps * 16);
+            const bool row_ok = (row0 + lm) < nrows;
+            const float qs = row_ok ? scale_row_col(q_scale, lm) : 0.0f;
+            #pragma unroll
+            for (int nj = 0; nj < size<1, 1>(scores); ++nj) {
+                #pragma unroll
+                for (int j = 0; j < size<1, 0>(scores); ++j) {
+                    const int ln = ln_pair + j + nj * 8;
+                    scores(make_coord(i, mi), make_coord(j, nj)) =
+                        static_cast<float>(acc32_rc(make_coord(i, mi), make_coord(j, nj)))
+                        * (qs * scale_row_col(k_scale, ln) * extra_scale);
+                }
+            }
+        }
+    }
+#else
+    (void)tArQ8; (void)tK8; (void)q_scale; (void)k_scale; (void)acc_s;
+    (void)tidx; (void)row0; (void)col0; (void)nrows; (void)extra_scale;
+#endif
+}
+
+// Одиночный вызов (харнес): A загружается из tQ8 здесь же.
+template <int kBlockM, int kBlockN, int kHeadDim, int kNWarps,
+          typename EngineQ, typename LayoutQ, typename EngineQS, typename LayoutQS,
+          typename EngineK, typename LayoutK, typename EngineKS, typename LayoutKS,
+          typename TensorS>
+__forceinline__ __device__ void qk_int8_scores(
+    Tensor<EngineQ, LayoutQ> const &tQ8,
+    Tensor<EngineQS, LayoutQS> const &q_scale,
+    Tensor<EngineK, LayoutK> const &tK8,
+    Tensor<EngineKS, LayoutKS> const &k_scale,
+    TensorS &acc_s,
+    const int tidx,
+    const int row0,
+    const int col0,
+    const int nrows,
+    const float extra_scale = 1.0f)
+{
+    TiledMmaQK8<kNWarps> mma8;
+    auto thr = mma8.get_thread_slice(tidx);
+    Tensor tArQ = thr.partition_fragment_A(tQ8);
+    copy(thr.partition_A(tQ8), tArQ);
+    qk_int8_gemm<kBlockM, kBlockN, kHeadDim, kNWarps>(
+        tArQ, tK8, q_scale, k_scale, acc_s, tidx, row0, col0, nrows, extra_scale);
+}
+
 template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
           typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>

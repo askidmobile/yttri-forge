@@ -23,6 +23,52 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
+__device__ __forceinline__ float warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+    return v;
+}
+
+// Q -> int8 с масштабом на строку (строка = (token, head)), одним ядром.
+// amax -> scale = max(amax/127, 1e-8) в f16; q8 = clamp(round(v/scale), -127, 127).
+// Раскладка входа [rows, d] F16, выхода [rows, d] int8, масштабов [rows] F16.
+extern "C" __global__ void q_int8_quantize_rows(
+    const __half* __restrict__ q,
+    int8_t* __restrict__ q8,
+    __half* __restrict__ scales,
+    const int d)
+{
+    __shared__ float red[8];
+    const int row = blockIdx.x;
+    const __half* x = q + (size_t)row * d;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int nwarp = blockDim.x >> 5;
+    float amax = 0.0f;
+    for (int i = tid; i < d; i += blockDim.x) {
+        amax = fmaxf(amax, fabsf(__half2float(x[i])));
+    }
+    amax = warp_max(amax);
+    if (lane == 0) red[warp] = amax;
+    __syncthreads();
+    if (warp == 0) {
+        float t = (lane < nwarp) ? red[lane] : 0.0f;
+        t = warp_max(t);
+        if (lane == 0) red[0] = t;
+    }
+    __syncthreads();
+    const __half sh = __float2half(fmaxf(red[0] / 127.0f, 1e-8f));
+    const float s = __half2float(sh);
+    if (tid == 0) scales[row] = sh;
+    const float inv = 1.0f / s;
+    int8_t* yo = q8 + (size_t)row * d;
+    for (int i = tid; i < d; i += blockDim.x) {
+        int r = __float2int_rn(__half2float(x[i]) * inv);
+        r = max(-127, min(127, r));
+        yo[i] = (int8_t)r;
+    }
+}
+
 // Kernel A: частичный attention по чанку KV.
 // grid=(n_head, S), block=128 (4 warps). КАЖДЫЙ warp — независимый сплиттер:
 // свой непрерывный под-диапазон позиций, свои m/l в регистрах (lane-uniform

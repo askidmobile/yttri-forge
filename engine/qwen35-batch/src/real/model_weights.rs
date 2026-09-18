@@ -9741,6 +9741,20 @@ impl ModelWeights {
             }
         }
         self.paged_ready = true;
+        // QK на int8 квантует Q в переиспользуемые буферы: прогреваем их до
+        // захвата CUDA-графа, иначе аллокация попадёт внутрь capture.
+        if std::env::var("QK_INT8").as_deref() == Ok("1") {
+            let n_head = self
+                .blocks
+                .iter()
+                .find_map(|b| match &b.layer {
+                    HybridLayerType::Attention(a) => Some(a.n_head),
+                    _ => None,
+                })
+                .unwrap_or(n_kv);
+            let dummy = Tensor::zeros((1, n_head, hd), DType::F16, device)?;
+            let _ = crate::real::paged_attn::quantize_q_int8_fast(&dummy);
+        }
         if std::env::var("GPROF").as_deref() == Ok("1") {
             use cudarc::driver::sys as csys;
             let mut evs = [std::ptr::null_mut(); 4];

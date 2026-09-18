@@ -570,7 +570,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, bool Is_kv_q8, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, bool Is_kv_q8, bool Is_qk_int8, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
@@ -742,6 +742,27 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                           + q8_tile_offset(nb, params.v_scale_batch_stride, params.v_scale_row_stride, params.v_scale_head_stride)),
             Shape<Int<kBlockN>>{}, make_stride(params.v_scale_row_stride));
     };
+
+    // int8-QK: Q-тайл приходит уже квантованным (q_int8_ptr), A-фрагмент
+    // загружается один раз на CTA; K читается прямо из staging sK8.
+    const index_t q8_qk_off = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb);
+    // Шаги масштабов повторяют шаги Q: при GQA-swap (seqlenq_ngroups_swapped)
+    // строка/голова переставлены, и масштаб головы обязан идти по q_head_stride.
+    const index_t q8_qk_scale_row = params.q_row_stride / (params.d > 0 ? params.d : 1);
+    const index_t q8_qk_scale_head = params.q_head_stride / (params.d > 0 ? params.d : 1);
+    const Element *q8_qk_scale = reinterpret_cast<const Element *>(params.q_scale_ptr)
+        + (params.d > 0 ? q8_qk_off / params.d : 0);
+    Tensor mQ8 = make_tensor(make_gmem_ptr(reinterpret_cast<const int8_t *>(params.q_int8_ptr) + q8_qk_off),
+                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
+                             make_stride(params.q_row_stride, params.q_head_stride, _1{}));
+    Tensor gQ8 = local_tile(mQ8(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                            make_coord(m_block, 0));
+    TiledMmaQK8<kNWarps> mma_qk8;
+    auto thr_qk8 = mma_qk8.get_thread_slice(tidx);
+    Tensor tArQ8 = thr_qk8.partition_fragment_A(gQ8);
+    if constexpr (Is_qk_int8) {
+        copy(thr_qk8.partition_A(gQ8), tArQ8);
+    }
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
@@ -953,6 +974,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         tVgV.data() = tVgV_data;
     }
 
+    // int8-QK читает Q байтами из gmem, f16-копия в smem не нужна.
+    if constexpr (!Is_qk_int8) {
     // Read Q from gmem to smem, optionally apply rotary embedding.
     if (!Append_KV || params.rotary_dim == 0) {
         // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
@@ -991,9 +1014,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
     }
 
+    }
     // Q в регистрах + общий буфер Q/K: smem = max(Q,KV) вместо Q+KV.
     static_assert(!Kernel_traits::Is_Q_in_regs || Kernel_traits::Share_Q_K_smem,
                   "split-KV: Is_Q_in_regs только вместе с Share_Q_K_smem");
+    if constexpr (!Is_qk_int8) {
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
     if (Kernel_traits::Share_Q_K_smem) {
         flash::cp_async_wait<0>();
@@ -1002,6 +1027,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));            // M
         cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
         __syncthreads();
+    }
     }
 
     int n_block = n_block_max - 1;
@@ -1088,17 +1114,29 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // следующей копии и умножением: так она перекрывается с загрузкой,
         // а не конкурирует с ней. Строки за пределами длины обнуляем —
         // иначе чтение масштаба ушло бы за границу массива.
-        if constexpr (Is_kv_q8) {
+        if constexpr (Is_kv_q8 && Is_qk_int8) {
+            // int8-QK: K читается прямо из staging sK8, распаковка K не нужна.
+            flash::qk_int8_gemm<kBlockM, kBlockN, kHeadDim, kNWarps>(
+                tArQ8, sK8,
+                make_tensor(make_gmem_ptr(q8_qk_scale + (index_t)bidh * q8_qk_scale_head
+                                              + (index_t)m_block * kBlockM * q8_qk_scale_row),
+                            Shape<Int<kBlockM>>{}, make_stride(q8_qk_scale_row)),
+                q8_ks(n_block), acc_s, tidx, m_block * kBlockM, n_block * kBlockN,
+                binfo.actual_seqlen_q, /*extra_scale=*/1.0f);
+        } else if constexpr (Is_kv_q8) {
             auto gs_k = q8_ks(n_block);
             flash::copy_dequant_q8</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
                 sK8, gs_k, tKsK, tKVcKV, tKVpKV,
                 binfo.actual_seqlen_k - n_block * kBlockN);
             __syncthreads();  // K готов в smem, дальше его читает MMA
+            flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K);
+        } else {
+            flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K);
         }
-        flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-            smem_thr_copy_Q, smem_thr_copy_K
-        );
         // if (cute::thread0()) { print(acc_s); }
         if constexpr (Is_softcap){
             flash::apply_softcap(acc_s, params.softcap);
@@ -1198,17 +1236,29 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // следующей копии и умножением: так она перекрывается с загрузкой,
         // а не конкурирует с ней. Строки за пределами длины обнуляем —
         // иначе чтение масштаба ушло бы за границу массива.
-        if constexpr (Is_kv_q8) {
+        if constexpr (Is_kv_q8 && Is_qk_int8) {
+            // int8-QK: K читается прямо из staging sK8, распаковка K не нужна.
+            flash::qk_int8_gemm<kBlockM, kBlockN, kHeadDim, kNWarps>(
+                tArQ8, sK8,
+                make_tensor(make_gmem_ptr(q8_qk_scale + (index_t)bidh * q8_qk_scale_head
+                                              + (index_t)m_block * kBlockM * q8_qk_scale_row),
+                            Shape<Int<kBlockM>>{}, make_stride(q8_qk_scale_row)),
+                q8_ks(n_block), acc_s, tidx, m_block * kBlockM, n_block * kBlockN,
+                binfo.actual_seqlen_q, /*extra_scale=*/1.0f);
+        } else if constexpr (Is_kv_q8) {
             auto gs_k = q8_ks(n_block);
             flash::copy_dequant_q8</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/true>(
                 sK8, gs_k, tKsK, tKVcKV, tKVpKV,
                 binfo.actual_seqlen_k - n_block * kBlockN);
             __syncthreads();  // K готов в smem, дальше его читает MMA
+            flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K);
+        } else {
+            flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K);
         }
-        flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-            smem_thr_copy_Q, smem_thr_copy_K
-        );
         if constexpr (Is_softcap){
             flash::apply_softcap(acc_s, params.softcap);
         }
@@ -1363,7 +1413,7 @@ inline __device__ void compute_attn(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, bool Is_kv_q8, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, bool Is_kv_q8, bool Is_qk_int8, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1372,7 +1422,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV, Is_kv_q8>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV, Is_kv_q8, Is_qk_int8>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

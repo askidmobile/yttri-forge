@@ -9,6 +9,9 @@
 
 use crate::real::paged_kv_cuda::tensor_cuda_ptr;
 use candle_core::{DType, Result, Tensor};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// Что нужно ядру для одного вызова постраничного внимания.
 pub struct PagedAttn<'a> {
@@ -139,6 +142,28 @@ impl PagedAttn<'_> {
         // Шаг по блоку у масштабов — как у пула, но без измерения head_dim.
         let scale_batch_stride = (self.page_block_size * h_k) as u32;
 
+        // QK на int8-тензорах: Q квантуется в int8 + построчные масштабы.
+        // Гейт QK_INT8=1 (A/B и откат); иначе прежний путь с распаковкой K.
+        // Декод (max_seqlen_q=1) и MTP-проверка (rows_per_position, 4): только они
+        // идут через split-KV ядро с int8-QK. Префил (тысячи строк) квантует Q
+        // зря — плотное ядро q_int8_ptr всё равно не читает.
+        let qk_int8_on = self.kv_scales.is_some()
+            && std::env::var("QK_INT8").as_deref() == Ok("1")
+            && self.max_seqlen_q <= 8;
+        let (q8, qs) = if qk_int8_on {
+            let (q8, qs) = quantize_q_int8_fast(self.q)?;
+            (Some(q8), Some(qs))
+        } else {
+            (None, None)
+        };
+        let (q_int8_ptr, q_scale_ptr) = match (&q8, &qs) {
+            (Some(a), Some(b)) => (
+                tensor_cuda_ptr(a)? as *const std::ffi::c_void,
+                tensor_cuda_ptr(b)? as *const std::ffi::c_void,
+            ),
+            _ => (std::ptr::null(), std::ptr::null()),
+        };
+
         let dev = self.q.device().as_cuda_device()?;
         let stream = dev.cuda_stream();
         unsafe {
@@ -208,8 +233,8 @@ impl PagedAttn<'_> {
                 scale_row_stride,
                 kv_is_q8,
                 self.rows_per_position as i32,
-                std::ptr::null(), // q_int8_ptr: int8-QK ещё не подключён
-                std::ptr::null(), // q_scale_ptr
+                q_int8_ptr,
+                q_scale_ptr,
                 stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
@@ -240,6 +265,53 @@ pub fn quantize_q_int8(q: &Tensor) -> Result<(Tensor, Tensor)> {
         .lt(0.0)?
         .where_cond(&(rounded.clone() + 256.0)?, &rounded)?;
     Ok((as_u8.to_dtype(DType::U8)?, scale))
+}
+
+/// Кэш буферов Q-int8: форма между шагами не меняется, поэтому аллокации
+/// делаются один раз и не попадают в захват CUDA-графа.
+fn q8_cache() -> &'static Mutex<HashMap<(usize, usize, usize), (Tensor, Tensor)>> {
+    static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), (Tensor, Tensor)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Быстрое квантование Q в int8 одним CUDA-ядром (`q_int8_quantize_rows`).
+/// Форма входа [rows, h, d] F16; результат — (U8 [rows, h, d], F16 [rows, h])
+/// в переиспользуемых буферах (см. `q8_cache`).
+#[cfg(feature = "cuda")]
+pub fn quantize_q_int8_fast(q: &Tensor) -> Result<(Tensor, Tensor)> {
+    let (rows, h, d) = q.dims3()?;
+    let dev = q.device().as_cuda_device()?;
+    let key = (rows, h, d);
+    let (q8, scales) = {
+        let mut cache = q8_cache().lock().expect("q8 cache");
+        match cache.get(&key) {
+            Some((a, b)) => (a.clone(), b.clone()),
+            None => {
+                let q8 = Tensor::zeros((rows, h, d), DType::U8, q.device())?;
+                let scales = Tensor::zeros((rows, h), DType::F16, q.device())?;
+                cache.insert(key, (q8.clone(), scales.clone()));
+                (q8, scales)
+            }
+        }
+    };
+    let q_ptr = tensor_cuda_ptr(q)?;
+    let q8_ptr = tensor_cuda_ptr(&q8)?;
+    let s_ptr = tensor_cuda_ptr(&scales)?;
+    let d_i = d as i32;
+    let func = dev.get_or_load_func("q_int8_quantize_rows", &candle_kernels::FLASH_DECODE)?;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows * h) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = func.builder();
+    builder.arg(&q_ptr);
+    builder.arg(&q8_ptr);
+    builder.arg(&s_ptr);
+    builder.arg(&d_i);
+    unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    Ok((q8, scales))
 }
 
 #[cfg(test)]
