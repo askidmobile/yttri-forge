@@ -45,7 +45,10 @@ askidmobile/candle заморожен как референс.
 
 ## Поддержать проект
 
-Если проект вам пригодился, его можно поддержать переводом **USDT в сети TON**:
+Если проект вам пригодился, его можно поддержать. Донаты идут на аренду GPU
+для тестирования новых моделей.
+
+Адрес для перевода **USDT в сети TON**:
 
 ```text
 UQAqmiUAf-kCo7pw1HM4KDrf4r8XCAsDDolODnZJnAydZ37O
@@ -56,4 +59,5 @@ UQAqmiUAf-kCo7pw1HM4KDrf4r8XCAsDDolODnZJnAydZ37O
 > токены и переводы из других сетей (TRC-20, ERC-20, BEP-20) на этот адрес
 > не зачисляются — средства можно потерять.
 
-**Donate:** USDT on the TON network only, to the address above.
+**Donate:** USDT on the TON network only, to the address above. Donations pay
+for GPU rental to test new models.
