@@ -40,3 +40,20 @@ askidmobile/candle заморожен как референс.
 |---|---|
 | askidmobile/candle (ЗАМОРОЖЕН на 05aa926a) | исторический референс |
 | askidmobile/qwen36-server (main ef76eb7) | сервер, планировщик |
+
+<a id="donate"></a>
+
+## Поддержать проект
+
+Если проект вам пригодился, его можно поддержать переводом **USDT в сети TON**:
+
+```text
+UQAqmiUAf-kCo7pw1HM4KDrf4r8XCAsDDolODnZJnAydZ37O
+```
+
+> [!WARNING]
+> Отправляйте только **USDT** и только в **сети TON**. Монеты TON, другие
+> токены и переводы из других сетей (TRC-20, ERC-20, BEP-20) на этот адрес
+> не зачисляются — средства можно потерять.
+
+**Donate:** USDT on the TON network only, to the address above.
