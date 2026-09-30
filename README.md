@@ -41,6 +41,22 @@ askidmobile/candle заморожен как референс.
 | askidmobile/candle (ЗАМОРОЖЕН на 05aa926a) | исторический референс |
 | askidmobile/qwen36-server (main ef76eb7) | сервер, планировщик |
 
+## Лицензия
+
+Код распространяется по двойной лицензии на выбор: [MIT](LICENSE-MIT) или
+[Apache-2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`). Движок в `engine/` — форк [candle](https://github.com/huggingface/candle) на тех
+же условиях; его лицензии и копирайты авторов candle лежат в `engine/`.
+
+Если явно не указано иное, любой вклад, намеренно отправленный для включения
+в проект, распространяется на условиях той же двойной лицензии без
+дополнительных условий.
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)
+at your option. Unless you explicitly state otherwise, any contribution
+intentionally submitted for inclusion in the work by you, as defined in the
+Apache-2.0 license, shall be dual licensed as above, without any additional
+terms or conditions.
+
 <a id="donate"></a>
 
 ## Поддержать проект
