@@ -10372,7 +10372,15 @@ impl ModelWeights {
 
     /// Token embeddings on model device. Media pipeline replaces placeholder rows
     /// before entering multimodal prefill; text-only forward does not call this.
+    ///
+    /// GPU_ONLY (прод-профиль) освобождает CPU-копию таблицы (mmap), поэтому
+    /// строки берём с GPU, как текстовый `forward`; тип — F32, как у CPU-пути.
+    /// Без этого картинка на CUDA падала «token_id … out of range (vocab_size=0)».
     pub fn embed_tokens(&self, tokens: &Tensor, device: &Device) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(emb) = self.tok_embeddings_cuda.as_ref() {
+            return emb.embedding(tokens)?.to_dtype(DType::F32)?.to_device(device);
+        }
         self.tok_embeddings.forward(tokens)?.to_device(device)
     }
 

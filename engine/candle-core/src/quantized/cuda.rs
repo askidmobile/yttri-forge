@@ -387,6 +387,16 @@ fn dequantize_f16(
         GgmlDType::IQ1S => ("dequantize_block_iq1_s_f16", true, 32, nb),
         GgmlDType::IQ1M => ("dequantize_block_iq1_m_f16", true, 32, nb),
         GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f16", true, 256, nb),
+        // F16 — уже целевой тип: копия без преобразования. Так грузится
+        // mmproj F16 (llama.cpp) эталонным путём vision; без ветки — ошибка
+        // "unsupported dtype for dequantize F16".
+        GgmlDType::F16 => {
+            let view = unsafe { data.inner.transmute::<f16>(elem_count) }
+                .ok_or_else(|| crate::Error::Msg("f16 view: size mismatch".into()).bt())?;
+            let mut dst = unsafe { dev.alloc::<f16>(elem_count)? };
+            dev.memcpy_dtod(&view, &mut dst)?;
+            return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+        }
         // BF16 — не квант: простой cast bf16→f16 (dequantize_f16 вызывается
         // из QMatMul::from_arc для F16/BF16 весов; без этого полные BF16
         // GGUF падали "unsupported dtype", а через F32 — 2x VRAM/OOM).
