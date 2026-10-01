@@ -61,85 +61,60 @@ pub fn force_dmmv() -> bool {
     FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || force_dmmv_env()
 }
 
-// Per-device Q8_1 scratch cache: 2 слота на размер, чтобы избежать self-deadlock
-// когда вход слоя и выход attention_wo имеют одинаковую размерность (например 9B: 4096 == 4096).
-static Q81_SCRATCH: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::HashMap<
-            crate::cuda_backend::DeviceId,
-            std::collections::HashMap<
-                usize,
-                (CudaSlice<u8>, CudaSlice<u8>, std::sync::atomic::AtomicBool),
-            >,
-        >,
-    >,
-> = std::sync::OnceLock::new();
-
-pub struct Q81ScratchSlice {
-    dev_id: crate::cuda_backend::DeviceId,
-    bytes: usize,
-    slot_idx: usize,
+/// Пул принадлежит устройству, поэтому выгрузка последнего владельца освобождает
+/// CUDA-буферы. Глобальный кэш по DeviceId удерживал их до завершения процесса.
+#[derive(Default)]
+pub(crate) struct Q81ScratchPool {
+    available: std::sync::Mutex<std::collections::HashMap<usize, Vec<CudaSlice<u8>>>>,
 }
 
-impl Drop for Q81ScratchSlice {
+/// Активный буфер извлечён из пула и имеет единственного владельца. Вложенные
+/// вызовы одного размера получают разные буферы, независимо от их количества.
+pub struct Q81ScratchRef {
+    slice: Option<CudaSlice<u8>>,
+    pool: std::sync::Arc<Q81ScratchPool>,
+    bytes: usize,
+}
+
+impl Drop for Q81ScratchRef {
     fn drop(&mut self) {
-        if let Some(map) = Q81_SCRATCH.get() {
-            if let Ok(guard) = map.lock() {
-                if let Some(per_size) = guard.get(&self.dev_id) {
-                    if let Some((_, _, in_use)) = per_size.get(&self.bytes) {
-                        in_use.store(false, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
+        if let Some(slice) = self.slice.take() {
+            if let Ok(mut available) = self.pool.available.lock() {
+                available.entry(self.bytes).or_default().push(slice);
             }
         }
     }
 }
 
-pub struct Q81ScratchRef {
-    ptr: *const CudaSlice<u8>,
-    _token: Q81ScratchSlice,
-}
-
-unsafe impl Send for Q81ScratchRef {}
-unsafe impl Sync for Q81ScratchRef {}
-
 impl std::ops::Deref for Q81ScratchRef {
     type Target = CudaSlice<u8>;
     fn deref(&self) -> &Self::Target {
-        unsafe { &*self.ptr }
+        self.slice.as_ref().expect("active q8_1 scratch")
     }
 }
 
 impl std::ops::DerefMut for Q81ScratchRef {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *(self.ptr as *mut CudaSlice<u8>) }
+        self.slice.as_mut().expect("active q8_1 scratch")
     }
 }
 
 fn q8_1_scratch(dev: &CudaDevice, bytes: usize) -> Q81ScratchRef {
-    let map = Q81_SCRATCH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let bytes = bytes.max(1);
-    let mut guard = map.lock().unwrap();
-    let per_size = guard.entry(dev.id()).or_default();
-    let entry = per_size.entry(bytes).or_insert_with(|| {
-        let s0 = unsafe { dev.alloc::<u8>(bytes) }.expect("q8_1 scratch alloc 0");
-        let s1 = unsafe { dev.alloc::<u8>(bytes) }.expect("q8_1 scratch alloc 1");
-        (s0, s1, std::sync::atomic::AtomicBool::new(false))
-    });
-
-    let (ptr, slot_idx) = if !entry.2.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        (&entry.0 as *const CudaSlice<u8>, 0)
-    } else {
-        (&entry.1 as *const CudaSlice<u8>, 1)
-    };
-
+    let pool = dev.q81_scratch.clone();
+    let cached = pool
+        .available
+        .lock()
+        .unwrap()
+        .entry(bytes)
+        .or_default()
+        .pop();
+    let slice =
+        cached.unwrap_or_else(|| unsafe { dev.alloc::<u8>(bytes) }.expect("q8_1 scratch alloc"));
     Q81ScratchRef {
-        ptr,
-        _token: Q81ScratchSlice {
-            dev_id: dev.id(),
-            bytes,
-            slot_idx,
-        },
+        slice: Some(slice),
+        pool,
+        bytes,
     }
 }
 
@@ -2289,6 +2264,52 @@ pub fn load_quantized_bytes(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn q81_scratch_overlapping_leases_do_not_alias() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let mut first = q8_1_scratch(&dev, 32);
+        let mut second = q8_1_scratch(&dev, 32);
+        let mut third = q8_1_scratch(&dev, 32);
+        dev.memcpy_htod(&[1u8; 32], &mut *first)?;
+        dev.memcpy_htod(&[2u8; 32], &mut *second)?;
+        dev.memcpy_htod(&[3u8; 32], &mut *third)?;
+        assert_eq!(dev.clone_dtoh(&*first)?, vec![1u8; 32]);
+        assert_eq!(dev.clone_dtoh(&*second)?, vec![2u8; 32]);
+        assert_eq!(dev.clone_dtoh(&*third)?, vec![3u8; 32]);
+
+        // Освобождение среднего буфера не делает два остальных доступными.
+        drop(second);
+        let mut reused = q8_1_scratch(&dev, 32);
+        dev.memcpy_htod(&[4u8; 32], &mut *reused)?;
+        assert_eq!(dev.clone_dtoh(&*first)?, vec![1u8; 32]);
+        assert_eq!(dev.clone_dtoh(&*third)?, vec![3u8; 32]);
+        assert_eq!(dev.clone_dtoh(&*reused)?, vec![4u8; 32]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn q81_scratch_pool_follows_device_and_active_lease_lifetimes() -> Result<()> {
+        for _ in 0..12 {
+            let dev = CudaDevice::new(0)?;
+            let cloned = dev.clone();
+            let pool = std::sync::Arc::downgrade(&dev.q81_scratch);
+            let active = q8_1_scratch(&dev, 1024 * 1024);
+            drop(q8_1_scratch(&dev, 1024 * 1024));
+            drop(dev);
+            assert!(pool.upgrade().is_some(), "device clone retains the pool");
+            drop(cloned);
+            assert!(pool.upgrade().is_some(), "active lease retains the pool");
+            drop(active);
+            assert!(
+                pool.upgrade().is_none(),
+                "last owner releases cached CUDA buffers"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn cuda_quantize_q8_1() -> Result<()> {
