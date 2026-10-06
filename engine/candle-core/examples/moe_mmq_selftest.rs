@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
         candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>().unwrap().slice(rw_l.start_offset()..),
         _ => anyhow::bail!("weights не на CUDA"),
     };
-    let group = moe_grouping(&cuda_dev, &ids_v, &rw_v, N_TOKENS, TOPK, N_EXPERTS)?;
+    let group = moe_grouping(&cuda_dev, &ids_v, &rw_v, N_TOKENS, TOPK, N_EXPERTS, true)?;
     eprintln!(
         "[group] ncols_max={} m_total={}",
         group.ncols_max,

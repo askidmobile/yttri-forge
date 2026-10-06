@@ -338,7 +338,7 @@ impl SharedExpert {
         let gate_scalar = silu_div(&gate_logits)?; // [n_tokens, 1]
         let gp = self.gate.forward(xs)?; // [n_tokens, n_ff_shexp]
         let up = self.up.forward(xs)?; // [n_tokens, n_ff_shexp]
-        let act = gp.silu()?.mul(&up)?; // [n_tokens, n_ff_shexp]
+        let act = gp.silu_mul_direct(&up)?; // [n_tokens, n_ff_shexp]
         let ffn = self.down.forward(&act)?; // [n_tokens, n_embd]
         ffn.broadcast_mul(&gate_scalar)
     }
@@ -525,7 +525,7 @@ impl Qwen35MoeBlock {
                     &x3,
                     &ids_t,
                 )?;
-                let act = gate.silu()?.mul(&up)?.contiguous()?;
+                let act = gate.silu_mul_direct(&up)?.contiguous()?;
                 let down = indexed_moe_forward_table(
                     cuda_dev,
                     store.down.dtype,
@@ -581,7 +581,7 @@ impl Qwen35MoeBlock {
                     &x3,
                     &ids_t,
                 )?;
-                let act = gate.silu()?.mul(&up)?.contiguous()?;
+                let act = gate.silu_mul_direct(&up)?.contiguous()?;
                 let down = indexed_moe_forward_table(
                     cuda_dev,
                     st.down.dtype,
@@ -609,8 +609,25 @@ impl Qwen35MoeBlock {
                 // Только префил и только когда токенов достаточно: группировка
                 // делает D2H за слой, а на декоде это ломает захват CUDA-графа
                 // и при m=1 всё равно невыгодно (8 пар на 256 экспертов).
-                if mode == ForwardMode::Prefill
-                    && n_tokens >= moe_mmq_min_tokens()
+                // MMQ-путь: префил — всегда (там группировка снимает
+                // перечитывание весов эксперта, 1074 -> 7459 t/s).
+                //
+                // Декод идёт на MMVQ, и это не недосмотр: замер Ornith на
+                // RTX 4090, ctx 32768, decode — MMQ 89.9 t/s против MMVQ
+                // 125.0 t/s. На одном токене у эксперта одна пара, MMQ читает
+                // те же веса, но гонит их через shared memory и считает тайл
+                // из mmq_x=32 колонок ради одной — чистые накладные расходы.
+                // Ветка оставлена под MOE_MMQ_DECODE=1 (захват CUDA-графа при
+                // ней проходит: 5861 узлов, res=CUDA_SUCCESS).
+                let m_total = n_tokens * k;
+                let mmq_ok = match mode {
+                    ForwardMode::Prefill => n_tokens >= moe_mmq_min_tokens(),
+                    ForwardMode::DecodeBatch => {
+                        std::env::var("MOE_MMQ_DECODE").map(|v| v == "1").unwrap_or(false)
+                            && m_total <= candle_core::quantized::moe_mmq_x_for(m_total)
+                    }
+                };
+                if mmq_ok
                     && candle_core::quantized::moe_mmq_enabled()
                     && moe_mmq_shape_ok(packed)
                 {
@@ -636,19 +653,21 @@ impl Qwen35MoeBlock {
                         n_tokens,
                         k,
                         packed.n_experts,
+                        mode == ForwardMode::Prefill,
                     )?;
                     let x_f32 = xs.to_dtype(DType::F32)?.contiguous()?;
                     let gate = packed.gate.moe_mmq_project_cuda(&x_f32, &group, true)?;
                     let up = packed.up.moe_mmq_project_cuda(&x_f32, &group, true)?;
-                    let act = gate.silu()?.mul(&up)?.contiguous()?;
+                    let act = gate.silu_mul_direct(&up)?.contiguous()?;
                     let down = packed.down.moe_mmq_project_cuda(&act, &group, false)?;
                     // dims2 = [m_total, n_out] — берём ИМЕННО ширину.
                     let (_, n_out) = down.dims2()?;
                     if std::env::var_os("MOE_MMQ_DEBUG").is_some() {
                         eprintln!(
-                            "[moe-mmq] layer={} m_total={} ncols_max={} \
+                            "[moe-mmq] layer={} mode={:?} m_total={} ncols_max={} \
 gate={:?} up={:?} down={:?} x={:?} n_out={}",
                             self.layer_idx,
+                            mode,
                             group.m_total(),
                             group.ncols_max,
                             packed.gate.shape().dims(),
@@ -677,7 +696,7 @@ gate={:?} up={:?} down={:?} x={:?} n_out={}",
                         .gate
                         .indexed_moe_forward_dual_cuda(&packed.up, &x3, &ids_t)?
                 };
-                let act = gate.silu()?.mul(&up)?.contiguous()?;
+                let act = gate.silu_mul_direct(&up)?.contiguous()?;
                 let down = packed.down.indexed_moe_forward_cuda(&act, &ids_t)?; // [tokens, topk, n_embd]
                 add_shared(weighted_sum(down, &w_t)?, xs)
             }
@@ -756,7 +775,7 @@ fn ptx_routed_swiglu(xs: &Tensor, experts: &PackedExperts, route: &RoutePlan) ->
     // gate/up: [n_tokens, topk, n_ff]; SwiGLU; down: [n_tokens, topk, n_embd].
     let gate = experts.gate.indexed_moe_forward_cuda(&x3, &ids_t)?;
     let up = experts.up.indexed_moe_forward_cuda(&x3, &ids_t)?;
-    let act = gate.silu()?.mul(&up)?.contiguous()?;
+    let act = gate.silu_mul_direct(&up)?.contiguous()?;
     let down = experts.down.indexed_moe_forward_cuda(&act, &ids_t)?;
 
     // Взвешивание route weights и редукция по topk → [n_tokens, n_embd].
@@ -857,7 +876,7 @@ fn reference_routed_swiglu(
 
         let gate_out = x_subset.matmul(&gate_w.t()?)?; // [n_sel, n_ff]
         let up_out = x_subset.matmul(&up_w.t()?)?; // [n_sel, n_ff]
-        let act = gate_out.silu()?.mul(&up_out)?; // [n_sel, n_ff]
+        let act = gate_out.silu_mul_direct(&up_out)?; // [n_sel, n_ff]
         let expert_out = act.matmul(&down_w.t()?)?; // [n_sel, n_embd]
 
         let w_len = weights.len();

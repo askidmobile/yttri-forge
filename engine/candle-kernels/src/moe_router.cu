@@ -404,3 +404,19 @@ extern "C" __global__ void moe_weighted_combine_kernel(
     }
     output[(size_t)token * n_out + col] = acc;
 }
+
+// ─── 7. Тождественная перестановка на устройстве ──────────────────────────────
+//
+// ids_dst для MMQ-MoE: строка j тайла пишется в sorted-слот j, раскладку по
+// токенам делает combine. Раньше перестановка готовилась через memcpy_htod —
+// на декоде это синхронизация внутри захвата CUDA-графа. Ядром обходимся без
+// host-обмена.
+
+extern "C" __global__ void moe_identity_kernel(
+    int32_t* __restrict__ dst,   // [n]
+    int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = i;
+    }
+}

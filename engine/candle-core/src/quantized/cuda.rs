@@ -154,6 +154,7 @@ pub const CUDA_DEQUANTIZE_BLOCK_SIZE: usize = 256;
 pub const CUDA_GET_ROWS_BLOCK_SIZE: usize = 256;
 pub const MATRIX_ROW_PADDING: usize = 512;
 
+
 fn ceil_div(p: usize, q: usize) -> usize {
     p.div_ceil(q)
 }
@@ -2462,6 +2463,7 @@ pub fn moe_grouping<'a>(
     n_tokens: usize,
     topk: usize,
     n_experts: usize,
+    need_d2h: bool,
 ) -> Result<MoeGrouping> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     let m_total = n_tokens * topk;
@@ -2476,8 +2478,22 @@ pub fn moe_grouping<'a>(
     let sorted_token_ids = unsafe { dev.alloc::<i32>(m_total)? };
     let sorted_weights = unsafe { dev.alloc::<f32>(m_total)? };
     let token_rows = unsafe { dev.alloc::<i32>(m_total)? };
-    let mut identity = unsafe { dev.alloc::<i32>(m_total)? };
-    dev.memcpy_htod(&(0..m_total as i32).collect::<Vec<i32>>(), &mut identity)?;
+    let identity = unsafe { dev.alloc::<i32>(m_total)? };
+    {
+        // Тождественную перестановку считает ядро, а не memcpy_htod: на декоде
+        // группировка идёт внутри захвата CUDA-графа, где host-обмен недопустим.
+        let idfn = dev.get_or_load_func("moe_identity_kernel", &candle_kernels::MOE_ROUTER)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(m_total, 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = m_total as i32;
+        let mut b = idfn.builder();
+        b.arg(&identity);
+        b.arg(&n_i);
+        unsafe { b.launch(cfg) }.w()?;
+    }
     let mut weights_owned = unsafe { dev.alloc::<f32>(m_total)? };
     {
         let mut dst = weights_owned.slice_mut(..);
@@ -2530,13 +2546,21 @@ pub fn moe_grouping<'a>(
         unsafe { b.launch(cfg) }.w()?;
     }
 
-    let mut host_offsets = vec![0i32; n_experts + 1];
-    dev.memcpy_dtoh(&offsets, &mut host_offsets)?;
-    let ncols_max = host_offsets
-        .windows(2)
-        .map(|w| (w[1] - w[0]).max(0) as usize)
-        .max()
-        .unwrap_or(0);
+    // ncols_max определяет число x-тайлов: ntx = ceil(ncols_max/mmq_x). Когда
+    // m_total ≤ mmq_x, ntx = 1 при ЛЮБОМ ncols_max ≤ m_total, поэтому вместо
+    // D2H подставляем m_total — конфигурация запуска та же, а синхронизации
+    // нет (на декоде это позволяет остаться внутри CUDA-графа).
+    let ncols_max = if need_d2h {
+        let mut host_offsets = vec![0i32; n_experts + 1];
+        dev.memcpy_dtoh(&offsets, &mut host_offsets)?;
+        host_offsets
+            .windows(2)
+            .map(|w| (w[1] - w[0]).max(0) as usize)
+            .max()
+            .unwrap_or(0)
+    } else {
+        m_total
+    };
 
     Ok(MoeGrouping {
         offsets,
@@ -2774,6 +2798,10 @@ pub fn moe_mmq_x() -> usize {
 /// Замеры на RTX 4090, Ornith-1.5-35B-A3B (256 экспертов, topk=8, Q8_0):
 ///   чанк 512  (≈16 токенов/эксперт): x64 5018 t/s, x128 4866 t/s
 ///   чанк 4096 (≈128 токенов/эксперт): x32 6275, x64 7068, x128 7503 t/s
+pub fn moe_mmq_x_for(ncols_max: usize) -> usize {
+    pick_mmq_x(ncols_max, moe_mmq_x())
+}
+
 fn pick_mmq_x(ncols_max: usize, forced: usize) -> usize {
     if forced != 0 {
         return forced;
