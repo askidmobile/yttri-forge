@@ -2741,10 +2741,14 @@ impl QCudaStorage {
     }
 }
 
-/// MMQ-MoE включён: env `MOE_MMQ=0` отключает (для отката и замеров).
+/// MMQ-MoE включён по умолчанию; `MOE_MMQ=0` отключает (откат и замеры).
+///
+/// Включается только на префиле (`ForwardMode::Prefill`) при n_tokens ≥ 32 и
+/// упакованных экспертах — декод и CUDA-графы не затрагиваются. Проверено на
+/// Ornith-1.5-35B-A3B Q8_0: 1074 → 7507 t/s префила при связном выводе.
 pub fn moe_mmq_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MOE_MMQ").map(|v| v != "0").unwrap_or(false))
+    *ON.get_or_init(|| std::env::var("MOE_MMQ").map(|v| v != "0").unwrap_or(true))
 }
 
 /// x-тайл MMQ для MoE. `MOE_MMQ_X` задаёт принудительно; 0 или отсутствие
