@@ -2566,6 +2566,7 @@ pub fn moe_mmq_project(
     g: &MoeGrouping,
     mmq_x: usize,
 ) -> Result<crate::Tensor> {
+    let mmq_x = pick_mmq_x(g.ncols_max, mmq_x);
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     const MMQ_Y: usize = 128;
     const MMQ_NWARPS: usize = 8;
@@ -2746,15 +2747,45 @@ pub fn moe_mmq_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("MOE_MMQ").map(|v| v != "0").unwrap_or(false))
 }
 
-/// x-тайл MMQ для MoE. На 256 экспертов и topk=8 у эксперта ~32 токена,
-/// поэтому широкий x128 тайл wastes 3/4 работы: по умолчанию 32.
+/// x-тайл MMQ для MoE. `MOE_MMQ_X` задаёт принудительно; 0 или отсутствие
+/// переменной — авто-выбор по реальной ширине эксперта (см. pick_mmq_x).
 pub fn moe_mmq_x() -> usize {
     static X: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *X.get_or_init(|| {
         std::env::var("MOE_MMQ_X")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|x| [32usize, 64, 128].contains(x))
-            .unwrap_or(32)
+            .filter(|x| [0usize, 32, 64, 128].contains(x))
+            .unwrap_or(0)
     })
+}
+
+/// Выбор ширины x-тайла под число токенов у самого «толстого» эксперта.
+///
+/// Ядро считает тайл целиком, поэтому реально занято `ntx*mmq_x` колонок при
+/// `ncols_max` полезных. Выбираем x с минимальным разворотом
+/// `ceil(ncols_max/x)*x`; при равенстве берём более широкий тайл — у него
+/// больше переиспользование весов на колонку.
+///
+/// Замеры на RTX 4090, Ornith-1.5-35B-A3B (256 экспертов, topk=8, Q8_0):
+///   чанк 512  (≈16 токенов/эксперт): x64 5018 t/s, x128 4866 t/s
+///   чанк 4096 (≈128 токенов/эксперт): x32 6275, x64 7068, x128 7503 t/s
+fn pick_mmq_x(ncols_max: usize, forced: usize) -> usize {
+    if forced != 0 {
+        return forced;
+    }
+    // Пороги — по замерам на реальном Ornith: роутер у этой модели сильно
+    // неравномерный, при чанке 4096 ncols_max держится в 1000..3400.
+    //
+    //   чанк 4096 (ncols_max ≈ 2000): x32 6275, x64 7068, x128 7503 t/s
+    //   чанк 512  (ncols_max ≈ 250):  x64 5018, x128 4866 t/s
+    //   короткий промпт (ncols_max < 128): широкий тайл — чистый разворот
+    //
+    // То есть широкий тайл выигрывает, когда экспертов достаточно, чтобы
+    // тайл был заполнен; на малых ncols_max он только множит x-тайлы.
+    match ncols_max {
+        0..=127 => 32,
+        128..=511 => 64,
+        _ => 128,
+    }
 }
