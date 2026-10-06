@@ -2,6 +2,7 @@
 // ВНИМАНИЕ: cudaforge кэширует nvcc-компиляцию по mtime/содержимому самого
 // .cu — изменения в инклюдах (mmq_common.cuh/mmq_gguf.cuh) кэш НЕ сбрасывают,
 // даже при сработавшем rerun-if-changed. Меняешь .cuh — бампни этот файл.
+// cache-bust: 2026-10-06 MoE-обёртки MMQ (ids_dst/expert_bounds, gather-квант)
 // cache-bust: 2026-09-17 stream-k обёртки (mmq_gguf.cuh: fixup вынесен
 // в __device__ impl — правка .cuh без бампа этого файла не пересоберётся)
 // extern "C" __global__ обёртки над llama.cpp mul_mat_q (Tensor-Core MMA) для
@@ -240,3 +241,57 @@ DEFINE_MMQ_SK_PAIR(GGML_TYPE_Q5_K, q5_k)
 DEFINE_MMQ_SK_PAIR(GGML_TYPE_Q6_K, q6_k)
 DEFINE_MMQ_SK_PAIR(GGML_TYPE_Q4_0, q4_0)
 DEFINE_MMQ_SK_PAIR(GGML_TYPE_Q8_0, q8_0)
+
+// ---------------------------------------------------------------------------
+// GATHER-квантизация q8_1 (MMQ layout): строка i1 выходной матрицы берётся из
+// строки ids[i1] входной. Нужна для MoE: активации раскладываются в порядке
+// сортировки по экспертам, и y-матрица MMQ обязана быть в том же порядке,
+// что и expert_bounds. ids=null → обычная dense-квантизация.
+// grid=(ne1, ceil(ne0/512), 1), block=(128).
+// ---------------------------------------------------------------------------
+#define DEFINE_QUANT_GATHER(layout_const, name) \
+    extern "C" __global__ void candle_mmq_quant_gather_##name( \
+        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy, \
+        const int64_t ne00, const int64_t s01, const int64_t ne0, const int ne1) { \
+        quantize_mmq_q8_1_impl<layout_const>(x, ids, vy, ne00, s01, 0, 0, ne0, ne1, 1); \
+    }
+
+DEFINE_QUANT_GATHER(MMQ_Q8_1_DS_LAYOUT_D4,   d4)
+DEFINE_QUANT_GATHER(MMQ_Q8_1_DS_LAYOUT_DS4,  ds4)
+DEFINE_QUANT_GATHER(MMQ_Q8_1_DS_LAYOUT_D2S6, d2s6)
+
+// ---------------------------------------------------------------------------
+// MoE-обёртки mul_mat_q (llama.cpp MoE-layout): ids_dst + expert_bounds.
+//   x    — веса ВСЕХ экспертов подряд, [n_experts, nrows_x, ncols_x];
+//          эксперт zt начинается с блока zt*stride_channel_x;
+//   y    — активации в sorted-порядке [m_total, ncols_x] в q8_1_mmq;
+//   dst  — [m_total, nrows_x], строка jt*mmq_x+j пишется в ids_dst[col_low+…];
+// grid=(n_experts*ntx*nty, 1, 1) — эксперты перебираются внутри по zt, тайлы
+// за пределами expert_bounds выходят сразу.
+// need_check=true: колонок у эксперта не кратно mmq_x.
+// ---------------------------------------------------------------------------
+#define DEFINE_MMQ_MOE(ggml_type_const, tag, MMQX) \
+    extern "C" __global__ void __launch_bounds__(256) \
+    candle_mmq_moe_##tag##_x##MMQX( \
+        const unsigned long long x_addr, const int * __restrict__ y, \
+        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, \
+        float * __restrict__ dst, \
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x, \
+        const int ncols_y, const int stride_col_dst, \
+        const int n_experts, const int stride_channel_x, const int ncols_max) { \
+        mul_mat_q_impl<ggml_type_const, MMQX, true>( \
+            (const char *) x_addr, y, ids_dst, expert_bounds, dst, nullptr, \
+            ncols_x, nrows_x, ncols_dst, stride_row_x, ncols_y, stride_col_dst, \
+            /*channel_ratio=*/1, /*nchannels_y=*/n_experts, \
+            /*stride_channel_x=*/stride_channel_x, /*stride_channel_y=*/0, /*stride_channel_dst=*/0, \
+            /*sample_ratio=*/1, /*nsamples_y=*/1, \
+            /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0, \
+            ncols_max); \
+    }
+
+DEFINE_MMQ_MOE(GGML_TYPE_Q8_0, q8_0, 32)
+DEFINE_MMQ_MOE(GGML_TYPE_Q8_0, q8_0, 64)
+DEFINE_MMQ_MOE(GGML_TYPE_Q8_0, q8_0, 128)
+DEFINE_MMQ_MOE(GGML_TYPE_Q4_0, q4_0, 32)
+DEFINE_MMQ_MOE(GGML_TYPE_Q4_0, q4_0, 64)
+DEFINE_MMQ_MOE(GGML_TYPE_Q4_0, q4_0, 128)

@@ -946,8 +946,12 @@ fn indexed_moe_forward_dispatch(
     let outsize = batch * topk * n;
     let out = unsafe { dev.alloc::<f32>(outsize)? };
 
+    // Grouped-ядро батчит токены по экспертам: вес эксперта читается из DRAM
+    // один раз на все его токены вместо раза на пару (token,route). Для Q8_0
+    // (Ornith-1.5-35B-A3B: 256 экспертов × [512,2048] Q8_0, topk=8) это
+    // ровно тот случай, где трафик, а не арифметика, упирает префил.
     let use_grouped = batch > 1
-        && std::env::var_os("ENABLE_MOE_GROUPED").is_some()  // OFF by default — measured slower (2026-08-24)
+        && std::env::var("MOE_GROUPED").map(|v| v != "0").unwrap_or(false)
         && matches!(
             w_dtype,
             GgmlDType::IQ2XXS
@@ -956,6 +960,7 @@ fn indexed_moe_forward_dispatch(
                 | GgmlDType::IQ3XXS
                 | GgmlDType::IQ3S
                 | GgmlDType::IQ4XS
+                | GgmlDType::Q8_0
         );
     let kernel_name = if use_grouped {
         match w_dtype {
@@ -965,6 +970,7 @@ fn indexed_moe_forward_dispatch(
             GgmlDType::IQ3XXS => "indexed_moe_forward_iq3_xxs_q8_1_grouped",
             GgmlDType::IQ3S => "indexed_moe_forward_iq3_s_q8_1_grouped",
             GgmlDType::IQ4XS => "indexed_moe_forward_iq4_xs_q8_1_grouped",
+            GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1_grouped",
             _ => unreachable!(),
         }
     } else {
@@ -2406,4 +2412,349 @@ mod test {
         let _vs = dev.clone_dtoh(&vs.as_view())?;
         Ok(())
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// MoE на тензорных ядрах: группировка пар (token, route) по экспертам + MMQ
+// в llama.cpp-layout (ids_dst + expert_bounds).
+//
+// Зачем: у MoE матрица эксперта перечитывается для каждой пары (token,route).
+// На Ornith-1.5-35B-A3B (256 экспертов × [512, 2048] Q8_0, topk=8) на чанк
+// префила это ~1.1 ТБ чтений — упирается в DRAM, а не в арифметику. MMVQ
+// с grid=(n, batch, topk) так и читает вес 32 раза на эксперта; группировка
+// даёт один проход и переводит префил в compute-bound.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Раскладка пар (token, route) по экспертам для MMQ-пути.
+pub struct MoeGrouping {
+    /// exclusive scan границ экспертов, `[n_experts + 1]`.
+    pub offsets: CudaSlice<i32>,
+    /// токен для каждой отсортированной пары, `[m_total]` — строки активаций
+    /// после gather-квантизации.
+    pub sorted_token_ids: CudaSlice<i32>,
+    /// обратная раскладка: позиция пары (token, k) в отсортированном массиве.
+    pub token_rows: CudaSlice<i32>,
+    /// веса маршрутов `[n_tokens, topk]`, нужны combine без атомиков.
+    pub weights: CudaSlice<f32>,
+    /// тождественная перестановка `[m_total]` — ids_dst для MMQ: выход пишется
+    /// в sorted-порядке, раскладку делает combine.
+    pub identity: CudaSlice<i32>,
+    /// максимум токенов у одного эксперта — им задаётся ширина x-тайла.
+    pub ncols_max: usize,
+    pub n_tokens: usize,
+    pub topk: usize,
+    pub n_experts: usize,
+}
+
+impl MoeGrouping {
+    pub fn m_total(&self) -> usize {
+        self.n_tokens * self.topk
+    }
+}
+
+/// Сортировка пар по эксперту: count+scan → sort → обратная раскладка.
+/// Один D2H на слой (offsets, ~1 КБ): без него MMQ не знает, сколько колонок
+/// у самого «толстого» эксперта, а от этого зависит число x-тайлов.
+pub fn moe_grouping<'a>(
+    dev: &CudaDevice,
+    ids: &CudaView<'a, u32>,
+    weights: &CudaView<'a, f32>,
+    n_tokens: usize,
+    topk: usize,
+    n_experts: usize,
+) -> Result<MoeGrouping> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let m_total = n_tokens * topk;
+    if m_total == 0 || n_experts == 0 || topk == 0 {
+        crate::bail!("moe_grouping: empty dimensions");
+    }
+    if n_experts > 1024 {
+        crate::bail!("moe_grouping: n_experts {n_experts} > 1024 (scan в одном блоке)");
+    }
+    let offsets = unsafe { dev.alloc::<i32>(n_experts + 1)? };
+    let counts = unsafe { dev.alloc::<i32>(n_experts)? };
+    let sorted_token_ids = unsafe { dev.alloc::<i32>(m_total)? };
+    let sorted_weights = unsafe { dev.alloc::<f32>(m_total)? };
+    let token_rows = unsafe { dev.alloc::<i32>(m_total)? };
+    let mut identity = unsafe { dev.alloc::<i32>(m_total)? };
+    dev.memcpy_htod(&(0..m_total as i32).collect::<Vec<i32>>(), &mut identity)?;
+    let mut weights_owned = unsafe { dev.alloc::<f32>(m_total)? };
+    {
+        let mut dst = weights_owned.slice_mut(..);
+        dev.cuda_stream()
+            .memcpy_dtod(weights, &mut dst)
+            .map_err(crate::Error::wrap)?;
+    }
+
+    // ids приходят как u32 (как их отдаёт gpu_softmax_topk); ядра читают их
+    // как unsigned int — значения неотрицательные.
+    let nt = n_tokens as i32;
+    let tk = topk as i32;
+    let ne = n_experts as i32;
+    let scan_block = n_experts.next_power_of_two().max(32) as u32;
+
+    let scan_fn = dev.get_or_load_func("moe_count_and_scan_kernel", &candle_kernels::MOE_ROUTER)?;
+    {
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (scan_block, 1, 1),
+            shared_mem_bytes: scan_block * 4,
+        };
+        let mut b = scan_fn.builder();
+        b.arg(ids);
+        b.arg(&counts);
+        b.arg(&offsets);
+        b.arg(&nt);
+        b.arg(&tk);
+        b.arg(&ne);
+        unsafe { b.launch(cfg) }.w()?;
+    }
+
+    let sort_fn = dev.get_or_load_func("moe_group_sort_kernel", &candle_kernels::MOE_ROUTER)?;
+    {
+        let cfg = LaunchConfig {
+            grid_dim: (n_experts as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = sort_fn.builder();
+        b.arg(ids);
+        b.arg(&weights_owned);
+        b.arg(&offsets);
+        b.arg(&sorted_token_ids);
+        b.arg(&sorted_weights);
+        b.arg(&token_rows);
+        b.arg(&nt);
+        b.arg(&tk);
+        b.arg(&ne);
+        unsafe { b.launch(cfg) }.w()?;
+    }
+
+    let mut host_offsets = vec![0i32; n_experts + 1];
+    dev.memcpy_dtoh(&offsets, &mut host_offsets)?;
+    let ncols_max = host_offsets
+        .windows(2)
+        .map(|w| (w[1] - w[0]).max(0) as usize)
+        .max()
+        .unwrap_or(0);
+
+    Ok(MoeGrouping {
+        offsets,
+        sorted_token_ids,
+        token_rows,
+        weights: weights_owned,
+        identity,
+        ncols_max,
+        n_tokens,
+        topk,
+        n_experts,
+    })
+}
+
+/// MMQ-проекция одного экспертного набора. `act` — `[rows, k]` F32 CUDA
+/// contiguous; `row_map[i]` = строка `act`, попадающая в sorted-слот `i`
+/// (для down-проекции это тождественная карта, acts уже в sorted-порядке).
+/// Возвращает `[m_total, n]`.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_mmq_project(
+    dev: &CudaDevice,
+    qdata: &CudaSlice<u8>,
+    w_dtype: GgmlDType,
+    w_shape: (usize, usize, usize), // [n_experts, n, k]
+    act: &crate::Tensor,
+    row_map: &CudaSlice<i32>,
+    g: &MoeGrouping,
+    mmq_x: usize,
+) -> Result<crate::Tensor> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    const MMQ_Y: usize = 128;
+    const MMQ_NWARPS: usize = 8;
+    const BLOCK_Q8_1_MMQ: usize = 144;
+    const TILE_X_K_Q8_0: usize = 76; // mmq_get_mma_tile_x_k(GGML_TYPE_Q8_0)
+
+    let (_n_experts, n, k) = w_shape;
+    if n % MMQ_Y != 0 {
+        crate::bail!("moe_mmq_project: n={n} не кратен MMQ_Y={MMQ_Y}");
+    }
+    let (tag, tile_x_k, quant_kernel) = match w_dtype {
+        GgmlDType::Q8_0 => ("q8_0", TILE_X_K_Q8_0, "candle_mmq_quant_gather_d4"),
+        GgmlDType::Q4_0 => ("q4_0", 76, "candle_mmq_quant_gather_ds4"),
+        _ => crate::bail!("moe_mmq_project: dtype {w_dtype:?} не собран"),
+    };
+    let m_total = g.m_total();
+
+    // 1) Активации в q8_1_mmq, с gather по sorted-порядку.
+    let (act_st, act_l) = act.storage_and_layout();
+    let act_cuda = match &*act_st {
+        crate::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+        _ => crate::bail!("moe_mmq_project: act не на CUDA"),
+    };
+    let (act_start, act_end) = act_l
+        .contiguous_offsets()
+        .ok_or_else(|| crate::Error::Msg("moe_mmq_project: act не contiguous".into()))?;
+    let act_view = act_cuda.slice(act_start..act_end);
+
+    let k_padded = pad(k, MATRIX_ROW_PADDING);
+    let blocks_per_row = k_padded / 128;
+    let y_mmq = unsafe { dev.alloc::<u8>(m_total * blocks_per_row * BLOCK_Q8_1_MMQ)? };
+    {
+        let qfn = dev.get_or_load_func(quant_kernel, &candle_kernels::CANDLE_MMQ_DENSE)?;
+        let cfg = LaunchConfig {
+            grid_dim: (m_total as u32, ceil_div(k_padded, 512) as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = qfn.builder();
+        b.arg(&act_view);
+        b.arg(row_map);
+        b.arg(&y_mmq);
+        barg!(
+            b,
+            /* ne00 */ k as i64,
+            /* s01  */ k as i64,
+            /* ne0  */ k_padded as i64,
+            /* ne1  */ m_total as i32
+        );
+        unsafe { b.launch(cfg) }.w()?;
+    }
+    drop(act_st);
+
+    // 2) MMQ: эксперты перебираются внутри ядра по expert_bounds.
+    let pad_to = |a: usize, al: usize| ceil_div(a, al) * al;
+    let nbs = mmq_x * 4 + MMQ_Y * tile_x_k * 4 + pad_to(mmq_x * BLOCK_Q8_1_MMQ, MMQ_NWARPS * WARP_SIZE * 4);
+    let func = dev.get_or_load_func(
+        &format!("candle_mmq_moe_{tag}_x{mmq_x}"),
+        &candle_kernels::CANDLE_MMQ_DENSE,
+    )?;
+    if nbs > 48 * 1024 {
+        func.set_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            nbs as i32,
+        )
+        .map_err(|e| crate::Error::Msg(format!("moe_mmq_project: set_attribute: {e:?}")))?;
+    }
+    let nty = ceil_div(n, MMQ_Y);
+    let ntx = ceil_div(g.ncols_max.max(1), mmq_x);
+    let nblocks = g.n_experts * ntx * nty;
+    let dst = unsafe { dev.alloc::<f32>(m_total * n)? };
+    {
+        let cfg = LaunchConfig {
+            grid_dim: (nblocks as u32, 1, 1),
+            block_dim: (WARP_SIZE as u32, MMQ_NWARPS as u32, 1),
+            shared_mem_bytes: nbs as u32,
+        };
+        let mut b = func.builder();
+        b.arg(qdata);
+        b.arg(&y_mmq);
+        b.arg(&g.identity);
+        b.arg(&g.offsets);
+        b.arg(&dst);
+        barg!(
+            b,
+            /* ncols_x */ k as i32,
+            /* nrows_x */ n as i32,
+            /* ncols_dst */ m_total as i32,
+            /* stride_row_x */ (k / w_dtype.block_size()) as i32,
+            /* ncols_y */ m_total as i32,
+            /* stride_col_dst */ n as i32,
+            /* n_experts */ g.n_experts as i32,
+            /* stride_channel_x */ (n * k / w_dtype.block_size()) as i32,
+            /* ncols_max */ g.ncols_max.max(1) as i32
+        );
+        unsafe { b.launch(cfg) }.w()?;
+    }
+
+    let out_shape: crate::Shape = (m_total, n).into();
+    Ok(crate::Tensor::from((
+        crate::Storage::Cuda(CudaStorage::wrap_cuda_slice(dst, dev.clone())),
+        out_shape,
+    )))
+}
+
+/// Combine: `out[token] = Σ_r w[token,r] * sorted_out[token_rows[token,r]]`.
+/// Без атомиков — блок на токен, строки topk читаются последовательно.
+pub fn moe_weighted_combine(
+    dev: &CudaDevice,
+    g: &MoeGrouping,
+    sorted_out: &crate::Tensor,
+    n_out: usize,
+) -> Result<crate::Tensor> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let (st, l) = sorted_out.storage_and_layout();
+    let src = match &*st {
+        crate::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+        _ => crate::bail!("moe_weighted_combine: вход не на CUDA"),
+    };
+    let (s0, s1) = l
+        .contiguous_offsets()
+        .ok_or_else(|| crate::Error::Msg("moe_weighted_combine: вход не contiguous".into()))?;
+    let src = src.slice(s0..s1);
+    let out = unsafe { dev.alloc::<f32>(g.n_tokens * n_out)? };
+    {
+        let func =
+            dev.get_or_load_func("moe_weighted_combine_kernel", &candle_kernels::MOE_ROUTER)?;
+        let cfg = LaunchConfig {
+            grid_dim: (g.n_tokens as u32, ceil_div(n_out, 256) as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_out_i = n_out as i32;
+        let topk_i = g.topk as i32;
+        let mut b = func.builder();
+        b.arg(&src);
+        b.arg(&g.token_rows);
+        b.arg(&g.weights);
+        b.arg(&out);
+        b.arg(&n_out_i);
+        b.arg(&topk_i);
+        unsafe { b.launch(cfg) }.w()?;
+    }
+    drop(st);
+    let out_shape: crate::Shape = (g.n_tokens, n_out).into();
+    Ok(crate::Tensor::from((
+        crate::Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
+        out_shape,
+    )))
+}
+
+impl QCudaStorage {
+    /// MMQ-проекция по этому набору весов (обёртка над одноимённой функцией).
+    pub fn moe_mmq_project(
+        &self,
+        w_shape: &crate::Shape, // [n_experts, n, k]
+        act: &crate::Tensor,
+        row_map: &CudaSlice<i32>,
+        g: &MoeGrouping,
+    ) -> Result<crate::Tensor> {
+        let (n_experts, n, k) = w_shape.dims3()?;
+        moe_mmq_project(
+            &self.device,
+            &self.data.inner,
+            self.dtype,
+            (n_experts, n, k),
+            act,
+            row_map,
+            g,
+            moe_mmq_x(),
+        )
+    }
+}
+
+/// MMQ-MoE включён: env `MOE_MMQ=0` отключает (для отката и замеров).
+pub fn moe_mmq_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MOE_MMQ").map(|v| v != "0").unwrap_or(false))
+}
+
+/// x-тайл MMQ для MoE. На 256 экспертов и topk=8 у эксперта ~32 токена,
+/// поэтому широкий x128 тайл wastes 3/4 работы: по умолчанию 32.
+pub fn moe_mmq_x() -> usize {
+    static X: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *X.get_or_init(|| {
+        std::env::var("MOE_MMQ_X")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|x| [32usize, 64, 128].contains(x))
+            .unwrap_or(32)
+    })
 }

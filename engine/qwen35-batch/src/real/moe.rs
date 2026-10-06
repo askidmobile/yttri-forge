@@ -33,6 +33,24 @@ pub enum ForwardMode {
     DecodeBatch,
 }
 
+/// Порог, с которого MoE уходит на MMQ с группировкой. Ниже — группировка
+/// (count/scan/sort + D2H) съедает больше, чем экономит на тайлах: у блока
+/// один блок-сортировки плюс синхронизация на слой.
+fn moe_mmq_min_tokens() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("MOE_MMQ_MIN_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(32)
+    })
+}
+
+/// Порог числа экспертов, для которого MMQ-обёртки вообще собраны.
+fn moe_mmq_shape_ok(packed: &PackedExperts) -> bool {
+    packed.n_experts <= 1024
+}
+
 // ─── Backend selection ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -586,12 +604,79 @@ impl Qwen35MoeBlock {
                 }
                 add_shared(weighted_sum(down, &w_t)?, xs)
             }
-            (ExpertWeights::Packed(packed), _) => {
+            (ExpertWeights::Packed(packed), mode) => {
+                // ── MMQ на тензорных ядрах с группировкой по экспертам ──
+                // Только префил и только когда токенов достаточно: группировка
+                // делает D2H за слой, а на декоде это ломает захват CUDA-графа
+                // и при m=1 всё равно невыгодно (8 пар на 256 экспертов).
+                if mode == ForwardMode::Prefill
+                    && n_tokens >= moe_mmq_min_tokens()
+                    && candle_core::quantized::moe_mmq_enabled()
+                    && moe_mmq_shape_ok(packed)
+                {
+                    use candle_core::quantized::{moe_grouping, moe_weighted_combine};
+                    let (ids_st, ids_lay) = ids_t.storage_and_layout();
+                    let ids_v = match &*ids_st {
+                        candle_core::Storage::Cuda(c) => {
+                            c.as_cuda_slice::<u32>()?.slice(ids_lay.start_offset()..)
+                        }
+                        _ => candle_core::bail!("moe mmq: ids не на CUDA"),
+                    };
+                    let (w_st, w_lay) = w_t.storage_and_layout();
+                    let w_v = match &*w_st {
+                        candle_core::Storage::Cuda(c) => {
+                            c.as_cuda_slice::<f32>()?.slice(w_lay.start_offset()..)
+                        }
+                        _ => candle_core::bail!("moe mmq: веса маршрута не на CUDA"),
+                    };
+                    let group = moe_grouping(
+                        cuda_dev,
+                        &ids_v,
+                        &w_v,
+                        n_tokens,
+                        k,
+                        packed.n_experts,
+                    )?;
+                    let x_f32 = xs.to_dtype(DType::F32)?.contiguous()?;
+                    let gate = packed.gate.moe_mmq_project_cuda(&x_f32, &group, true)?;
+                    let up = packed.up.moe_mmq_project_cuda(&x_f32, &group, true)?;
+                    let act = gate.silu()?.mul(&up)?.contiguous()?;
+                    let down = packed.down.moe_mmq_project_cuda(&act, &group, false)?;
+                    // dims2 = [m_total, n_out] — берём ИМЕННО ширину.
+                    let (_, n_out) = down.dims2()?;
+                    if std::env::var_os("MOE_MMQ_DEBUG").is_some() {
+                        eprintln!(
+                            "[moe-mmq] layer={} m_total={} ncols_max={} \
+gate={:?} up={:?} down={:?} x={:?} n_out={}",
+                            self.layer_idx,
+                            group.m_total(),
+                            group.ncols_max,
+                            packed.gate.shape().dims(),
+                            packed.up.shape().dims(),
+                            packed.down.shape().dims(),
+                            x_f32.dims(),
+                            n_out,
+                        );
+                    }
+                    let routed = moe_weighted_combine(cuda_dev, &group, &down, n_out)?;
+                    return add_shared(routed, xs);
+                }
                 // Резидентный путь: те же ядра через ленивую таблицу упаковки.
-                let (gate, up) =
+                // MOE_GROUPED=1 — grouped-вариант ядер (вес эксперта читается
+                // один раз на все его токены). У dual-ядра grouped-инстанса
+                // нет, поэтому на нём gate и up идут двумя отдельными
+                // запусками: вход квантуется дважды, но это [tokens, n_embd]
+                // против [n_experts, n_ff, n_embd] чтений весов.
+                let grouped = std::env::var("MOE_GROUPED").map(|v| v != "0").unwrap_or(false);
+                let (gate, up) = if grouped {
+                    let g = packed.gate.indexed_moe_forward_cuda(&x3, &ids_t)?;
+                    let u = packed.up.indexed_moe_forward_cuda(&x3, &ids_t)?;
+                    (g, u)
+                } else {
                     packed
                         .gate
-                        .indexed_moe_forward_dual_cuda(&packed.up, &x3, &ids_t)?;
+                        .indexed_moe_forward_dual_cuda(&packed.up, &x3, &ids_t)?
+                };
                 let act = gate.silu()?.mul(&up)?.contiguous()?;
                 let down = packed.down.indexed_moe_forward_cuda(&act, &ids_t)?; // [tokens, topk, n_embd]
                 add_shared(weighted_sum(down, &w_t)?, xs)

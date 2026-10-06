@@ -211,14 +211,21 @@ extern "C" __global__ void moe_sort_by_expert_kernel(
     const int tid = threadIdx.x;
     const int block_dim = blockDim.x;
 
-    int write_pos = expert_offsets[expert];
+    // См. примечание в moe_group_sort_kernel: atomic по локальной переменной
+    // nvcc превращает в trap. Это ядро пока не вызывается движком, но
+    // оставлять заведомо неработающий код нельзя.
+    __shared__ int write_pos;
+    if (tid == 0) {
+        write_pos = expert_offsets[expert];
+    }
+    __syncthreads();
     const int end_pos = expert_offsets[expert + 1];
 
     // Each thread scans a strided subset of the token*topk pairs
     for (int i = tid; i < n_tokens * topk; i += block_dim) {
         int token_idx = i / topk;
         int k_idx = i % topk;
-        if (expert_ids[i] == expert) {
+        if ((int) expert_ids[i] == expert) {
             // Atomic reservation of write position
             int my_pos = atomicAdd(&write_pos, 1);
             if (my_pos < end_pos) {
@@ -240,7 +247,7 @@ extern "C" __global__ void moe_sort_by_expert_kernel(
 // Assumes n_experts ≤ 1024 (fits in one block).
 
 extern "C" __global__ void moe_count_and_scan_kernel(
-    const int32_t* __restrict__ expert_ids,  // [n_tokens * topk]
+    const unsigned int* __restrict__ expert_ids,  // [n_tokens * topk]
     int32_t* __restrict__ expert_counts,    // [n_experts] — output counts
     int32_t* __restrict__ expert_offsets,   // [n_experts + 1] — output exclusive scan
     int n_tokens,
@@ -326,4 +333,74 @@ extern "C" __global__ void moe_combine_kernel(
 
     // Weighted scatter-add into output
     atomicAdd(&output[token * n_out + col], weight * val);
+}
+
+// ─── 5. Группировка для MMQ-MoE ───────────────────────────────────────────────
+//
+// moe_count_and_scan_kernel (выше) даёт expert_offsets. Этот ядро сортирует
+// пары (token,k) по эксперту и заодно строит ОБРАТНУЮ раскладку
+// token_rows[token*topk + k] = позиция пары в отсортированном массиве —
+// она нужна, чтобы сложить выходы topk маршрутов без атомиков.
+//
+// Один блок на эксперта; позиция выдаётся atomicAdd от expert_offsets[expert].
+
+extern "C" __global__ void moe_group_sort_kernel(
+    const unsigned int* __restrict__ expert_ids,  // [n_tokens*topk]
+    const float*   __restrict__ weights,          // [n_tokens*topk]
+    const int32_t* __restrict__ expert_offsets,  // [n_experts+1]
+    int32_t* __restrict__ sorted_token_ids,       // [m_total] out
+    float*   __restrict__ sorted_weights,         // [m_total] out
+    int32_t* __restrict__ token_rows,             // [n_tokens*topk] out
+    int n_tokens,
+    int topk,
+    int n_experts) {
+    const int expert = blockIdx.x;
+    // Счётчик обязателен в SHARED, а не в локальной памяти: nvcc на
+    // atomicAdd по локальной переменной печатает «Cannot do atomic on local
+    // memory» и генерирует trap вместо тела (проверено nvcc 12.8, compute_89).
+    __shared__ int write_pos;
+    if (threadIdx.x == 0) {
+        write_pos = expert_offsets[expert];
+    }
+    __syncthreads();
+    const int end_pos = expert_offsets[expert + 1];
+
+    for (int i = threadIdx.x; i < n_tokens * topk; i += blockDim.x) {
+        if ((int) expert_ids[i] == expert) {
+            const int my_pos = atomicAdd(&write_pos, 1);
+            if (my_pos < end_pos) {
+                sorted_token_ids[my_pos] = i / topk;
+                sorted_weights[my_pos]   = weights[i];
+                token_rows[i]            = my_pos;
+            }
+        }
+    }
+}
+
+// ─── 6. Combine без атомиков ─────────────────────────────────────────────────
+//
+// out[token, col] = Σ_r  w[token, r] * expert_out[token_rows[token, r], col].
+// Каждый блок берёт один токен и колонку-полосу; строки topk читаются
+// последовательно, поэтому запись в out единственная — гонок нет.
+// grid = (n_tokens, ceil(n_out/256)), block = (256, 1, 1).
+
+extern "C" __global__ void moe_weighted_combine_kernel(
+    const float*   __restrict__ expert_outputs,  // [m_total, n_out]
+    const int32_t* __restrict__ token_rows,      // [n_tokens*topk]
+    const float*   __restrict__ weights,         // [n_tokens*topk]
+    float*         __restrict__ output,          // [n_tokens, n_out]
+    int n_out,
+    int topk) {
+    const int token = blockIdx.x;
+    const int col   = blockIdx.y * blockDim.x + threadIdx.x;
+    if (col >= n_out) {
+        return;
+    }
+    float acc = 0.0f;
+    const int32_t* rows = token_rows + token*topk;
+    const float*   wts  = weights   + token*topk;
+    for (int r = 0; r < topk; ++r) {
+        acc += wts[r] * expert_outputs[(size_t)rows[r] * n_out + col];
+    }
+    output[(size_t)token * n_out + col] = acc;
 }

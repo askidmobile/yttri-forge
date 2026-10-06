@@ -29,7 +29,10 @@ pub mod cuda;
 // FR-002: публичные входы MoE-ядер через таблицу указателей (фаза 1
 // 2026-09-04-moe-expert-offload). Упакованные пути — через методы QTensor.
 #[cfg(feature = "cuda")]
-pub use cuda::{indexed_moe_forward_dual_table, indexed_moe_forward_table};
+pub use cuda::{
+    indexed_moe_forward_dual_table, indexed_moe_forward_table, moe_grouping, moe_mmq_enabled,
+    moe_mmq_project, moe_mmq_x, moe_weighted_combine, MoeGrouping,
+};
 #[cfg(feature = "cuda")]
 pub mod fast_mmq;
 #[cfg(feature = "cuda")]
@@ -978,6 +981,29 @@ impl QTensor {
             Tensor::from((crate::Storage::Cuda(out1), shape.clone())),
             Tensor::from((crate::Storage::Cuda(out2), shape)),
         ))
+    }
+
+    /// MMQ-MoE проекция: act `[rows, k]` → `[m_total, n]` в sorted-порядке.
+    /// `gathered=true` — act в «натуральном» порядке токенов, строки берутся
+    /// через `sorted_token_ids` (gate/up). `gathered=false` — act уже в
+    /// sorted-порядке, строки 1:1 (down).
+    #[cfg(feature = "cuda")]
+    pub fn moe_mmq_project_cuda(
+        &self,
+        act: &Tensor,
+        g: &cuda::MoeGrouping,
+        gathered: bool,
+    ) -> Result<Tensor> {
+        let qs = match &self.storage {
+            QStorage::Cuda(c) => c,
+            _ => crate::bail!("moe_mmq_project_cuda: веса не на CUDA"),
+        };
+        let map = if gathered {
+            &g.sorted_token_ids
+        } else {
+            &g.identity
+        };
+        qs.moe_mmq_project(&self.shape, act, map, g)
     }
 
     /// Dequantize a row-slice `[row_start, row_end)` of a 2D view `[n, k]` into

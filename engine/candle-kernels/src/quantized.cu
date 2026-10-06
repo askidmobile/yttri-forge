@@ -7276,6 +7276,7 @@ IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_iq2_s_q8_1, QK_K, QI2_S, block_iq
 IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_iq3_xxs_q8_1, QK_K, QI3_XXS, block_iq3_xxs, VDR_IQ3_XXS_Q8_1_MMVQ, vec_dot_iq3_xxs_q8_1)
 IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_iq3_s_q8_1, QK_K, QI3_S, block_iq3_s, VDR_IQ3_S_Q8_1_MMVQ, vec_dot_iq3_s_q8_1)
 IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_iq4_xs_q8_1, QK_K, QI4_XS, block_iq4_xs, VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_iq4_xs_q8_1)
+IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_q8_0_q8_1, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1)
 
 // ═══════════════════════════════════════════════════════════════
 // Dual indexed MoE: ДВЕ проекции (gate+up) одним запуском на один вход.
