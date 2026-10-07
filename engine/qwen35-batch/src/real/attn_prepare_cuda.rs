@@ -20,11 +20,15 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use crate::real::paged_kv_cuda::tensor_cuda_ptr;
 
-/// Слитое ядро включено? (A/B через env, дефолт — выключено.)
+/// Слитое ядро включено по умолчанию; `YTTRI_ATTN_PREP_FUSED=0` выключает.
+///
+/// Замер Ornith-1.5-35B-A3B Q8_0, ctx 32768, декод: 134.3 и 137.1 t/s против
+/// 128.1 и 128.0 на эталонной цепочке — то есть +5.5% и разрыв с llama.cpp
+/// сокращается с 7.8% до 3.4%. Перекрёстный A/B (ON-OFF-OFF-ON) воспроизвёлся.
 pub fn enabled() -> bool {
     std::env::var("YTTRI_ATTN_PREP_FUSED")
-        .map(|v| v == "1" || v == "all")
-        .unwrap_or(false)
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 /// Переиспользуемые буферы слитого прохода.
