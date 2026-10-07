@@ -404,10 +404,30 @@ pub fn dispatch_delta_rule_batched(
         candle_core::bail!("delta decode: head_v_dim={hvd} > 128 не поддерживается ядром");
     }
     // DELTA_SPLITR=1 — динамический rowgrp (больше потоков на карту).
-    let rowgrp_dyn: u32 = std::env::var("DELTA_ROWGRP_DYN")
-        .ok()
-        .and_then(|x| x.trim().parse::<u32>().ok())
-        .unwrap_or(0);
+    // Env-ручки раскладки читаются в горячем пути (раз на DeltaNet-слой на
+    // токен, 30 слоёв). Значения неизменны в процессе — кэшируем через
+    // OnceLock, иначе это десятки getenv на токен.
+    fn env_u32_cached(key: &'static str, default: u32) -> u32 {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<HashMap<&'static str, u32>>> = OnceLock::new();
+        let m = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut g = m.lock().unwrap();
+        *g.entry(key).or_insert_with(|| {
+            std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+        })
+    }
+    fn env_str_cached(key: &'static str) -> Option<&'static str> {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<HashMap<&'static str, Option<&'static str>>>> = OnceLock::new();
+        let m = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut g = m.lock().unwrap();
+        *g.entry(key).or_insert_with(|| {
+            std::env::var(key).ok().map(|v| Box::leak(v.into_boxed_str()) as &'static str)
+        })
+    }
+    let rowgrp_dyn: u32 = env_u32_cached("DELTA_ROWGRP_DYN", 0);
     let splitr_cfg = rowgrp_dyn > 0;
     {
         // Split-вариант (умолчание): столбец состояния делится между четырьмя
@@ -417,11 +437,10 @@ pub fn dispatch_delta_rule_batched(
         // ROWGRP/COLS — env-ручки раскладки. Число блоков = n_v * (hvd/COLS);
         // при COLS=32 и n_v=32 это 128 блоков на 28 SM, тогда как llama.cpp
         // держит 1024 (warp-на-столбец). Меньше COLS → больше блоков.
-        let env_u32 = |k: &str, d: u32| -> u32 {
-            std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d)
-        };
+        // Ключи — статические литералы, поэтому кэш не течёт.
+        let env_u32 = |k: &'static str, d: u32| -> u32 { env_u32_cached(k, d) };
         let ROWGRP: u32 = env_u32("DELTA_ROWGRP", 4);
-        let single = std::env::var("DELTA_DECODE").as_deref() == Ok("single");
+        let single = env_str_cached("DELTA_DECODE") == Some("single");
         let split_ok = !single && ROWGRP > 0 && hvd % ROWGRP == 0 && (hvd / ROWGRP) <= 32;
         // Столбцы состояния независимы: режем их между блоками (grid.z).
         const DELTA_R_MAX_ROWS: u32 = 32;
@@ -455,7 +474,7 @@ pub fn dispatch_delta_rule_batched(
         const DRW: u32 = 4;
         let warpcol = ROWGRP > 0
             && hvd % DRW == 0
-            && std::env::var("DELTA_DECODE").as_deref() == Ok("warpcol");
+            && env_str_cached("DELTA_DECODE") == Some("warpcol");
         if splitr_cfg {
             if rowgrp_dyn == 0 || hvd % rowgrp_dyn != 0 {
                 candle_core::bail!(
@@ -475,13 +494,13 @@ pub fn dispatch_delta_rule_batched(
         // layout не меняется. Замер на изолированном стенде — 1.64x на
         // рекуррентной части (0.0151 против 0.0248 мс на слой). Включается по
         // умолчанию при hvd==128; DELTA_DECODE=off возвращает прежний путь.
-        let decode_mode = std::env::var("DELTA_DECODE").ok();
+        let decode_mode = env_str_cached("DELTA_DECODE");
         let tile_ok = hvd == 128
-            && decode_mode.as_deref() != Some("off")
-            && decode_mode.as_deref() != Some("single")
-            && decode_mode.as_deref() != Some("warpcol")
-            && decode_mode.as_deref() != Some("cols")
-            && decode_mode.as_deref() != Some("split");
+            && decode_mode != Some("off")
+            && decode_mode != Some("single")
+            && decode_mode != Some("warpcol")
+            && decode_mode != Some("cols")
+            && decode_mode != Some("split");
         let (name, cfg) = if tile_ok {
             (
                 "delta_rule_kernel_batched_tile",

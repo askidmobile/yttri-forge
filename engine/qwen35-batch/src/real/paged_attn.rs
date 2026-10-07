@@ -156,9 +156,12 @@ impl PagedAttn<'_> {
         // QK_INT8_PREFILL=0 оставлен для A/B и отладки.
         let qk_int8_on = self.kv_scales.is_some()
             && if self.max_seqlen_q <= 8 {
-                std::env::var("QK_INT8").as_deref() == Ok("1")
+                // Горячий путь: раз на attention-слой на токен. Кэш обязателен.
+                static QK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *QK.get_or_init(|| std::env::var("QK_INT8").as_deref() == Ok("1"))
             } else {
-                std::env::var("QK_INT8_PREFILL").as_deref() != Ok("0")
+                static QKP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *QKP.get_or_init(|| std::env::var("QK_INT8_PREFILL").as_deref() != Ok("0"))
             };
         let (q8, qs) = if qk_int8_on {
             let (q8, qs) = quantize_q_int8_fast(self.q)?;

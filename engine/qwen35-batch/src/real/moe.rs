@@ -704,7 +704,12 @@ gate={:?} up={:?} down={:?} x={:?} n_out={}",
                 // нет, поэтому на нём gate и up идут двумя отдельными
                 // запусками: вход квантуется дважды, но это [tokens, n_embd]
                 // против [n_experts, n_ff, n_embd] чтений весов.
-                let grouped = std::env::var("MOE_GROUPED").map(|v| v != "0").unwrap_or(false);
+                // MOE_GROUPED читается на каждом MoE-слое на токен (41 раз). Значение
+                // неизменно в процессе — кэшируем.
+                let grouped = {
+                    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    *G.get_or_init(|| std::env::var("MOE_GROUPED").map(|v| v != "0").unwrap_or(false))
+                };
                 let (gate, up) = if grouped {
                     let g = packed.gate.indexed_moe_forward_cuda(&x3, &ids_t)?;
                     let u = packed.up.indexed_moe_forward_cuda(&x3, &ids_t)?;

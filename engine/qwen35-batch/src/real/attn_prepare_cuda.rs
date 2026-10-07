@@ -26,9 +26,14 @@ use crate::real::paged_kv_cuda::tensor_cuda_ptr;
 /// 128.1 и 128.0 на эталонной цепочке — то есть +5.5% и разрыв с llama.cpp
 /// сокращается с 7.8% до 3.4%. Перекрёстный A/B (ON-OFF-OFF-ON) воспроизвёлся.
 pub fn enabled() -> bool {
-    std::env::var("YTTRI_ATTN_PREP_FUSED")
-        .map(|v| v != "0")
-        .unwrap_or(true)
+    // Кэш обязателен: вызов идёт из `forward_decode_batch_paged`, то есть
+    // по разу на каждый attention-слой на токен (10 на Ornith-35B).
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("YTTRI_ATTN_PREP_FUSED")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 /// Переиспользуемые буферы слитого прохода.

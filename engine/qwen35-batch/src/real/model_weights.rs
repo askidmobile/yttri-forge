@@ -3423,6 +3423,22 @@ fn audit_ytf16(name: &str, gguf: &QMatMul, sidecar: &QMatMul) {
     }
 }
 
+/// GRAPH_SKIP_* — диагностические выключатели частей слоя на графовом декоде.
+/// Читаются в `forward_decode_batch_paged`, то есть 41 раз на токен; без
+/// кэша это 41 syscall-подобных `getenv` в горячем пути. Результат неизменен
+/// в пределах процесса, поэтому кэшируем.
+#[cfg(feature = "cuda")]
+fn graph_skip(which: u8) -> bool {
+    static DELTA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ATTN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static FFN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match which {
+        0 => *DELTA.get_or_init(|| std::env::var("GRAPH_SKIP_DELTA").as_deref() == Ok("1")),
+        1 => *ATTN.get_or_init(|| std::env::var("GRAPH_SKIP_ATTN").as_deref() == Ok("1")),
+        _ => *FFN.get_or_init(|| std::env::var("GRAPH_SKIP_FFN").as_deref() == Ok("1")),
+    }
+}
+
 /// KV декода: круговой прогон через q8 (квантование и сразу обратно) стоит
 /// точности и ничего не экономит — кэш всё равно хранится в f16. Он остался
 /// ради численного паритета между батчевым кэшем и paged-пулом.
@@ -5779,14 +5795,14 @@ impl HybridBlock {
 
         let layer_out = match &mut self.layer {
             HybridLayerType::DeltaNet(delta) => {
-                if std::env::var("GRAPH_SKIP_DELTA").as_deref() == Ok("1") {
+                if graph_skip(0) {
                     normed.clone()
                 } else {
                     delta.forward_decode_batch_rows(&normed, slots, false, Some(&ctx.slots_dev))?
                 }
             }
             HybridLayerType::Attention(attn) => {
-                if std::env::var("GRAPH_SKIP_ATTN").as_deref() == Ok("1") {
+                if graph_skip(1) {
                     normed.clone()
                 } else {
                     if crate::scheduler::trace_on() {
@@ -5813,7 +5829,7 @@ impl HybridBlock {
             eprintln!("[fdbp] 5. ffn");
             let _ = std::io::stderr().flush();
         }
-        let ffn_out = if std::env::var("GRAPH_SKIP_FFN").as_deref() == Ok("1") {
+        let ffn_out = if graph_skip(2) {
             normed
         } else {
             self.ff.forward_decode_batch(&normed)?
