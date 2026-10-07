@@ -403,42 +403,114 @@ pub fn dispatch_delta_rule_batched(
     if hvd > 128 {
         candle_core::bail!("delta decode: head_v_dim={hvd} > 128 не поддерживается ядром");
     }
+    // DELTA_SPLITR=1 — динамический rowgrp (больше потоков на карту).
+    let rowgrp_dyn: u32 = std::env::var("DELTA_ROWGRP_DYN")
+        .ok()
+        .and_then(|x| x.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let splitr_cfg = rowgrp_dyn > 0;
     {
         // Split-вариант (умолчание): столбец состояния делится между четырьмя
         // потоками — 512 потоков на блок вместо 128. Прежняя сетка давала
         // 32 блока × 128 = 4096 потоков на карту, чего мало для насыщения
         // памяти. DELTA_DECODE=single возвращает однопоточный столбец.
-        // Ручки раскладки: ядро читает фактические blockDim.x/y, поэтому
-        // значения обязаны с ними совпадать. Раньше здесь стояли константы,
-        // и не-дефолтное значение молча давало неполное покрытие состояния
-        // при внешне высокой скорости — см.
-        // docs/research/2026-10-07-router-warp-and-false-cols-gain.md.
-        let ROWGRP: u32 = std::env::var("DELTA_ROWGRP")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(4);
+        // ROWGRP/COLS — env-ручки раскладки. Число блоков = n_v * (hvd/COLS);
+        // при COLS=32 и n_v=32 это 128 блоков на 28 SM, тогда как llama.cpp
+        // держит 1024 (warp-на-столбец). Меньше COLS → больше блоков.
+        let env_u32 = |k: &str, d: u32| -> u32 {
+            std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d)
+        };
+        let ROWGRP: u32 = env_u32("DELTA_ROWGRP", 4);
         let single = std::env::var("DELTA_DECODE").as_deref() == Ok("single");
         let split_ok = !single && ROWGRP > 0 && hvd % ROWGRP == 0 && (hvd / ROWGRP) <= 32;
-        // Столбцы состояния независимы: режем их между блоками (grid.z),
-        // иначе при B=1 сетка = 8 блоков на 28 SM. DELTA_DECODE=cols.
-        let COLS: u32 = std::env::var("DELTA_COLS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(32);
-        // Fail-closed для фактически выбранной раскладки.
-        if ROWGRP == 0 || hvd % ROWGRP != 0 || (hvd / ROWGRP) > 32 {
+        // Столбцы состояния независимы: режем их между блоками (grid.z).
+        const DELTA_R_MAX_ROWS: u32 = 32;
+        // COLS=32 — прежнее, проверенное поведение. Меньшие значения давали
+        // ложный прирост: ядро splitc читало DR_COLS=32 из константы, а
+        // blockDim.x был меньше, и половина столбцов состояния не считалась
+        // (мусорный вывод). После починки ядра (blockDim.x вместо константы)
+        // значение перемерено заново.
+        let COLS: u32 = env_u32("DELTA_COLS", 32).clamp(1, 1024);
+        // Fail-closed: неполное покрытие столбцов/строк = молча неверный
+        // результат при внешне высокой скорости. Лучше явная ошибка.
+        if hvd % COLS != 0 {
             candle_core::bail!(
-                "DELTA_ROWGRP={ROWGRP} несовместим с head_v_dim={hvd}: строки состояния были бы покрыты не полностью"
+                "DELTA_COLS={COLS} не делит head_v_dim={hvd}: состояние покрыто не полностью"
             );
         }
-        let cols = std::env::var("DELTA_DECODE").as_deref() == Ok("cols")
-            && COLS > 0 && hvd % COLS == 0 && COLS * ROWGRP <= 1024;
-        if std::env::var("DELTA_DECODE").as_deref() == Ok("cols") && !cols {
+        if hvd % ROWGRP != 0 {
             candle_core::bail!(
-                "DELTA_COLS={COLS} или DELTA_ROWGRP={ROWGRP} несовместимы с head_v_dim={hvd}: состояние было бы покрыто не полностью"
+                "DELTA_ROWGRP={ROWGRP} не делит head_v_dim={hvd}: состояние покрыто не полностью"
             );
         }
-        let (name, cfg) = if cols {
+        let cols = ROWGRP > 0
+            && COLS > 0
+            && hvd % COLS == 0
+            && COLS * ROWGRP <= 1024
+            && (hvd / ROWGRP) <= DELTA_R_MAX_ROWS;
+        // DELTA_DECODE=warpcol — раскладка llama.cpp (warp на столбец, 1024 блока).
+        // ВКЛЮЧАЕТСЯ ЯВНО: у нас состояние row-major, поэтому lane-по-строке
+        // читает с шагом hd*4 байт — некогерентно, и выигрыша нет (129.9
+        // против 130.0). Раскладка оставлена для сверки, не по умолчанию.
+        const DRW: u32 = 4;
+        let warpcol = ROWGRP > 0
+            && hvd % DRW == 0
+            && std::env::var("DELTA_DECODE").as_deref() == Ok("warpcol");
+        if splitr_cfg {
+            if rowgrp_dyn == 0 || hvd % rowgrp_dyn != 0 {
+                candle_core::bail!(
+                    "DELTA_ROWGRP_DYN={rowgrp_dyn} не делит head_v_dim={hvd}: состояние покрыто не полностью"
+                );
+            }
+            if hvd % COLS != 0 {
+                candle_core::bail!("DELTA_COLS={COLS} не делит head_v_dim={hvd}");
+            }
+        }
+        let splitr = splitr_cfg
+            && hvd % COLS == 0
+            && hvd % rowgrp_dyn == 0
+            && (hvd / rowgrp_dyn) <= DELTA_R_MAX_ROWS
+            && COLS * rowgrp_dyn <= 1024;
+        // Tile-ядро: транспозиция тайла состояния через shared, глобальный
+        // layout не меняется. Замер на изолированном стенде — 1.64x на
+        // рекуррентной части (0.0151 против 0.0248 мс на слой). Включается по
+        // умолчанию при hvd==128; DELTA_DECODE=off возвращает прежний путь.
+        let decode_mode = std::env::var("DELTA_DECODE").ok();
+        let tile_ok = hvd == 128
+            && decode_mode.as_deref() != Some("off")
+            && decode_mode.as_deref() != Some("single")
+            && decode_mode.as_deref() != Some("warpcol")
+            && decode_mode.as_deref() != Some("cols")
+            && decode_mode.as_deref() != Some("split");
+        let (name, cfg) = if tile_ok {
+            (
+                "delta_rule_kernel_batched_tile",
+                LaunchConfig {
+                    grid_dim: (n_v, b_u32, hvd / 64),
+                    block_dim: (32, 32, 1),
+                    // строка тайла с паддингом +1 против bank conflict
+                    shared_mem_bytes: 64 * (hvd + 1) * 4,
+                },
+            )
+        } else if splitr {
+            (
+                "delta_rule_kernel_batched_splitr",
+                LaunchConfig {
+                    grid_dim: (n_v, b_u32, hvd / COLS),
+                    block_dim: (COLS, rowgrp_dyn, 1),
+                    shared_mem_bytes: COLS * rowgrp_dyn * 4,
+                },
+            )
+        } else if warpcol {
+            (
+                "delta_rule_kernel_batched_warpcol",
+                LaunchConfig {
+                    grid_dim: (n_v, b_u32, hvd / DRW),
+                    block_dim: (32, DRW, 1),
+                    shared_mem_bytes: 0,
+                },
+            )
+        } else if cols {
             (
                 "delta_rule_kernel_batched_splitc",
                 LaunchConfig {
@@ -477,6 +549,10 @@ pub fn dispatch_delta_rule_batched(
         bb.arg(&temp.delta_output); // out
         bb.arg(&p);
         bb.arg(slot_ids_buf); // slot_ids (indirection)
+        if splitr {
+            bb.arg(&rowgrp_dyn); // динамический rowgrp (только splitr-ядро)
+        }
+        let _ = &decode_mode;
         unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
 

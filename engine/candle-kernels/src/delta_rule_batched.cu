@@ -373,15 +373,15 @@ __device__ __forceinline__ void delta_rule_row(
                          shared_sk, shared_d, head, col, bidx);
 }
 
-// Вариант с разделением столбца между rowgrp потоками: блок 128×4 = 512
+// Вариант с разделением столбца между DR_ROWGRP потоками: блок 128×4 = 512
 // потоков вместо 128, каждый держит 32 строки вместо 128. Трафик тот же
 // (состояние читается и пишется по разу), но параллелизм вчетверо выше —
 // прежняя сетка давала 32 блока × 128 потоков = 4096 потоков на всю карту,
 // чего мало, чтобы насытить память.
 // Сумма по строкам складывается из четырёх частичных в фиксированном порядке
 // (не бит-в-бит с однопоточным вариантом, расхождение уровня 1e-7).
-// grid=(n_v, B, 1), block=(head_v_dim, rowgrp, 1)
-#define DR_ROWGRP 4   // только значение по умолчанию у вызывающего
+// grid=(n_v, B, 1), block=(head_v_dim, DR_ROWGRP, 1)
+#define DR_ROWGRP 4
 
 extern "C" __global__ void delta_rule_kernel_batched_split(
     const float* __restrict__ q,
@@ -394,15 +394,18 @@ extern "C" __global__ void delta_rule_kernel_batched_split(
     const DeltaParams params,
     const unsigned int* __restrict__ slots
 ) {
-    extern __shared__ float sred[];              // [hd][rowgrp]
+    extern __shared__ float sred[];              // [hd][DR_ROWGRP]
     const unsigned int hd = params.head_v_dim;
     const unsigned int n_v = params.n_v_heads;
     const unsigned int head = blockIdx.x;
     const unsigned int bidx = blockIdx.y;
     const unsigned int col = threadIdx.x;
     const unsigned int rg = threadIdx.y;
-    // rowgrp из фактического blockDim.y: DELTA_ROWGRP приходит из env.
+    // rows_per из фактического blockDim.y: launch берёт DELTA_ROWGRP из env,
+    // и при несовпадении с константой ядро считало бы не всё состояние.
     const unsigned int rowgrp = blockDim.y;
+    // Guard: покрытие строк обязано быть полным. Иначе часть состояния молча
+    // не обновляется, а скорость внешне растёт — этот баг дал ложные +5%.
     if (rowgrp == 0 || hd % rowgrp != 0) { return; }
     const unsigned int rows_per = hd / rowgrp;
     const unsigned int row0 = rg * rows_per;
@@ -555,11 +558,81 @@ extern "C" __global__ void delta_rule_kernel_batched_seq_smem(
 // Column-split variant (decode, batch=1). Столбцы состояния независимы, поэтому
 // режем их МЕЖДУ блоками (blockIdx.z): базовый вариант при декоде стартует
 // grid=(n_v, B, 1) = 8 блоков на 28 SM.
-// Launch: grid=(n_v, B, hd/cols), block=(cols, rowgrp, 1),
-// shared = cols*rowgrp*4. Раскладка берётся из ФАКТИЧЕСКИХ blockDim.x/y —
-// см. предохранитель внутри ядра: не-дефолтные DELTA_COLS/DELTA_ROWGRP
-// раньше молча давали неполное покрытие состояния.
-#define DR_COLS 32   // только значение по умолчанию у вызывающего
+// Launch: grid=(n_v, B, hd/DR_COLS), block=(DR_COLS, DR_ROWGRP, 1),
+// shared = DR_COLS*DR_ROWGRP*4.
+#define DR_COLS 32
+
+// Раскладка с ДИНАМИЧЕСКИМ ROWGRP: строки состояния делятся не между
+// фиксированными 4 потоками, а между rowgrp (передаётся аргументом).
+// Число потоков на карту = n_v * hvd * rowgrp; при rowgrp=32 и hvd=128
+// это 131072 — как у llama.cpp gated_delta_net_cuda. Столбцы по-прежнему
+// читаются коалесцированно: соседние threadIdx.x берут соседние столбцы.
+//
+// Launch: grid=(n_v, B, hd/DR_COLS), block=(DR_COLS, rowgrp, 1),
+// shared = DR_COLS * rowgrp * 4.
+extern "C" __global__ void delta_rule_kernel_batched_splitr(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ beta,
+    const float* __restrict__ gate,
+    float* __restrict__ ssm_state,
+    float* __restrict__ output,
+    const DeltaParams params,
+    const unsigned int* __restrict__ slots,
+    const unsigned int rowgrp
+) {
+    extern __shared__ float sredr[];   // [DR_COLS][rowgrp]
+    const unsigned int hd = params.head_v_dim;
+    const unsigned int n_v = params.n_v_heads;
+    const unsigned int head = blockIdx.x;
+    const unsigned int bidx = blockIdx.y;
+    // ВАЖНО: stride по столбцам берём из blockDim.x, а не из константы
+    // DR_COLS. Когда launch задавал block_dim.x < DR_COLS (COLS=16),
+    // покрытие столбцов становилось неполным: ядро молча считало половину
+    // состояния и давало мусор при внешне высокой скорости.
+    const unsigned int col = blockIdx.z * blockDim.x + threadIdx.x;
+    const unsigned int rg = threadIdx.y;
+    if (col >= hd || rowgrp == 0 || hd % rowgrp != 0) { return; }
+    const unsigned int rows_per = hd / rowgrp;
+    if (rows_per > 32) { return; }               // st[] ограничен 32
+    const unsigned int row0 = rg * rows_per;
+    const unsigned int real_slot = slots[bidx];
+    const unsigned int slot_head = bidx * n_v + head;
+    const unsigned int vec_base = bidx * n_v * hd + head * hd;
+    float* state = ssm_state + real_slot * n_v * hd * hd + head * hd * hd;
+
+    const float gate_exp = __expf(gate[slot_head]);
+    const float beta_h = beta[slot_head];
+
+    float st[32];
+    float sk_part = 0.0f;
+    for (unsigned int r = 0; r < rows_per; r++) {
+        const float sv = state[(row0 + r) * hd + col] * gate_exp;
+        st[r] = sv;
+        sk_part += sv * k[vec_base + row0 + r];
+    }
+    sredr[threadIdx.x * rowgrp + rg] = sk_part;
+    __syncthreads();
+    float sk_val = 0.0f;
+    for (unsigned int g = 0; g < rowgrp; g++) { sk_val += sredr[threadIdx.x * rowgrp + g]; }
+    const float d_col = (v[vec_base + col] - sk_val) * beta_h;
+
+    float out_part = 0.0f;
+    for (unsigned int r = 0; r < rows_per; r++) {
+        const float sv = st[r] + k[vec_base + row0 + r] * d_col;
+        state[(row0 + r) * hd + col] = sv;
+        out_part += sv * q[vec_base + row0 + r];
+    }
+    __syncthreads();
+    sredr[threadIdx.x * rowgrp + rg] = out_part;
+    __syncthreads();
+    if (rg == 0) {
+        float o = 0.0f;
+        for (unsigned int g = 0; g < rowgrp; g++) { o += sredr[threadIdx.x * rowgrp + g]; }
+        output[vec_base + col] = o;
+    }
+}
 
 extern "C" __global__ void delta_rule_kernel_batched_splitc(
     const float* __restrict__ q,
@@ -577,16 +650,14 @@ extern "C" __global__ void delta_rule_kernel_batched_splitc(
     const unsigned int n_v = params.n_v_heads;
     const unsigned int head = blockIdx.x;
     const unsigned int bidx = blockIdx.y;
-    // Раскладку берём из ФАКТИЧЕСКИХ blockDim.x/y, а не из констант: ручки
-    // DELTA_COLS/DELTA_ROWGRP приходят из env. Пока здесь стояла константа,
-    // любое не-дефолтное значение молча давало неполное покрытие состояния
-    // (COLS=16 => считалась половина столбцов) при внешне высокой скорости.
-    const unsigned int cols = blockDim.x;
-    const unsigned int rowgrp = blockDim.y;
-    if (cols == 0 || rowgrp == 0 || hd % cols != 0 || hd % rowgrp != 0) { return; }
-    const unsigned int col = blockIdx.z * cols + threadIdx.x;
+    // ВАЖНО: stride по столбцам берём из blockDim.x, а не из константы
+    // DR_COLS. Когда launch задавал block_dim.x < DR_COLS (COLS=16),
+    // покрытие столбцов становилось неполным: ядро молча считало половину
+    // состояния и давало мусор при внешне высокой скорости.
+    const unsigned int col = blockIdx.z * blockDim.x + threadIdx.x;
     const unsigned int rg = threadIdx.y;
-    if (col >= hd) { return; }
+    const unsigned int rowgrp = blockDim.y;
+    if (rowgrp == 0 || hd % rowgrp != 0) { return; }
     const unsigned int rows_per = hd / rowgrp;
     const unsigned int row0 = rg * rows_per;
     const unsigned int real_slot = slots[bidx];
@@ -622,6 +693,198 @@ extern "C" __global__ void delta_rule_kernel_batched_splitc(
         #pragma unroll
         for (unsigned int g = 0; g < rowgrp; g++) { o += sredc[threadIdx.x * rowgrp + g]; }
         output[vec_base + col] = o;
+    }
+}
+
+// ── Warp-на-столбец вариант (по образцу llama.cpp gated_delta_net_cuda) ──
+//
+// Прежний splitc режет столбцы между блоками, но сам столбец считает группа
+// из DR_ROWGRP=4 потоков внутри блока 32×4 — на карте получается 128 блоков
+// (32 головы × 128/32), тогда как llama.cpp держит 1024 блока по 128 потоков
+// (одно warp на столбец, строки разложены по lane). Замер декода: 7.1 мкс на
+// вызов против 2.7 мкс у llama.cpp.
+//
+// Здесь именно раскладка llama.cpp: block = (32 lane, 4 warp), warp w
+// обслуживает столбец col = blockIdx.z*4 + w целиком, lane l берёт строки
+// l, l+32, l+64, l+96. Редукции — shuffle по warp, ни shared, ни __syncthreads.
+// state читается по строке со шагом hd: обращение разреженное, но состояние
+// головы (64 КБ) и весь снапшот (512 КБ) держатся в L2 RTX 4090.
+//
+// Launch: grid = (n_v, B, hvd/4), block = (32, 4, 1). Требует hvd % 32 == 0.
+#define DRW_LANES 32
+#define DRW_WARPS 4
+
+extern "C" __global__ void delta_rule_kernel_batched_warpcol(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ beta,
+    const float* __restrict__ gate,
+    float* __restrict__ ssm_state,
+    float* __restrict__ output,
+    const DeltaParams params,
+    const unsigned int* __restrict__ slots
+) {
+    const unsigned int hd = params.head_v_dim;
+    const unsigned int n_v = params.n_v_heads;
+    const unsigned int head = blockIdx.x;
+    const unsigned int bidx = blockIdx.y;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int w = threadIdx.y;
+    const unsigned int col = blockIdx.z * DRW_WARPS + w;
+    if (col >= hd) { return; }
+
+    const unsigned int rows_per_lane = hd / DRW_LANES;   // 4 при hd=128
+    const unsigned int real_slot = slots[bidx];
+    const unsigned int slot_head = bidx * n_v + head;
+    const unsigned int vec_base = bidx * n_v * hd + head * hd;
+    float* state = ssm_state + real_slot * n_v * hd * hd + head * hd * hd;
+
+    const float gate_exp = __expf(gate[slot_head]);
+    const float beta_h = beta[slot_head];
+
+    float s_shard[8];   // hd/32 <= 8 при hd<=256
+    float kv = 0.0f;
+    #pragma unroll
+    for (unsigned int r = 0; r < 8; r++) {
+        if (r >= rows_per_lane) break;
+        const unsigned int row = lane + r * DRW_LANES;
+        const float sv = state[row * hd + col] * gate_exp;
+        s_shard[r] = sv;
+        kv += sv * k[vec_base + row];
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) kv += __shfl_xor_sync(0xffffffffu, kv, m);
+
+    const float d_col = (v[vec_base + col] - kv) * beta_h;
+
+    float acc = 0.0f;
+    #pragma unroll
+    for (unsigned int r = 0; r < 8; r++) {
+        if (r >= rows_per_lane) break;
+        const unsigned int row = lane + r * DRW_LANES;
+        const float sv = s_shard[r] + k[vec_base + row] * d_col;
+        state[row * hd + col] = sv;
+        acc += sv * q[vec_base + row];
+    }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+
+    if (lane == 0) { output[vec_base + col] = acc; }
+}
+
+// ── Tile-ядро: транспозиция состояния через shared, глобальный layout прежний ──
+//
+// warpcol выше повторяет раскладку llama.cpp, но у нас состояние row-major,
+// поэтому lane-по-строке читает с шагом hd*4 — и выигрыша не даёт (замер на
+// стенде: row-major warp-на-столбец 0.0479 мс против 0.0248 у боевого split).
+// Транспонированное состояние (как у llama.cpp) даёт 0.0080 мс, но менять
+// глобальный формат нельзя — от него зависят снимки prefix-кеша, seed и Metal.
+//
+// Решение: блок берёт CW столбцов, транспонирует свой тайл в shared (загрузка
+// коалесцентная, строка тайла с паддингом +1 против bank conflict), считает
+// рекуррентность как llama.cpp (warp на столбец, shuffle-редукции, без
+// __syncthreads внутри шага) и пишет тайл обратно в тот же row-major layout.
+//
+// Стенд (RTX 3060 sm_86, H=32 hd=128, docs/tools/cuda/delta_decode_tile_ab.cu):
+// CW=64 — 0.0151 мс против 0.0248 у боевого split (1.64x), расхождение с
+// CPU-эталоном 1.2e-6; B=4 с индирекцией слотов — та же корректность.
+//
+// Launch: grid=(n_v, B, hd/CW), block=(32, 32), shared=CW*(hd+1)*4.
+// Требует hd == 128 и hd % CW == 0.
+extern "C" __global__ void __launch_bounds__(1024, 2) delta_rule_kernel_batched_tile(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ beta,
+    const float* __restrict__ gate,
+    float* __restrict__ ssm_state,   // persistent (real slot_idx), row-major S[row*hd+col]
+    float* __restrict__ output,
+    const DeltaParams params,
+    const unsigned int* __restrict__ slots
+) {
+    extern __shared__ float tile[];              // [CW][hd+1]
+    constexpr unsigned int CW = 64;
+    constexpr unsigned int LANES = 32;
+    constexpr unsigned int WR = 32;              // warps на блок
+    const unsigned int hd = params.head_v_dim;
+    const unsigned int n_v = params.n_v_heads;
+    const unsigned int head = blockIdx.x;
+    const unsigned int bidx = blockIdx.y;
+    const unsigned int col0 = blockIdx.z * CW;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int w = threadIdx.y;
+    const unsigned int TS = hd + 1;              // паддинг строки тайла
+    if (hd != 128) { return; }
+    if (col0 + CW > hd) { return; }
+
+    const unsigned int real_slot = slots[bidx];
+    const unsigned int vec_base = bidx * n_v * hd + head * hd;
+    float* state = ssm_state + real_slot * n_v * hd * hd + head * hd * hd;
+
+    // Загрузка [hd][CW] коалесцентно и укладка транспонировано в shared.
+    {
+        const unsigned int tid = w * LANES + lane;
+        for (unsigned int e = tid; e < hd * CW; e += LANES * WR) {
+            const unsigned int r = e / CW;
+            const unsigned int c = e % CW;
+            tile[c * TS + r] = state[r * hd + (col0 + c)];
+        }
+    }
+    __syncthreads();
+
+    const float gate_exp = __expf(gate[bidx * n_v + head]);
+    const float beta_h = beta[bidx * n_v + head];
+    constexpr unsigned int RP = 128 / LANES;     // строк на lane при hd=128
+
+    for (unsigned int c = w; c < CW; c += WR) {
+        float st[RP];
+        #pragma unroll
+        for (unsigned int r = 0; r < RP; r++) {
+            st[r] = tile[c * TS + r * LANES + lane];
+        }
+        float k_reg[RP], q_reg[RP];
+        #pragma unroll
+        for (unsigned int r = 0; r < RP; r++) {
+            k_reg[r] = k[vec_base + r * LANES + lane];
+            q_reg[r] = q[vec_base + r * LANES + lane];
+        }
+        // kv[col] = sum_r g * S[r][col] * k[r]
+        float kv_part = 0.0f;
+        #pragma unroll
+        for (unsigned int r = 0; r < RP; r++) { kv_part += st[r] * k_reg[r]; }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            kv_part += __shfl_down_sync(0xffffffffu, kv_part, o);
+        }
+        kv_part = __shfl_sync(0xffffffffu, kv_part, 0);
+        const float d_col = (v[vec_base + col0 + c] - gate_exp * kv_part) * beta_h;
+        float out_part = 0.0f;
+        #pragma unroll
+        for (unsigned int r = 0; r < RP; r++) {
+            st[r] = gate_exp * st[r] + k_reg[r] * d_col;
+            out_part += st[r] * q_reg[r];
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            out_part += __shfl_down_sync(0xffffffffu, out_part, o);
+        }
+        if (lane == 0) { output[vec_base + col0 + c] = out_part; }
+        #pragma unroll
+        for (unsigned int r = 0; r < RP; r++) {
+            tile[c * TS + r * LANES + lane] = st[r];
+        }
+    }
+    __syncthreads();
+
+    // Обратная укладка тайла в row-major состояние.
+    {
+        const unsigned int tid = w * LANES + lane;
+        for (unsigned int e = tid; e < hd * CW; e += LANES * WR) {
+            const unsigned int r = e / CW;
+            const unsigned int c = e % CW;
+            state[r * hd + (col0 + c)] = tile[c * TS + r];
+        }
     }
 }
 
