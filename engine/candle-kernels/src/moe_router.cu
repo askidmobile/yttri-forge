@@ -153,23 +153,25 @@ extern "C" __global__ void moe_softmax_topk_kernel(
         }
         __syncthreads();
 
-        if (tid == 0) {
-            float bv = warp_val[0];
-            int bi = warp_idx[0];
-            for (unsigned int i = 1; i < nwarp; i++) {
-                // Strict `>` → lower index wins on tie
-                if (warp_val[i] > bv || (warp_val[i] == bv && warp_idx[i] >= 0 && (bi < 0 || warp_idx[i] < bi))) {
-                    bv = warp_val[i];
-                    bi = warp_idx[i];
-                }
+        // Глобальный argmax считают ВСЕ потоки, а не только tid==0: раньше
+        // серийный хвост по nwarp выполнял один поток, пока остальные ждали
+        // (8 итераций topk, каждая с барьером).
+        float gv = -INFINITY;
+        int gi = -1;
+        for (unsigned int i = 0; i < nwarp; i++) {
+            // Strict > → lower index wins on tie
+            if (warp_val[i] > gv || (warp_val[i] == gv && warp_idx[i] >= 0 && (gi < 0 || warp_idx[i] < gi))) {
+                gv = warp_val[i];
+                gi = warp_idx[i];
             }
-            int sel = bi;
+        }
+        const int sel = gi;
+        if (tid == 0) {
             if (sel >= 0) {
                 masked[sel] = 1;
                 expert_ids[token * topk + k] = sel;
-                float w = probs[sel];
-                weights[token * topk + k] = w;
-                selected_weight_sum += w;
+                weights[token * topk + k] = probs[sel];
+                selected_weight_sum += probs[sel];
             } else {
                 expert_ids[token * topk + k] = 0;
                 weights[token * topk + k] = 0.0f;

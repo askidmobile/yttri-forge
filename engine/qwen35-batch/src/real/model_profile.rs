@@ -583,6 +583,16 @@ impl MtpProfile {
             GgmlDType::IQ1M,
             GgmlDType::F16,
         ];
+        // Роутер MTP-слоя в GGUF бывает F32 (Ornith-1.5-35B-A3B:
+        // blk.40.ffn_gate_inp.weight и ..._shexp.weight). Раньше F32 отсутствовал
+        // в списке matrix, и встроенный MTP не грузился вовсе — движок падал на
+        // валидации, хотя математически тип поддержан (QMatMul::from_arc
+        // де-квантует F32 втензор). Разрешён только для контракта MTP.
+        let matrix_f32 = {
+            let mut v = matrix.to_vec();
+            v.push(GgmlDType::F32);
+            v
+        };
         let norm = [GgmlDType::BF16, GgmlDType::F32];
         if is_moe {
             // FR-011: MoE-вариант — routed experts + router + shared expert
@@ -615,7 +625,7 @@ impl MtpProfile {
                 (format!("{prefix}.ffn_gate_inp_shexp.weight"), vec![hidden]),
                 (format!("{prefix}.nextn.eh_proj.weight"), vec![hidden, 2 * hidden]),
             ] {
-                require_tensor_contract(&tensors, &name, &shape, &matrix, &mut errs);
+                require_tensor_contract(&tensors, &name, &shape, &matrix_f32, &mut errs);
             }
         } else {
             for (name, shape) in [
