@@ -31,6 +31,7 @@ pub mod cuda;
 #[cfg(feature = "cuda")]
 pub use cuda::{
     indexed_moe_forward_dual_table, indexed_moe_forward_table, moe_grouping, moe_mmq_enabled,
+    moe_weighted_sum,
     moe_mmq_project, moe_mmq_x, moe_mmq_x_for, moe_weighted_combine, MoeGrouping,
 };
 #[cfg(feature = "cuda")]

@@ -2821,3 +2821,61 @@ fn pick_mmq_x(ncols_max: usize, forced: usize) -> usize {
         _ => 128,
     }
 }
+
+/// Взвешенная сумма выхода MoE по topk одним ядром.
+/// `routed` — [tokens, topk, n_out], `weights` — [tokens, topk].
+/// Заменяет пару `broadcast_mul` + `sum` движка (bmul_f32 + fast_sum_f32).
+#[cfg(feature = "cuda")]
+pub fn moe_weighted_sum(
+    dev: &CudaDevice,
+    routed: &crate::Tensor,
+    weights: &crate::Tensor,
+    n_out: usize,
+    topk: usize,
+) -> Result<crate::Tensor> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let (r_st, r_l) = routed.storage_and_layout();
+    let routed_v = match &*r_st {
+        crate::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+        _ => crate::bail!("moe_weighted_sum: routed не на CUDA"),
+    };
+    let (r0, r1) = r_l
+        .contiguous_offsets()
+        .ok_or_else(|| crate::Error::Msg("moe_weighted_sum: routed не contiguous".into()))?;
+    let routed_v = routed_v.slice(r0..r1);
+
+    let (w_st, w_l) = weights.storage_and_layout();
+    let w_v = match &*w_st {
+        crate::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+        _ => crate::bail!("moe_weighted_sum: weights не на CUDA"),
+    };
+    let (w0, w1) = w_l
+        .contiguous_offsets()
+        .ok_or_else(|| crate::Error::Msg("moe_weighted_sum: weights не contiguous".into()))?;
+    let w_v = w_v.slice(w0..w1);
+
+    let (tokens, _r, _n) = routed.dims3()?;
+    let out = unsafe { dev.alloc::<f32>(tokens * n_out)? };
+    let func = dev.get_or_load_func("moe_weighted_sum_kernel", &candle_kernels::MOE_ROUTER)?;
+    let n_out_i = n_out as i32;
+    let topk_i = topk as i32;
+    {
+        let cfg = LaunchConfig {
+            grid_dim: (tokens as u32, ceil_div(n_out, 256) as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = func.builder();
+        b.arg(&routed_v);
+        b.arg(&w_v);
+        b.arg(&out);
+        b.arg(&n_out_i);
+        b.arg(&topk_i);
+        unsafe { b.launch(cfg) }.w()?;
+    }
+    let shape: crate::Shape = (tokens, n_out).into();
+    Ok(crate::Tensor::from((
+        crate::Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
+        shape,
+    )))
+}

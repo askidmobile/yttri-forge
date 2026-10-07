@@ -420,3 +420,30 @@ extern "C" __global__ void moe_identity_kernel(
         dst[i] = i;
     }
 }
+
+// ─── 8. Взвешенная сумма topk одним ядром ───────────────────────────────────
+//
+// В MMVQ-пути выход down приходит как [tokens, topk, n_embd], и редукция по
+// topk шла двумя ядрами движка: bmul_f32, затем fast_sum_f32. На профиле
+// декода Ornith это bmul 0.48 мс/токен плюс fast_sum 0.16 мс/токен —
+// около четверти всего шага. Одно ядро делает и умножение на вес маршрута,
+// и суммирование по topk.
+//
+// grid = (tokens, ceil(n_out / 256)), block = (256, 1, 1).
+extern "C" __global__ void moe_weighted_sum_kernel(
+    const float*   __restrict__ routed,   // [n_tokens, topk, n_out]
+    const float*   __restrict__ weights,  // [n_tokens, topk]
+    float*         __restrict__ out,      // [n_tokens, n_out]
+    int n_out,
+    int topk) {
+    const int token = blockIdx.x;
+    const int col   = blockIdx.y * blockDim.x + threadIdx.x;
+    if (col >= n_out) {
+        return;
+    }
+    float acc = 0.0f;
+    for (int r = 0; r < topk; ++r) {
+        acc += weights[token * topk + r] * routed[(size_t)(token * topk + r) * n_out + col];
+    }
+    out[(size_t)token * n_out + col] = acc;
+}

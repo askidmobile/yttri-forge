@@ -33,6 +33,24 @@ pub enum ForwardMode {
     DecodeBatch,
 }
 
+/// Редукция выхода MoE по topk. На CUDA — одно ядро moe_weighted_sum_kernel
+/// вместо пары `broadcast_mul` + `sum` движка: на профиле декода Ornith эти
+/// два ядра стоили bmul 0.48 мс/токен и fast_sum 0.16 мс/токен.
+#[cfg(feature = "cuda")]
+fn moe_reduce(
+    down: Tensor,
+    w_t: &Tensor,
+    topk: usize,
+    cuda_dev: &candle_core::CudaDevice,
+) -> Result<Tensor> {
+    // down ранга 3: [tokens, topk, n_out]
+    let (_tokens, topk_in, n_out) = down.dims3()?;
+    if topk_in != topk {
+        candle_core::bail!("moe_reduce: topk {topk_in} != {topk}");
+    }
+    candle_core::quantized::moe_weighted_sum(cuda_dev, &down, w_t, n_out, topk)
+}
+
 /// Порог, с которого MoE уходит на MMQ с группировкой. Ниже — группировка
 /// (count/scan/sort + D2H) съедает больше, чем экономит на тайлах: у блока
 /// один блок-сортировки плюс синхронизация на слой.
@@ -698,7 +716,7 @@ gate={:?} up={:?} down={:?} x={:?} n_out={}",
                 };
                 let act = gate.silu_mul_direct(&up)?.contiguous()?;
                 let down = packed.down.indexed_moe_forward_cuda(&act, &ids_t)?; // [tokens, topk, n_embd]
-                add_shared(weighted_sum(down, &w_t)?, xs)
+                add_shared(moe_reduce(down, &w_t, k, cuda_dev)?, xs)
             }
         }
     }
