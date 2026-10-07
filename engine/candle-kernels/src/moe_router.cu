@@ -10,6 +10,7 @@
 
 #include "cuda_fp16.h"
 #include <stdint.h>
+#include <cfloat>
 
 #define WARP_SIZE 32
 
@@ -448,4 +449,88 @@ extern "C" __global__ void moe_weighted_sum_kernel(
         acc += weights[token * topk + r] * routed[(size_t)(token * topk + r) * n_out + col];
     }
     out[(size_t)token * n_out + col] = acc;
+}
+
+// ─── 1b. Warp-per-token роутер (по образцу llama.cpp topk_moe_cuda) ───────────
+//
+// Блочный вариант выше на 256 экспертах делает 8 раундов argmax, каждый с
+// двумя __syncthreads() и двумя проходами по shared — по профилю это 6.4 мкс
+// против 2.6 мкс у llama.cpp. Здесь одно warp на токен: все 256 логитов
+// лежат в 8 регистрах на поток, softmax и top-k идут через shuffle, ни
+// shared, ни барьеров. Тай-брейк по меньшему индексу сохранён (строгое >).
+
+#define WRT_EPT 8   // 256 экспертов / 32 lane
+
+extern "C" __global__ void moe_softmax_topk_warp_kernel(
+    const float* __restrict__ logits,  // [n_tokens, n_experts]
+    int32_t* __restrict__ expert_ids,  // [n_tokens * topk]
+    float* __restrict__ weights,       // [n_tokens * topk]
+    int n_experts,
+    int topk,
+    int norm_topk_prob
+) {
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int row = blockIdx.x * (int)blockDim.y + warp;
+
+    float wt[WRT_EPT];
+    #pragma unroll
+    for (int i = 0; i < WRT_EPT; i++) {
+        const int e = lane + i * WARP_SIZE;
+        wt[i] = (e < n_experts) ? __ldg(&logits[(size_t)row * n_experts + e]) : -INFINITY;
+    }
+    #pragma unroll
+    for (int i = 0; i < WRT_EPT; i++) if (__isnanf(wt[i])) wt[i] = -FLT_MAX;
+
+    // softmax по warp
+    float max_val = -INFINITY;
+    #pragma unroll
+    for (int i = 0; i < WRT_EPT; i++) max_val = fmaxf(max_val, wt[i]);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1)
+        max_val = fmaxf(max_val, __shfl_xor_sync(0xffffffffu, max_val, m));
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < WRT_EPT; i++) { const float e = expf(wt[i] - max_val); wt[i] = e; sum += e; }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, m);
+    const float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+    #pragma unroll
+    for (int i = 0; i < WRT_EPT; i++) wt[i] *= inv_sum;
+
+    float sel_w[WRT_EPT];
+    int   sel_e[WRT_EPT];
+    float selected_sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < WRT_EPT; k++) {
+        if (k >= topk) break;
+        float best = wt[0];
+        int best_e = lane;
+        #pragma unroll
+        for (int i = 1; i < WRT_EPT; i++) {
+            const int e = lane + i * WARP_SIZE;
+            if (e < n_experts && wt[i] > best) { best = wt[i]; best_e = e; }
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, m);
+            const int   oe = __shfl_xor_sync(0xffffffffu, best_e, m);
+            if (ov > best || (ov == best && oe < best_e)) { best = ov; best_e = oe; }
+        }
+        if ((best_e & (WARP_SIZE - 1)) == lane) wt[best_e / WARP_SIZE] = -INFINITY;
+        sel_w[k] = best;
+        sel_e[k] = best_e;
+        selected_sum += best;
+    }
+
+    const float inv_sel = (norm_topk_prob && selected_sum > 0.0f) ? 1.0f / selected_sum : 1.0f;
+    #pragma unroll
+    for (int k = 0; k < WRT_EPT; k++) {
+        if (k >= topk) break;
+        if (lane == 0) {
+            expert_ids[(size_t)row * topk + k] = sel_e[k];
+            weights[(size_t)row * topk + k] = sel_w[k] * inv_sel;
+        }
+    }
 }

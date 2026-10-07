@@ -932,6 +932,21 @@ fn gpu_softmax_topk(
     norm_topk_prob: bool,
     trace: Option<(&super::expert_store::MoeRuntime, usize)>,
 ) -> Result<(Tensor, Tensor)> {
+    gpu_softmax_topk_sel(dev, logits, n_experts, topk, norm_topk_prob, trace, None)
+}
+
+/// `force_warp`: None — по env ROUTER_WARP, Some(b) — принудительно.
+/// Разделение нужно регресс-тесту: менять env в параллельных тестах нельзя.
+#[allow(clippy::too_many_arguments)]
+fn gpu_softmax_topk_sel(
+    dev: &candle_core::CudaDevice,
+    logits: &Tensor,
+    n_experts: usize,
+    topk: usize,
+    norm_topk_prob: bool,
+    trace: Option<(&super::expert_store::MoeRuntime, usize)>,
+    force_warp: Option<bool>,
+) -> Result<(Tensor, Tensor)> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     let (n_tokens, _) = logits.dims2()?;
     let (l_st, l_lay) = logits.storage_and_layout();
@@ -943,21 +958,42 @@ fn gpu_softmax_topk(
     let ids = unsafe { dev.alloc::<u32>(n_tokens * topk)? };
     let mut weights = unsafe { dev.alloc::<f32>(n_tokens * topk)? };
 
-    let func = dev.get_or_load_func("moe_softmax_topk_kernel", &candle_kernels::MOE_ROUTER)?;
-    let block = 256u32; // >= n_experts(256), power of 2
-    let shared = (n_experts * 4 + n_experts) as u32; // probs f32 + masked u8
-    let cfg = LaunchConfig {
-        grid_dim: (n_tokens as u32, 1, 1),
-        block_dim: (block, 1, 1),
-        shared_mem_bytes: shared,
-    };
-    // kernel ждёт int32_t* для ids — transmute view u32→i32.
-    let ids_i32 = unsafe { ids.transmute::<i32>(n_tokens * topk) }
-        .ok_or_else(|| candle_core::Error::Msg("ids transmute".into()))?;
+    // ROUTER_WARP=0 — откат на прежний блочный вариант.
+    let warp_router = force_warp
+        .unwrap_or_else(|| std::env::var("ROUTER_WARP").as_deref() != Ok("0"));
     let norm_flag: i32 = if norm_topk_prob { 1 } else { 0 };
     let n_experts_i = n_experts as i32;
     let topk_i = topk as i32;
-    {
+    // kernel ждёт int32_t* для ids — transmute view u32→i32.
+    let ids_i32 = unsafe { ids.transmute::<i32>(n_tokens * topk) }
+        .ok_or_else(|| candle_core::Error::Msg("ids transmute".into()))?;
+    if warp_router {
+        // Одно warp на токен, 4 строки на блок: без shared и барьеров.
+        let func =
+            dev.get_or_load_func("moe_softmax_topk_warp_kernel", &candle_kernels::MOE_ROUTER)?;
+        let rows_per_block = 4u32;
+        let cfg = LaunchConfig {
+            grid_dim: ((n_tokens as u32).div_ceil(rows_per_block), 1, 1),
+            block_dim: (32, rows_per_block, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = func.builder();
+        b.arg(&logits_view);
+        b.arg(&ids_i32);
+        b.arg(&mut weights);
+        b.arg(&n_experts_i);
+        b.arg(&topk_i);
+        b.arg(&norm_flag);
+        unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    } else {
+        let func = dev.get_or_load_func("moe_softmax_topk_kernel", &candle_kernels::MOE_ROUTER)?;
+        let block = 256u32; // >= n_experts(256), power of 2
+        let shared = (n_experts * 4 + n_experts) as u32; // probs f32 + masked u8
+        let cfg = LaunchConfig {
+            grid_dim: (n_tokens as u32, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: shared,
+        };
         let mut b = func.builder();
         b.arg(&logits_view);
         b.arg(&ids_i32);
@@ -999,8 +1035,22 @@ mod cuda_router_tests {
             })
             .collect();
         let logits_t = Tensor::from_slice(&logits, (n_tokens, n_experts), &device)?;
-        let (ids, weights) =
-            gpu_softmax_topk(device.as_cuda_device()?, &logits_t, n_experts, topk, true, None)?;
+        // Регресс-гард: warp-роутер и прежний блочный обязаны совпасть
+        // побитово по ids и численно по весам (tie-break по меньшему индексу).
+        let (ids_blk, w_blk) = gpu_softmax_topk_sel(
+            device.as_cuda_device()?, &logits_t, n_experts, topk, true, None, Some(false))?;
+        let (ids, weights) = gpu_softmax_topk_sel(
+            device.as_cuda_device()?, &logits_t, n_experts, topk, true, None, Some(true))?;
+        {
+            let a = ids_blk.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+            let b = ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+            let wa = w_blk.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            let wb = weights.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(a, b, "warp vs block: ids расходятся");
+            for (i, (x, y)) in wa.iter().zip(wb.iter()).enumerate() {
+                assert!((x - y).abs() < 1e-6, "warp vs block: вес {i}: {x} vs {y}");
+            }
+        }
         let ids = ids.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
         let weights = weights.to_device(&Device::Cpu)?.to_vec2::<f32>()?;
 
