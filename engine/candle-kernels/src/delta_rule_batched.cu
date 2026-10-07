@@ -373,15 +373,15 @@ __device__ __forceinline__ void delta_rule_row(
                          shared_sk, shared_d, head, col, bidx);
 }
 
-// Вариант с разделением столбца между DR_ROWGRP потоками: блок 128×4 = 512
+// Вариант с разделением столбца между rowgrp потоками: блок 128×4 = 512
 // потоков вместо 128, каждый держит 32 строки вместо 128. Трафик тот же
 // (состояние читается и пишется по разу), но параллелизм вчетверо выше —
 // прежняя сетка давала 32 блока × 128 потоков = 4096 потоков на всю карту,
 // чего мало, чтобы насытить память.
 // Сумма по строкам складывается из четырёх частичных в фиксированном порядке
 // (не бит-в-бит с однопоточным вариантом, расхождение уровня 1e-7).
-// grid=(n_v, B, 1), block=(head_v_dim, DR_ROWGRP, 1)
-#define DR_ROWGRP 4
+// grid=(n_v, B, 1), block=(head_v_dim, rowgrp, 1)
+#define DR_ROWGRP 4   // только значение по умолчанию у вызывающего
 
 extern "C" __global__ void delta_rule_kernel_batched_split(
     const float* __restrict__ q,
@@ -394,14 +394,17 @@ extern "C" __global__ void delta_rule_kernel_batched_split(
     const DeltaParams params,
     const unsigned int* __restrict__ slots
 ) {
-    extern __shared__ float sred[];              // [hd][DR_ROWGRP]
+    extern __shared__ float sred[];              // [hd][rowgrp]
     const unsigned int hd = params.head_v_dim;
     const unsigned int n_v = params.n_v_heads;
     const unsigned int head = blockIdx.x;
     const unsigned int bidx = blockIdx.y;
     const unsigned int col = threadIdx.x;
     const unsigned int rg = threadIdx.y;
-    const unsigned int rows_per = hd / DR_ROWGRP;
+    // rowgrp из фактического blockDim.y: DELTA_ROWGRP приходит из env.
+    const unsigned int rowgrp = blockDim.y;
+    if (rowgrp == 0 || hd % rowgrp != 0) { return; }
+    const unsigned int rows_per = hd / rowgrp;
     const unsigned int row0 = rg * rows_per;
 
     const unsigned int real_slot = slots[bidx];
@@ -419,13 +422,13 @@ extern "C" __global__ void delta_rule_kernel_batched_split(
         st[r] = sv;
         sk_part += sv * k[vec_base + row0 + r];
     }
-    sred[col * DR_ROWGRP + rg] = sk_part;
+    sred[col * rowgrp + rg] = sk_part;
     __syncthreads();
 
     float sk_val = 0.0f;
     #pragma unroll
-    for (unsigned int g = 0; g < DR_ROWGRP; g++) {
-        sk_val += sred[col * DR_ROWGRP + g];
+    for (unsigned int g = 0; g < rowgrp; g++) {
+        sk_val += sred[col * rowgrp + g];
     }
     const float d_col = (v[vec_base + col] - sk_val) * beta_h;
 
@@ -436,13 +439,13 @@ extern "C" __global__ void delta_rule_kernel_batched_split(
         out_part += sv * q[vec_base + row0 + r];
     }
     __syncthreads();
-    sred[col * DR_ROWGRP + rg] = out_part;
+    sred[col * rowgrp + rg] = out_part;
     __syncthreads();
     if (rg == 0) {
         float o = 0.0f;
         #pragma unroll
-        for (unsigned int g = 0; g < DR_ROWGRP; g++) {
-            o += sred[col * DR_ROWGRP + g];
+        for (unsigned int g = 0; g < rowgrp; g++) {
+            o += sred[col * rowgrp + g];
         }
         output[vec_base + col] = o;
     }
@@ -552,9 +555,11 @@ extern "C" __global__ void delta_rule_kernel_batched_seq_smem(
 // Column-split variant (decode, batch=1). Столбцы состояния независимы, поэтому
 // режем их МЕЖДУ блоками (blockIdx.z): базовый вариант при декоде стартует
 // grid=(n_v, B, 1) = 8 блоков на 28 SM.
-// Launch: grid=(n_v, B, hd/DR_COLS), block=(DR_COLS, DR_ROWGRP, 1),
-// shared = DR_COLS*DR_ROWGRP*4.
-#define DR_COLS 32
+// Launch: grid=(n_v, B, hd/cols), block=(cols, rowgrp, 1),
+// shared = cols*rowgrp*4. Раскладка берётся из ФАКТИЧЕСКИХ blockDim.x/y —
+// см. предохранитель внутри ядра: не-дефолтные DELTA_COLS/DELTA_ROWGRP
+// раньше молча давали неполное покрытие состояния.
+#define DR_COLS 32   // только значение по умолчанию у вызывающего
 
 extern "C" __global__ void delta_rule_kernel_batched_splitc(
     const float* __restrict__ q,
@@ -572,10 +577,17 @@ extern "C" __global__ void delta_rule_kernel_batched_splitc(
     const unsigned int n_v = params.n_v_heads;
     const unsigned int head = blockIdx.x;
     const unsigned int bidx = blockIdx.y;
-    const unsigned int col = blockIdx.z * DR_COLS + threadIdx.x;
+    // Раскладку берём из ФАКТИЧЕСКИХ blockDim.x/y, а не из констант: ручки
+    // DELTA_COLS/DELTA_ROWGRP приходят из env. Пока здесь стояла константа,
+    // любое не-дефолтное значение молча давало неполное покрытие состояния
+    // (COLS=16 => считалась половина столбцов) при внешне высокой скорости.
+    const unsigned int cols = blockDim.x;
+    const unsigned int rowgrp = blockDim.y;
+    if (cols == 0 || rowgrp == 0 || hd % cols != 0 || hd % rowgrp != 0) { return; }
+    const unsigned int col = blockIdx.z * cols + threadIdx.x;
     const unsigned int rg = threadIdx.y;
     if (col >= hd) { return; }
-    const unsigned int rows_per = hd / DR_ROWGRP;
+    const unsigned int rows_per = hd / rowgrp;
     const unsigned int row0 = rg * rows_per;
     const unsigned int real_slot = slots[bidx];
     const unsigned int slot_head = bidx * n_v + head;
@@ -590,11 +602,11 @@ extern "C" __global__ void delta_rule_kernel_batched_splitc(
         st[r] = sv;
         sk_part += sv * k[vec_base + row0 + r];
     }
-    sredc[threadIdx.x * DR_ROWGRP + rg] = sk_part;
+    sredc[threadIdx.x * rowgrp + rg] = sk_part;
     __syncthreads();
     float sk_val = 0.0f;
     #pragma unroll
-    for (unsigned int g = 0; g < DR_ROWGRP; g++) { sk_val += sredc[threadIdx.x * DR_ROWGRP + g]; }
+    for (unsigned int g = 0; g < rowgrp; g++) { sk_val += sredc[threadIdx.x * rowgrp + g]; }
     const float d_col = (v[vec_base + col] - sk_val) * beta_h;
     float out_part = 0.0f;
     for (unsigned int r = 0; r < rows_per; r++) {
@@ -603,12 +615,12 @@ extern "C" __global__ void delta_rule_kernel_batched_splitc(
         out_part += sv * q[vec_base + row0 + r];
     }
     __syncthreads();
-    sredc[threadIdx.x * DR_ROWGRP + rg] = out_part;
+    sredc[threadIdx.x * rowgrp + rg] = out_part;
     __syncthreads();
     if (rg == 0) {
         float o = 0.0f;
         #pragma unroll
-        for (unsigned int g = 0; g < DR_ROWGRP; g++) { o += sredc[threadIdx.x * DR_ROWGRP + g]; }
+        for (unsigned int g = 0; g < rowgrp; g++) { o += sredc[threadIdx.x * rowgrp + g]; }
         output[vec_base + col] = o;
     }
 }

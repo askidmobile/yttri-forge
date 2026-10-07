@@ -408,15 +408,36 @@ pub fn dispatch_delta_rule_batched(
         // потоками — 512 потоков на блок вместо 128. Прежняя сетка давала
         // 32 блока × 128 = 4096 потоков на карту, чего мало для насыщения
         // памяти. DELTA_DECODE=single возвращает однопоточный столбец.
-        const ROWGRP: u32 = 4;
+        // Ручки раскладки: ядро читает фактические blockDim.x/y, поэтому
+        // значения обязаны с ними совпадать. Раньше здесь стояли константы,
+        // и не-дефолтное значение молча давало неполное покрытие состояния
+        // при внешне высокой скорости — см.
+        // docs/research/2026-10-07-router-warp-and-false-cols-gain.md.
+        let ROWGRP: u32 = std::env::var("DELTA_ROWGRP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4);
         let single = std::env::var("DELTA_DECODE").as_deref() == Ok("single");
-        let split_ok = !single && hvd % ROWGRP == 0 && (hvd / ROWGRP) <= 32;
+        let split_ok = !single && ROWGRP > 0 && hvd % ROWGRP == 0 && (hvd / ROWGRP) <= 32;
         // Столбцы состояния независимы: режем их между блоками (grid.z),
         // иначе при B=1 сетка = 8 блоков на 28 SM. DELTA_DECODE=cols.
-        const COLS: u32 = 32;
+        let COLS: u32 = std::env::var("DELTA_COLS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(32);
+        // Fail-closed для фактически выбранной раскладки.
+        if ROWGRP == 0 || hvd % ROWGRP != 0 || (hvd / ROWGRP) > 32 {
+            candle_core::bail!(
+                "DELTA_ROWGRP={ROWGRP} несовместим с head_v_dim={hvd}: строки состояния были бы покрыты не полностью"
+            );
+        }
         let cols = std::env::var("DELTA_DECODE").as_deref() == Ok("cols")
-            && hvd % COLS == 0
-            && COLS * ROWGRP <= 1024;
+            && COLS > 0 && hvd % COLS == 0 && COLS * ROWGRP <= 1024;
+        if std::env::var("DELTA_DECODE").as_deref() == Ok("cols") && !cols {
+            candle_core::bail!(
+                "DELTA_COLS={COLS} или DELTA_ROWGRP={ROWGRP} несовместимы с head_v_dim={hvd}: состояние было бы покрыто не полностью"
+            );
+        }
         let (name, cfg) = if cols {
             (
                 "delta_rule_kernel_batched_splitc",
