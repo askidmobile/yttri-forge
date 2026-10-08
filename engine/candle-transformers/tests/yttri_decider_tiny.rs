@@ -344,23 +344,27 @@ fn install_from_many_threads_on_one_pool_does_not_hang() {
             .collect(),
     );
     let m2 = m.clone();
-    within(60, "pool.install из 6 потоков на пуле из 4", move || {
-        let callers: Vec<_> = (0..6)
-            .map(|t| {
-                let (m, pool, inputs) = (m2.clone(), pool.clone(), inputs.clone());
-                std::thread::spawn(move || {
-                    for i in 0..100 {
-                        let (ids, want) = &inputs[(i + t) % inputs.len()];
-                        let got = pool.install(|| m.forward(ids)).unwrap();
-                        assert!(same_logits(&got, want), "поток {t}, вызов {i}");
-                    }
+    within(
+        60,
+        "pool.install из 6 потоков на пуле из 4",
+        move || {
+            let callers: Vec<_> = (0..6)
+                .map(|t| {
+                    let (m, pool, inputs) = (m2.clone(), pool.clone(), inputs.clone());
+                    std::thread::spawn(move || {
+                        for i in 0..100 {
+                            let (ids, want) = &inputs[(i + t) % inputs.len()];
+                            let got = pool.install(|| m.forward(ids)).unwrap();
+                            assert!(same_logits(&got, want), "поток {t}, вызов {i}");
+                        }
+                    })
                 })
-            })
-            .collect();
-        for c in callers {
-            c.join().unwrap();
-        }
-    });
+                .collect();
+            for c in callers {
+                c.join().unwrap();
+            }
+        },
+    );
     // свободных рабочих пространств хранится не больше двух: после всплеска параллельных вызовов память не раздувается
     assert!(
         m.resident_bytes() < 3 * base,
@@ -639,7 +643,11 @@ impl Edit {
 fn reader_rejects_hostile_headers_with_errors_not_panics() {
     let ok = original();
     let edit = || Edit::parse(&ok);
-    assert_eq!(edit().build(32), ok, "пересборка без правок должна давать тот же файл");
+    assert_eq!(
+        edit().build(32),
+        ok,
+        "пересборка без правок должна давать тот же файл"
+    );
     let mut x = edit();
     x.set_u32("general.alignment", 32);
     load_ok("alignment = 32", &x.build(32));
@@ -658,13 +666,19 @@ fn reader_rejects_hostile_headers_with_errors_not_panics() {
     let mut x = edit();
     x.set_offset("embeddings.LayerNorm.bias", 0xFFFF_FFFF_FFFF_FFF0);
     let e = load_err("offset wrap", &x.build(32));
-    assert!(e.contains("embeddings.LayerNorm.bias") && e.contains("overflow"), "{e}");
+    assert!(
+        e.contains("embeddings.LayerNorm.bias") && e.contains("overflow"),
+        "{e}"
+    );
     // смещение внутри файла, но не кратное 32
     let mut x = edit();
     let off = x.offset("embeddings.LayerNorm.bias");
     x.set_offset("embeddings.LayerNorm.bias", off + 16);
     let e = load_err("offset unaligned", &x.build(32));
-    assert!(e.contains("embeddings.LayerNorm.bias") && e.contains("не кратно"), "{e}");
+    assert!(
+        e.contains("embeddings.LayerNorm.bias") && e.contains("не кратно"),
+        "{e}"
+    );
 
     // block_count управляет объёмом раскладки: потолок, а не 1,6 млн записей (и терабайты при 4·10⁹)
     let mut x = edit();
@@ -685,15 +699,27 @@ fn reader_rejects_hostile_headers_with_errors_not_panics() {
     let mut x = edit();
     let last = x.infos.pop().unwrap().0;
     let e = load_err("missing tensor", &x.build(32));
-    assert!(e.contains("52 тензоров") && e.contains("требует 53"), "{last}: {e}");
+    assert!(
+        e.contains("52 тензоров") && e.contains("требует 53"),
+        "{last}: {e}"
+    );
     let mut x = edit();
-    x.rename("encoder.layer.1.output.dense.bias", "encoder.layer.1.output.dense.biaz");
+    x.rename(
+        "encoder.layer.1.output.dense.bias",
+        "encoder.layer.1.output.dense.biaz",
+    );
     let e = load_err("renamed tensor", &x.build(32));
-    assert!(e.contains("нет тензора encoder.layer.1.output.dense.bias"), "{e}");
+    assert!(
+        e.contains("нет тензора encoder.layer.1.output.dense.bias"),
+        "{e}"
+    );
     let mut x = edit();
     x.set_dim("encoder.layer.1.output.dense.bias", 0, 65);
     let e = load_err("wrong shape", &x.build(32));
-    assert!(e.contains("encoder.layer.1.output.dense.bias") && e.contains("раскладка требует"), "{e}");
+    assert!(
+        e.contains("encoder.layer.1.output.dense.bias") && e.contains("раскладка требует"),
+        "{e}"
+    );
 }
 
 /// NaN или Inf в весах не должны превращаться в ответ: `forward` отказывает (контроль: тот же вход на целом файле считается).
@@ -1187,6 +1213,9 @@ fn cuda_matches_the_reference_and_cpu() {
     for r in g["reject"].as_array().unwrap() {
         assert!(gpu.forward(&ids_of(&r["ids"])).is_err(), "{}", r["name"]);
     }
-    assert!(gpu.forward(&ids_of_len(513, 0)).is_err(), "513 id: pad_id + L = 514 не помещается");
+    assert!(
+        gpu.forward(&ids_of_len(513, 0)).is_err(),
+        "513 id: pad_id + L = 514 не помещается"
+    );
     assert!(gpu.resident_bytes() > 0);
 }

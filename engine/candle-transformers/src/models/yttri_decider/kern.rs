@@ -58,7 +58,10 @@ fn x86_v3_missing() -> Vec<&'static str> {
         };
     }
     // ровно набор `pulp::x86::V3` (sse, sse2 и fxsr в x86-64 есть всегда)
-    missing!("sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "bmi1", "bmi2", "fma", "lzcnt")
+    missing!(
+        "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "bmi1", "bmi2", "fma",
+        "lzcnt"
+    )
 }
 
 /// Годится ли этот CPU для `gemm` (gemm-common 0.19): он выбирает ядро по одному признаку `fma`, а само ядро строит на

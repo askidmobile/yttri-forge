@@ -442,7 +442,8 @@ mod tests {
     #[test]
     fn expected_tensor_count_matches_the_layout() {
         let four = [("a", 9), ("b", 1), ("c", 1), ("d", 53)];
-        for (layers, heads, total) in [(6, &four[..], 117), (2, &four[..], 53), (1, &four[..1], 25)] {
+        for (layers, heads, total) in [(6, &four[..], 117), (2, &four[..], 53), (1, &four[..1], 25)]
+        {
             let c = cfg(layers, heads);
             assert_eq!(tensor_specs(&c).len(), expected_tensor_count(&c));
             assert_eq!(expected_tensor_count(&c), total);

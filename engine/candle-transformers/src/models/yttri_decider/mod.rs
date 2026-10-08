@@ -91,7 +91,8 @@ impl YttriDecider {
         let g = gguf::Gguf::open(path)?;
         let engine = match device {
             Device::Cpu => {
-                kern::check_gemm_cpu().map_err(|e| candle::Error::msg(format!("yttri_decider: {e}")))?;
+                kern::check_gemm_cpu()
+                    .map_err(|e| candle::Error::msg(format!("yttri_decider: {e}")))?;
                 Engine::Lean(Box::new(lean::Lean::load(&g, isa)?))
             }
             Device::Cuda(_) => Engine::Tensor(tensor::TensorPath::load(&g, device)?),
