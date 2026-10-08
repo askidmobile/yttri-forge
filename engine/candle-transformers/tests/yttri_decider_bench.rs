@@ -9,7 +9,8 @@
 //! * `YTTRI_DECIDER_GGUF` — путь к `model.gguf` (стенд или боевая модель);
 //! * `YTTRI_DECIDER_PARITY` — необязательно: JSON эталона паритета, из него берётся поток реальных токенов (иначе id по Ципфу
 //!   от генератора — для латентности безразлично, для RSS нет: страницы таблицы эмбеддингов подгружаются по обращению);
-//! * `YTTRI_DECIDER_OUT` — куда дописать строки отчёта (JSON Lines), необязательно.
+//! * `YTTRI_DECIDER_OUT` — куда дописать строки отчёта (JSON Lines), необязательно;
+//! * `YTTRI_FORGE_REV` — ревизия forge, которую нужно записать в каждую строку отчёта (тест её не знает).
 //!
 //! Продуктовые флаги сборки (релиз Yttri идёт без `target-cpu`): `--config 'build.rustflags=[]'`.
 //!
@@ -33,7 +34,10 @@ fn gguf() -> PathBuf {
     PathBuf::from(std::env::var("YTTRI_DECIDER_GGUF").expect("не задана YTTRI_DECIDER_GGUF"))
 }
 
-fn report(line: Value) {
+fn report(mut line: Value) {
+    if let (Some(obj), Ok(rev)) = (line.as_object_mut(), std::env::var("YTTRI_FORGE_REV")) {
+        obj.insert("forge_rev".into(), json!(rev));
+    }
     println!("REPORT {line}");
     if let Ok(path) = std::env::var("YTTRI_DECIDER_OUT") {
         let mut f = std::fs::OpenOptions::new()
@@ -139,8 +143,10 @@ impl Ids {
 
 // ------------------------------------------------------------------------------------------------ память процесса
 
+/// (RSS, закоммиченная частная память) процесса, МБ. RSS на Windows и Linux включает страницы отображённого файла
+/// (таблица эмбеддингов), частная память — только кучу и стеки: по ней видна утечка.
 #[cfg(windows)]
-fn rss_mb() -> f64 {
+fn proc_mem() -> (f64, f64) {
     #[repr(C)]
     struct Pmc {
         cb: u32,
@@ -162,29 +168,43 @@ fn rss_mb() -> f64 {
         let mut p: Pmc = std::mem::zeroed();
         p.cb = std::mem::size_of::<Pmc>() as u32;
         if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut p, p.cb) == 0 {
-            return 0.0;
+            return (0.0, 0.0);
         }
-        p.working_set as f64 / 1_048_576.0
+        (
+            p.working_set as f64 / 1_048_576.0,
+            p.private as f64 / 1_048_576.0,
+        )
     }
 }
 
 #[cfg(target_os = "linux")]
-fn rss_mb() -> f64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| {
+fn proc_mem() -> (f64, f64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let kb = |key: &str| {
+        status
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| {
                 l.split_whitespace()
                     .nth(1)
                     .and_then(|v| v.parse::<f64>().ok())
             })
-        })
-        .map_or(0.0, |kb| kb / 1024.0)
+            .map_or(0.0, |kb| kb / 1024.0)
+    };
+    (kb("VmRSS:"), kb("RssAnon:"))
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
+fn proc_mem() -> (f64, f64) {
+    (0.0, 0.0)
+}
+
 fn rss_mb() -> f64 {
-    0.0
+    proc_mem().0
+}
+
+fn private_mb() -> f64 {
+    proc_mem().1
 }
 
 // ------------------------------------------------------------------------------------------------ CPU
@@ -304,4 +324,175 @@ fn bench_cpu_stability() -> Result<()> {
     Ok(())
 }
 
+/// Утечка: после прогрева (страницы таблицы, буферы потоков, кэши gemm) частная память не растёт на 5000 прогонах разной длины
+/// (норма G8, как у e5: рост ≤ 5 МБ). RSS при этом может расти: в него входят страницы таблицы, которых ещё не касались.
+#[test]
+#[ignore = "замер: release и YTTRI_DECIDER_GGUF"]
+fn bench_cpu_leak() -> Result<()> {
+    let model = YttriDecider::load(gguf(), &Device::Cpu)?;
+    let mut ids = Ids::new(model.config().vocab as u32);
+    let p = pool(4);
+    let mut rng = Lcg(0x1eaf);
+    let mut run = |n: usize| {
+        for _ in 0..n {
+            let l = 2 + rng.next() as usize % 255;
+            p.install(|| model.forward(&ids.next(l))).unwrap();
+        }
+    };
+    run(1000);
+    let (rss0, private0) = (rss_mb(), private_mb());
+    for block in 1..=5 {
+        run(1000);
+        println!(
+            "после {} прогонов: RSS {:.1} МБ, частная {:.1} МБ",
+            1000 + block * 1000,
+            rss_mb(),
+            private_mb()
+        );
+    }
+    let growth = private_mb() - private0;
+    report(
+        json!({"bench": "cpu-leak", "runs": 6000, "private_start_mb": private0, "private_end_mb": private_mb(), "private_growth_mb": growth, "rss_start_mb": rss0, "rss_end_mb": rss_mb()}),
+    );
+    assert!(
+        growth <= 5.0,
+        "частная память выросла на {growth:.1} МБ за 5000 прогонов"
+    );
+    Ok(())
+}
+
 // ------------------------------------------------------------------------------------------------ CUDA
+
+#[cfg(feature = "cuda")]
+fn vram_used_mb(dev: &Device) -> Option<f64> {
+    match dev {
+        Device::Cuda(cd) => cd
+            .cuda_stream()
+            .context()
+            .mem_get_info()
+            .ok()
+            .map(|(free, total)| (total - free) as f64 / 1_048_576.0),
+        _ => None,
+    }
+}
+
+/// Соседнее устройство №1 «уже поднимает среду» (как e5 в Yttri): decider берёт своё устройство и видит активную среду.
+#[cfg(feature = "cuda")]
+fn cuda_probe(dev: &Device) -> Result<()> {
+    let a = candle::Tensor::from_vec(vec![0.5f32; 64], (8, 8), dev)?;
+    let c = a.matmul(&a)?;
+    let _ = candle_nn::ops::softmax_last_dim(&c)?.tanh()?;
+    dev.synchronize()
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "замер: release, видеокарта NVIDIA и YTTRI_DECIDER_GGUF"]
+fn bench_cuda() -> Result<()> {
+    let rss_start = rss_mb();
+    // среда CUDA уже активна «соседом»: так decider используется в Yttri (candle_device::cuda_runtime_active())
+    let t = Instant::now();
+    let neighbour = Device::new_cuda(0)?;
+    cuda_probe(&neighbour)?;
+    let env_ms = t.elapsed().as_secs_f64() * 1e3;
+    let (rss_env, vram_env) = (rss_mb(), vram_used_mb(&neighbour));
+    println!("CUDA: среда поднята соседом за {env_ms:.0} мс, RSS {rss_start:.1} → {rss_env:.1} МБ, VRAM занято {vram_env:?} МБ");
+
+    let t = Instant::now();
+    let dev = Device::new_cuda(0)?; // своё устройство decider (отдельный контекст на ту же карту — как у моделей forge)
+    let model = YttriDecider::load(gguf(), &dev)?;
+    dev.synchronize()?;
+    let load_ms = t.elapsed().as_secs_f64() * 1e3;
+    let mut ids = Ids::new(model.config().vocab as u32);
+    let first = {
+        let x = ids.next(256);
+        let t = Instant::now();
+        model.forward(&x)?;
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    let (rss_load, vram_load) = (rss_mb(), vram_used_mb(&dev));
+    println!(
+        "CUDA: готовность {load_ms:.0} мс, первый проход L=256 {first:.1} мс; RSS {rss_env:.1} → {rss_load:.1} МБ (+{:.1}); VRAM {vram_env:?} → {vram_load:?} МБ; веса на устройстве {:.1} МБ",
+        rss_load - rss_env,
+        model.resident_bytes() as f64 / 1_048_576.0
+    );
+    report(json!({
+        "bench": "cuda-memory", "env_ms": env_ms, "load_ms": load_ms, "first_forward_ms": first, "rss_env_mb": rss_env, "rss_after_load_mb": rss_load,
+        "vram_env_mb": vram_env, "vram_after_load_mb": vram_load, "weights_mb": model.resident_bytes() as f64 / 1_048_576.0
+    }));
+
+    // подряд
+    for l in [64usize, 128, 256] {
+        for _ in 0..WARMUP {
+            model.forward(&ids.next(l))?;
+        }
+        let ms: Vec<f64> = (0..RUNS)
+            .map(|_| {
+                let x = ids.next(l);
+                let t = Instant::now();
+                model.forward(&x).unwrap();
+                t.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        let s = stats(&ms);
+        println!("LAT cuda подряд L={l:<3}  {}", s.line());
+        report(
+            json!({"bench": "cuda-consecutive", "l": l, "p50": s.p50, "p95": s.p95, "p99": s.p99, "max": s.max}),
+        );
+    }
+    // память после 600 вызовов подряд (рост относительно «после загрузки» — буферы cuBLAS и аллокатор устройства)
+    let (rss_runs, vram_runs) = (rss_mb(), vram_used_mb(&dev));
+    println!(
+        "CUDA: после замеров RSS {rss_runs:.1} МБ (+{:.1} к среде соседа), VRAM {vram_runs:?} МБ (+{:?} к среде соседа)",
+        rss_runs - rss_env,
+        vram_runs.zip(vram_env).map(|(a, b)| a - b)
+    );
+    report(
+        json!({"bench": "cuda-memory-after-runs", "rss_mb": rss_runs, "rss_delta_mb": rss_runs - rss_env, "vram_mb": vram_runs}),
+    );
+    // редкие вызовы: пауза 1 с (карта успевает сбросить такты)
+    for l in [64usize, 128, 256] {
+        let ms: Vec<f64> = (0..WARMUP + 60)
+            .map(|i| {
+                let x = ids.next(l);
+                let t = Instant::now();
+                model.forward(&x).unwrap();
+                let dt = t.elapsed().as_secs_f64() * 1e3;
+                std::thread::sleep(Duration::from_millis(1000));
+                (i, dt)
+            })
+            .filter(|(i, _)| *i >= WARMUP)
+            .map(|(_, dt)| dt)
+            .collect();
+        let s = stats(&ms);
+        println!("LAT cuda пауза 1 с L={l:<3}  {}", s.line());
+        report(
+            json!({"bench": "cuda-gap1s", "l": l, "p50": s.p50, "p95": s.p95, "p99": s.p99, "max": s.max}),
+        );
+    }
+    // после простоя ≥ 10 с: карта уходит в P8, первый вызов серии разгоняет такты заново
+    let ms: Vec<f64> = (0..20)
+        .map(|_| {
+            std::thread::sleep(Duration::from_secs(10));
+            let x = ids.next(256);
+            let t = Instant::now();
+            model.forward(&x).unwrap();
+            t.elapsed().as_secs_f64() * 1e3
+        })
+        .collect();
+    let s = stats(&ms);
+    println!(
+        "LAT cuda после простоя 10 с L=256 (20 вызовов)  {}",
+        s.line()
+    );
+    report(
+        json!({"bench": "cuda-idle10s", "l": 256, "p50": s.p50, "p95": s.p95, "p99": s.p99, "max": s.max}),
+    );
+    assert!(
+        s.p95 <= NFR_P95_MS,
+        "D-036: GPU-путь после простоя p95 {:.2} мс > {NFR_P95_MS} мс",
+        s.p95
+    );
+    drop(neighbour);
+    Ok(())
+}

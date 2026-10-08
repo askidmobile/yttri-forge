@@ -850,3 +850,42 @@ fn random_inputs_match_the_oracle() {
 }
 
 // ------------------------------------------------------------------------------------------------ CUDA
+
+/// Тензорный путь на GPU против golden и против CPU-пути. Без CUDA-устройства тест пропускается громко.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_matches_the_reference_and_cpu() {
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("SKIPPED cuda_matches_the_reference_and_cpu: устройства CUDA нет ({e})");
+            return;
+        }
+    };
+    let (g, tol) = (golden(), tolerance(&golden()));
+    let gpu = YttriDecider::load(dir().join("model.gguf"), &dev).unwrap();
+    let cpu = load_cpu();
+    assert_eq!(gpu.outputs(), cpu.outputs());
+    let rows = run_golden(&gpu, &g);
+    let worst = rows.iter().map(|r| r.1).fold(0.0, f64::max);
+    eprintln!("CUDA: max |dz| против golden = {worst:.3e}; по случаям {rows:?}");
+    for (name, dz) in &rows {
+        assert!(*dz <= tol, "CUDA {name}: {dz:e} > {tol:e}");
+    }
+    // GPU против CPU на тех же входах: оба f32, расхождение — порядок суммирования
+    let mut cross = 0f32;
+    for c in g["cases"].as_array().unwrap() {
+        let ids = ids_of(&c["ids"]);
+        let (a, b) = (gpu.forward(&ids).unwrap(), cpu.forward(&ids).unwrap());
+        for (x, y) in a.iter().flatten().zip(b.iter().flatten()) {
+            cross = cross.max((x - y).abs());
+        }
+    }
+    eprintln!("CUDA против CPU: max |dz| = {cross:.3e}");
+    assert!(cross <= 1e-4);
+    // отказы те же, что у lean
+    for r in g["reject"].as_array().unwrap() {
+        assert!(gpu.forward(&ids_of(&r["ids"])).is_err(), "{}", r["name"]);
+    }
+    assert!(gpu.resident_bytes() > 0);
+}

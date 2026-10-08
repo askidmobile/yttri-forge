@@ -11,7 +11,8 @@
 //!   "logits": {"logits_<qid>": […]}}]}` (генератор — `gen_parity.py`; состав: state_v1.json, тексты, id по Ципфу и равномерные,
 //!   `<pad>` внутри входа, граничные длины; не меньше 1000 входов);
 //! * `YTTRI_DECIDER_OUT` — куда записать отчёт (числа, без id и текста), необязательно;
-//! * `YTTRI_DECIDER_THREADS` — размер пула rayon для CPU, по умолчанию 4.
+//! * `YTTRI_DECIDER_THREADS` — размер пула rayon для CPU, по умолчанию 4;
+//! * `YTTRI_FORGE_REV` — ревизия forge, которую нужно записать в отчёт (тест её не знает).
 //!
 //! Допуски PD-052: max |Δz| ≤ 1e-3 на каждой голове, смен вердикта 0 (FR-017 допускает 2 на 1000; здесь жёстче), max |Δp| —
 //! справочно (допуск `self_check` 0,02 проверяется отдельно).
@@ -248,7 +249,7 @@ fn run(device: Device, label: &str) -> Result<()> {
     );
     if let Ok(out) = std::env::var("YTTRI_DECIDER_OUT") {
         let report = json!({
-            "device": label, "threads": if on_cpu { threads } else { 0 }, "cases": cases.len(), "model_sha256": file_sha,
+            "device": label, "forge_rev": std::env::var("YTTRI_FORGE_REV").ok(), "threads": if on_cpu { threads } else { 0 }, "cases": cases.len(), "model_sha256": file_sha,
             "tolerance": {"max_dz": MAX_DZ, "max_flips": 0}, "load_ms": load_ms,
             "forward_ms": {"p50": percentile(&ms, 0.5), "p95": percentile(&ms, 0.95)}, "heads": per_head,
         });
@@ -265,4 +266,11 @@ fn run(device: Device, label: &str) -> Result<()> {
 #[ignore = "нужны YTTRI_DECIDER_GGUF и YTTRI_DECIDER_PARITY"]
 fn parity_cpu() -> Result<()> {
     run(Device::Cpu, "cpu")
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "нужны YTTRI_DECIDER_GGUF, YTTRI_DECIDER_PARITY и видеокарта NVIDIA"]
+fn parity_cuda() -> Result<()> {
+    run(Device::new_cuda(0)?, "cuda")
 }

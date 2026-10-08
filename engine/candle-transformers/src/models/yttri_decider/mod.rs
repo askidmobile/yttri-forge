@@ -18,9 +18,13 @@
 //! # Устройства
 //!
 //! * `Device::Cpu` — lean-путь (`lean.rs`): веса f32, `gemm` напрямую, слитые ядра, AVX2+FMA с проверкой в рантайме
-//!   и запасом на базовом уровне. На i7-9700, L = 256, пул из 4 потоков: p95 ≈ 19 мс.
-//! * `Device::Cuda` — тензорный путь (`tensor.rs`). **Модуль CUDA сам не поднимает**: устройство создаёт и передаёт
-//!   вызывающий, когда среда CUDA процесса уже активна; на свежей среде это +365 МБ RSS и до 10 с на пустом JIT-кэше.
+//!   и запасом на базовом уровне. На i7-9700, L = 256, пул из 4 потоков: p50 ≈ 16 мс, p95 ≈ 18–22 мс; резидентно ≈ 47 МБ
+//!   плюс страницы таблицы эмбеддингов из отображённого файла (RSS ≈ 67 МБ после загрузки, ≈ 100 МБ после тысяч прогонов).
+//! * `Device::Cuda` — тензорный путь (`tensor.rs`), f32. **Модуль CUDA сам не поднимает**: устройство создаёт и передаёт
+//!   вызывающий, когда среда CUDA процесса уже активна; на свежей среде это +365 МБ RSS и до 10 с на пустом JIT-кэше, на
+//!   активной — около +50 МБ RSS и +40 МБ VRAM. Подряд (L = 256) проход занимает ≈ 3,2 мс, но после простоя дольше 7–8 с
+//!   видеокарта уходит в P8 (210–330 МГц) и тот же проход идёт ≈ 31 мс (p95 ≈ 35): медленнее lean-CPU, в норме p95 ≤ 40 мс.
+//!   Свойство железа: документируется, не лечится.
 //! * остальные устройства — ошибка.
 //!
 //! # Потоки
@@ -37,6 +41,7 @@
 mod gguf;
 mod kern;
 mod lean;
+mod tensor;
 
 use candle::{bail, Device, Result};
 use std::path::Path;
@@ -45,6 +50,7 @@ pub use gguf::DeciderConfig;
 
 enum Engine {
     Lean(Box<lean::Lean>),
+    Tensor(tensor::TensorPath),
 }
 
 /// Загруженный decider: веса, конфигурация и вычислитель под выбранное устройство.
@@ -75,7 +81,7 @@ impl YttriDecider {
         let g = gguf::Gguf::open(path)?;
         let engine = match device {
             Device::Cpu => Engine::Lean(Box::new(lean::Lean::load(&g, isa)?)),
-            Device::Cuda(_) => bail!("yttri_decider: путь CUDA появится отдельным шагом (C5)"),
+            Device::Cuda(_) => Engine::Tensor(tensor::TensorPath::load(&g, device)?),
             _ => bail!(
                 "yttri_decider: устройство {:?} не поддерживается (Cpu и Cuda)",
                 device.location()
@@ -109,6 +115,7 @@ impl YttriDecider {
     pub fn resident_bytes(&self) -> usize {
         match &self.engine {
             Engine::Lean(m) => m.resident_bytes(),
+            Engine::Tensor(m) => m.resident_bytes(),
         }
     }
 
@@ -133,6 +140,7 @@ impl YttriDecider {
         let mut flat = vec![0f32; cfg.total_outputs()];
         match &self.engine {
             Engine::Lean(m) => m.forward(ids, &mut flat)?,
+            Engine::Tensor(m) => m.forward(ids, &mut flat)?,
         }
         if !flat.iter().all(|v| v.is_finite()) {
             bail!("yttri_decider: логиты не конечны (NaN или Inf)");
