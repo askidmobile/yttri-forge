@@ -2,6 +2,8 @@
 # will have compiled files and executables
 debug/
 data/
+# фикстура decider (T-750, Ф3c): sha256 закреплены в тесте; без исключения `git add` молча её пропускает
+!candle-transformers/tests/data/
 dist/
 target/
 
