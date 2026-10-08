@@ -6,6 +6,11 @@
 //! Строгость — как у референсной читалки `export_gguf.read_gguf`: набор, формы и типы тензоров совпадают с
 //! раскладкой точно (лишний или недостающий тензор — отказ), согласованность `pad_id`, `max_tokens` и таблицы
 //! позиций проверяется здесь, а не в рантайме. Прочие KV игнорируются.
+//!
+//! Файл может быть враждебным или испорченным уже после сверки sha256 (клиент сверяет её до открытия), поэтому любое
+//! число из заголовка проверяется до того, как по нему что-то выделяется или складывается: отказ — всегда `Err`,
+//! а не паника и не нехватка памяти. Выравнивание данных — 32 (ключ `general.alignment` не пишется), каждый тензор
+//! начинается на кратном 32 смещении внутри файла.
 
 use super::kern;
 use candle::quantized::gguf_file::{Content, Value};
@@ -24,6 +29,13 @@ const LAYOUT: u32 = 1;
 const BLOCK: usize = 32;
 /// Байт в блоке Q8_0: f16 масштаб + 32 × int8.
 const BLOCK_BYTES: usize = 34;
+/// Потолки размеров архитектуры из KV. Настоящие значения на порядки меньше (слоёв 6, словарь 250002, ширина 384),
+/// а произведения вида vocab × hidden × 34 / 32 при потолке 2^24 укладываются в `usize` с запасом: смещения и размеры
+/// тензоров считаются без переполнения даже на заголовке из одних 0xFF.
+const MAX_LAYERS: usize = 1 << 12;
+const MAX_DIM: usize = 1 << 24;
+/// Выравнивание данных и каждого тензора по контракту §10.3.
+const ALIGNMENT: usize = 32;
 
 /// Архитектура, версии и головы из KV файла (имена полей — по ключам `yttri-decider.*`).
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +169,18 @@ fn parse_config(c: &Content) -> Result<DeciderConfig> {
     {
         bail!("gguf: нулевой размер архитектуры: {cfg:?}");
     }
+    for (what, n, max) in [
+        ("block_count", cfg.layers, MAX_LAYERS),
+        ("embedding_length", cfg.hidden, MAX_DIM),
+        ("feed_forward_length", cfg.intermediate, MAX_DIM),
+        ("attention.head_count", cfg.attention_heads, MAX_DIM),
+        ("vocab_size", cfg.vocab, MAX_DIM),
+        ("context_length", cfg.positions, MAX_DIM),
+    ] {
+        if n > max {
+            bail!("gguf: {what} = {n} больше потолка {max}");
+        }
+    }
     if !cfg.hidden.is_multiple_of(cfg.attention_heads) {
         bail!(
             "gguf: embedding_length {} не делится на attention.head_count {}",
@@ -196,6 +220,13 @@ fn parse_config(c: &Content) -> Result<DeciderConfig> {
 
 /// Тензор раскладки: имя, форма как в torch, квантован ли (Q8_0) или F32.
 type Spec = (String, Vec<usize>, bool);
+
+/// Сколько тензоров требует раскладка: 5 общих (слова, позиции, тип токена, LayerNorm ×2), по 16 на слой (шесть матриц
+/// с bias и два LayerNorm с весом и bias) и по 4 на голову (dense и out_proj с bias). Считается без выделений: с этим
+/// числом сверяется файл ДО построения [`tensor_specs`], чтобы `block_count` из заголовка не управлял памятью.
+fn expected_tensor_count(cfg: &DeciderConfig) -> usize {
+    5 + 16 * cfg.layers + 4 * cfg.heads.len()
+}
 
 fn tensor_specs(cfg: &DeciderConfig) -> Vec<Spec> {
     let (h, ff) = (cfg.hidden, cfg.intermediate);
@@ -262,14 +293,22 @@ impl Gguf {
         let mmap = unsafe { Mmap::map(&f) }
             .map_err(|e| candle::Error::msg(format!("gguf: mmap {name}: {e}")))?;
         let cfg = parse_config(&content).map_err(|e| e.context(format!("gguf: {name}")))?;
-        let specs = tensor_specs(&cfg);
-        if content.tensor_infos.len() != specs.len() {
+        if let Some(v) = content.metadata.get("general.alignment") {
+            if v.to_u32().ok() != Some(ALIGNMENT as u32) {
+                bail!("gguf: {name}: general.alignment = {v:?}, контракт — {ALIGNMENT} (ключ обычно не пишется)");
+            }
+        }
+        let want = expected_tensor_count(&cfg);
+        if content.tensor_infos.len() != want {
             bail!(
-                "gguf: {name}: {} тензоров, раскладка требует {}",
+                "gguf: {name}: {} тензоров, раскладка (block_count {}, голов {}) требует {want}",
                 content.tensor_infos.len(),
-                specs.len()
+                cfg.layers,
+                cfg.heads.len()
             );
         }
+        let specs = tensor_specs(&cfg);
+        debug_assert_eq!(specs.len(), want);
         for (tname, shape, quantized) in &specs {
             let Some(info) = content.tensor_infos.get(tname) else {
                 bail!("gguf: {name}: нет тензора {tname}");
@@ -286,7 +325,13 @@ impl Gguf {
                     info.shape.dims()
                 );
             }
-            let (start, size) = content.tensor_byte_range(tname)?;
+            // смещение не меньше начала секции данных (сумма проверенная), кратно выравниванию и данные лежат внутри файла
+            let (start, size) = content
+                .tensor_byte_range(tname)
+                .map_err(|e| e.context(format!("gguf: {name}: тензор {tname}")))?;
+            if !start.is_multiple_of(ALIGNMENT) {
+                bail!("gguf: {name}: тензор {tname}: смещение {start} не кратно {ALIGNMENT}");
+            }
             if start.checked_add(size).is_none_or(|end| end > mmap.len()) {
                 bail!("gguf: {name}: тензор {tname} выходит за пределы файла");
             }
@@ -366,5 +411,41 @@ impl Table {
         let s = self.off + id * self.row_bytes;
         kern::dequant_q8_0_row(&self.g.mmap[s..s + self.row_bytes], out);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(layers: usize, heads: &[(&str, usize)]) -> DeciderConfig {
+        DeciderConfig {
+            model_version: String::new(),
+            registry_rev: 1,
+            state_version: 1,
+            quant: "q8_0".into(),
+            layers,
+            hidden: 64,
+            intermediate: 128,
+            attention_heads: 2,
+            eps: 1e-5,
+            positions: 514,
+            vocab: 256,
+            pad_id: 1,
+            max_tokens: 256,
+            heads: heads.iter().map(|(q, n)| (q.to_string(), *n)).collect(),
+        }
+    }
+
+    /// Формула числа тензоров (ею отсекается заголовок до построения раскладки) не расходится с самой раскладкой:
+    /// 117 на боевом конфиге (6 слоёв, 4 головы, §10.3) и 53 на tiny (2 слоя, 4 головы, §10.9).
+    #[test]
+    fn expected_tensor_count_matches_the_layout() {
+        let four = [("a", 9), ("b", 1), ("c", 1), ("d", 53)];
+        for (layers, heads, total) in [(6, &four[..], 117), (2, &four[..], 53), (1, &four[..1], 25)] {
+            let c = cfg(layers, heads);
+            assert_eq!(tensor_specs(&c).len(), expected_tensor_count(&c));
+            assert_eq!(expected_tensor_count(&c), total);
+        }
     }
 }

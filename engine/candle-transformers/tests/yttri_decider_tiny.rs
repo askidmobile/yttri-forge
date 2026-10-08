@@ -19,6 +19,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -306,12 +307,17 @@ fn within(secs: u64, what: &str, work: impl FnOnce() + Send + 'static) {
     }
 }
 
-/// Вход длины `l` (`<s>`, токены, `</s>`) и его логиты, посчитанные последовательно, — эталон для параллельных вызовов.
-fn input_with_answer(m: &YttriDecider, l: usize, salt: u32) -> (Vec<u32>, Vec<Vec<f32>>) {
-    let ids: Vec<u32> = std::iter::once(0)
+/// Вход длины `l`: `<s>`, токены словаря tiny (3…202), `</s>`.
+fn ids_of_len(l: usize, salt: u32) -> Vec<u32> {
+    std::iter::once(0)
         .chain((1..l as u32 - 1).map(|i| 3 + (i * 7 + salt) % 200))
         .chain(std::iter::once(2))
-        .collect();
+        .collect()
+}
+
+/// Вход длины `l` и его логиты, посчитанные последовательно, — эталон для параллельных вызовов.
+fn input_with_answer(m: &YttriDecider, l: usize, salt: u32) -> (Vec<u32>, Vec<Vec<f32>>) {
+    let ids = ids_of_len(l, salt);
     let want = m.forward(&ids).unwrap();
     (ids, want)
 }
@@ -405,10 +411,14 @@ fn patch_str(bytes: &mut [u8], key: &str, old: &str, new: &str) {
     bytes[p + 12..p + 12 + new.len()].copy_from_slice(new.as_bytes());
 }
 
-fn write_tmp(tag: &str, bytes: &[u8]) -> PathBuf {
+/// Имя файла нейтральное (номер, а не тег случая): читалка оборачивает любую ошибку в «gguf: <путь>», и слово из тега
+/// попало бы в сообщение само — проверка причины отказа по подстроке стала бы тавтологией.
+fn write_tmp(bytes: &[u8]) -> PathBuf {
+    static N: AtomicUsize = AtomicUsize::new(0);
     let p = std::env::temp_dir().join(format!(
-        "yttri-decider-tiny-{}-{tag}.gguf",
-        std::process::id()
+        "yttri-decider-tiny-{}-{}.gguf",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::write(&p, bytes).unwrap();
     p
@@ -419,13 +429,20 @@ fn original() -> Vec<u8> {
 }
 
 fn load_err(tag: &str, bytes: &[u8]) -> String {
-    let p = write_tmp(tag, bytes);
+    let p = write_tmp(bytes);
     let r = YttriDecider::load(&p, &Device::Cpu);
     let _ = std::fs::remove_file(&p);
     match r {
         Ok(_) => panic!("{tag}: испорченный файл загрузился"),
         Err(e) => format!("{e}"),
     }
+}
+
+fn load_ok(tag: &str, bytes: &[u8]) -> YttriDecider {
+    let p = write_tmp(bytes);
+    let r = YttriDecider::load(&p, &Device::Cpu);
+    let _ = std::fs::remove_file(&p);
+    r.unwrap_or_else(|e| panic!("{tag}: контрольный файл не загрузился: {e}"))
 }
 
 #[test]
@@ -498,13 +515,209 @@ fn reader_rejects_a_broken_contract() {
     assert!(YttriDecider::load(dir().join("нет-такого.gguf"), &Device::Cpu).is_err());
 }
 
+/// Заголовок GGUF v3 в разобранном виде: KV и описания тензоров лежат сырыми байтами, данные — как есть. Позволяет
+/// править, добавлять и удалять записи и собирать файл заново с пересчётом выравнивания: так делаются испорченные копии
+/// фикстуры, которые остаются корректными GGUF во всём, кроме одной правки.
+struct Edit {
+    kvs: Vec<(String, Vec<u8>)>,   // ключ, тип (u32) и значение
+    infos: Vec<(String, Vec<u8>)>, // имя тензора, остаток описания: n_dims, измерения (u64, порядок файла), тип (u32), смещение (u64)
+    data: Vec<u8>,
+}
+
+impl Edit {
+    fn parse(b: &[u8]) -> Self {
+        let u32_at = |p: usize| u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+        let u64_at = |p: usize| u64::from_le_bytes(b[p..p + 8].try_into().unwrap()) as usize;
+        assert_eq!((&b[..4], u32_at(4)), (&b"GGUF"[..], 3), "нужен GGUF v3");
+        let (n_tensors, n_kvs) = (u64_at(8), u64_at(16));
+        let read_str = |p: &mut usize| -> String {
+            let n = u64_at(*p);
+            let s = String::from_utf8(b[*p + 8..*p + 8 + n].to_vec()).unwrap();
+            *p += 8 + n;
+            s
+        };
+        let mut p = 24;
+        let mut kvs = vec![];
+        for _ in 0..n_kvs {
+            let key = read_str(&mut p);
+            let start = p;
+            p += 4 + match u32_at(p) {
+                4..=6 => 4, // u32, i32, f32
+                8 => 8 + u64_at(p + 4),
+                t => panic!("тип KV {t}: в фикстуре только u32, i32, f32 и строки"),
+            };
+            kvs.push((key, b[start..p].to_vec()));
+        }
+        let mut infos = vec![];
+        for _ in 0..n_tensors {
+            let name = read_str(&mut p);
+            let start = p;
+            p += 4 + 8 * u32_at(p) as usize + 4 + 8;
+            infos.push((name, b[start..p].to_vec()));
+        }
+        Edit {
+            kvs,
+            infos,
+            data: b[p.next_multiple_of(32)..].to_vec(),
+        }
+    }
+
+    fn build(&self, align: usize) -> Vec<u8> {
+        let mut out = b"GGUF".to_vec();
+        out.extend(3u32.to_le_bytes());
+        out.extend((self.infos.len() as u64).to_le_bytes());
+        out.extend((self.kvs.len() as u64).to_le_bytes());
+        for (name, rest) in self.kvs.iter().chain(&self.infos) {
+            out.extend((name.len() as u64).to_le_bytes());
+            out.extend(name.as_bytes());
+            out.extend(rest);
+        }
+        out.resize(out.len().next_multiple_of(align), 0);
+        out.extend(&self.data);
+        out
+    }
+
+    fn set_u32(&mut self, key: &str, v: u32) {
+        self.kvs.retain(|(k, _)| k != key);
+        let mut raw = 4u32.to_le_bytes().to_vec();
+        raw.extend(v.to_le_bytes());
+        self.kvs.push((key.to_string(), raw));
+    }
+
+    fn info(&mut self, name: &str) -> &mut Vec<u8> {
+        &mut self
+            .infos
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("в фикстуре нет тензора {name}"))
+            .1
+    }
+
+    fn offset(&mut self, name: &str) -> u64 {
+        let r = self.info(name);
+        u64::from_le_bytes(r[r.len() - 8..].try_into().unwrap())
+    }
+
+    fn set_offset(&mut self, name: &str, off: u64) {
+        let r = self.info(name);
+        let n = r.len();
+        r[n - 8..].copy_from_slice(&off.to_le_bytes());
+    }
+
+    /// Измерение `i` (в порядке файла) одномерного или двумерного тензора.
+    fn set_dim(&mut self, name: &str, i: usize, v: u64) {
+        self.info(name)[4 + 8 * i..12 + 8 * i].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn rename(&mut self, from: &str, to: &str) {
+        assert_eq!(from.len(), to.len());
+        self.infos.iter_mut().find(|(n, _)| n == from).unwrap().0 = to.to_string();
+    }
+
+    /// Лишний F32-тензор `[1]` в конце секции данных (смещение кратно 32).
+    fn add_tensor(&mut self, name: &str) {
+        let off = self.data.len().next_multiple_of(32);
+        self.data.resize(off + 32, 0);
+        let mut rest = 1u32.to_le_bytes().to_vec(); // n_dims
+        rest.extend(1u64.to_le_bytes()); // [1]
+        rest.extend(0u32.to_le_bytes()); // F32
+        rest.extend((off as u64).to_le_bytes());
+        self.infos.push((name.to_string(), rest));
+    }
+
+    fn set_f32(&mut self, name: &str, index: usize, v: f32) {
+        let at = self.offset(name) as usize + 4 * index;
+        self.data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Испорченный заголовок — всегда `Err` с названием причины, а не паника (деление на ноль, переполнение, выделение по
+/// числу из файла) и не молчаливое чтение мимо секции данных. Файл мимо sha256-пина сюда может попасть только в обход
+/// цепочки поставки, но «ошибка, не паника» не зависит от пина. Контроли: пересборка без правки — тот же файл, а
+/// каждая ветка, где допустима правка (явное выравнивание 32), читается, — отказы вызваны правкой, а не сборщиком.
+#[test]
+fn reader_rejects_hostile_headers_with_errors_not_panics() {
+    let ok = original();
+    let edit = || Edit::parse(&ok);
+    assert_eq!(edit().build(32), ok, "пересборка без правок должна давать тот же файл");
+    let mut x = edit();
+    x.set_u32("general.alignment", 32);
+    load_ok("alignment = 32", &x.build(32));
+
+    // general.alignment = 0: деление на ноль в читалке candle до всех проверок модуля
+    let mut x = edit();
+    x.set_u32("general.alignment", 0);
+    assert!(load_err("alignment 0", &x.build(32)).contains("general.alignment"));
+    // иное выравнивание сдвигало бы секцию данных молча; контракт — 32
+    let mut x = edit();
+    x.set_u32("general.alignment", 64);
+    let e = load_err("alignment 64", &x.build(64));
+    assert!(e.contains("general.alignment") && e.contains("32"), "{e}");
+
+    // смещение тензора: сумма с началом секции данных переполняет u64 (debug паниковал, release заворачивал)
+    let mut x = edit();
+    x.set_offset("embeddings.LayerNorm.bias", 0xFFFF_FFFF_FFFF_FFF0);
+    let e = load_err("offset wrap", &x.build(32));
+    assert!(e.contains("embeddings.LayerNorm.bias") && e.contains("overflow"), "{e}");
+    // смещение внутри файла, но не кратное 32
+    let mut x = edit();
+    let off = x.offset("embeddings.LayerNorm.bias");
+    x.set_offset("embeddings.LayerNorm.bias", off + 16);
+    let e = load_err("offset unaligned", &x.build(32));
+    assert!(e.contains("embeddings.LayerNorm.bias") && e.contains("не кратно"), "{e}");
+
+    // block_count управляет объёмом раскладки: потолок, а не 1,6 млн записей (и терабайты при 4·10⁹)
+    let mut x = edit();
+    x.set_u32("yttri-decider.block_count", 100_000);
+    let e = load_err("layers 100000", &x.build(32));
+    assert!(e.contains("block_count") && e.contains("потолка"), "{e}");
+    // в пределах потолка, но файл столько тензоров не содержит: отказ по числу, раскладка не строится
+    let mut x = edit();
+    x.set_u32("yttri-decider.block_count", 4000);
+    let e = load_err("layers 4000", &x.build(32));
+    assert!(e.contains("53 тензоров") && e.contains("64021"), "{e}");
+
+    // раскладка точна: лишний, недостающий, переименованный тензор и неверная форма — отказ
+    let mut x = edit();
+    x.add_tensor("embeddings.position_ids");
+    let e = load_err("extra tensor", &x.build(32));
+    assert!(e.contains("54 тензоров") && e.contains("требует 53"), "{e}");
+    let mut x = edit();
+    let last = x.infos.pop().unwrap().0;
+    let e = load_err("missing tensor", &x.build(32));
+    assert!(e.contains("52 тензоров") && e.contains("требует 53"), "{last}: {e}");
+    let mut x = edit();
+    x.rename("encoder.layer.1.output.dense.bias", "encoder.layer.1.output.dense.biaz");
+    let e = load_err("renamed tensor", &x.build(32));
+    assert!(e.contains("нет тензора encoder.layer.1.output.dense.bias"), "{e}");
+    let mut x = edit();
+    x.set_dim("encoder.layer.1.output.dense.bias", 0, 65);
+    let e = load_err("wrong shape", &x.build(32));
+    assert!(e.contains("encoder.layer.1.output.dense.bias") && e.contains("раскладка требует"), "{e}");
+}
+
+/// NaN или Inf в весах не должны превращаться в ответ: `forward` отказывает (контроль: тот же вход на целом файле считается).
+#[test]
+fn non_finite_logits_are_an_error() {
+    let ok = original();
+    let m = load_ok("целый файл", &ok);
+    assert!(m.forward(&[0, 100, 2]).is_ok());
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut x = Edit::parse(&ok);
+        x.set_f32("heads.mail_needs_attention.out_proj.bias", 0, bad);
+        let m = load_ok("bias не конечен", &x.build(32));
+        let e = m.forward(&[0, 100, 2]).unwrap_err().to_string();
+        assert!(e.contains("не конечны"), "{bad}: {e}");
+    }
+}
+
 #[test]
 fn eps_comes_from_the_file() {
     // боевой eps 1e-5 в той же модели: каждый из 14 входов обязан разойтись с golden заметно больше допуска (§10.9: ×28)
     let (g, tol) = (golden(), tolerance(&golden()));
     let mut b = original();
     patch_f32(&mut b, "yttri-decider.attention.layer_norm_epsilon", 1e-5);
-    let p = write_tmp("eps-1e-5", &b);
+    let p = write_tmp(&b);
     let m = YttriDecider::load(&p, &Device::Cpu).unwrap();
     let _ = std::fs::remove_file(&p);
     assert!((m.config().eps - 1e-5).abs() < 1e-12);
@@ -956,11 +1169,24 @@ fn cuda_matches_the_reference_and_cpu() {
             cross = cross.max((x - y).abs());
         }
     }
+    // входы длиннее max_tokens (257…512: вне входного контракта, но в пределах таблицы позиций) — на тензорном пути тоже
+    for l in [257usize, 300, 512] {
+        let ids = ids_of_len(l, l as u32);
+        let (a, b) = (gpu.forward(&ids).unwrap(), cpu.forward(&ids).unwrap());
+        let d = a
+            .iter()
+            .flatten()
+            .zip(b.iter().flatten())
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        eprintln!("CUDA против CPU, L = {l}: max |dz| = {d:.3e}");
+        cross = cross.max(d);
+    }
     eprintln!("CUDA против CPU: max |dz| = {cross:.3e}");
     assert!(cross <= 1e-4);
     // отказы те же, что у lean
     for r in g["reject"].as_array().unwrap() {
         assert!(gpu.forward(&ids_of(&r["ids"])).is_err(), "{}", r["name"]);
     }
+    assert!(gpu.forward(&ids_of_len(513, 0)).is_err(), "513 id: pad_id + L = 514 не помещается");
     assert!(gpu.resident_bytes() > 0);
 }

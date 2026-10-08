@@ -195,8 +195,14 @@ impl TensorInfo {
             )
         }
         let size_in_bytes = tensor_elems / block_size * self.ggml_dtype.type_size();
-        let start = (tensor_data_offset + self.offset) as usize;
-        Ok((start, size_in_bytes))
+        // смещение приходит из файла: переполнение суммы не должно ни паниковать (debug), ни молча заворачиваться (release)
+        let Some(start) = tensor_data_offset.checked_add(self.offset) else {
+            crate::bail!(
+                "gguf: tensor offset {} overflows the data section start {tensor_data_offset}",
+                self.offset
+            )
+        };
+        Ok((start as usize, size_in_bytes))
     }
 }
 
@@ -638,6 +644,10 @@ impl Content {
             Some(Value::I32(v)) if *v >= 0 => *v as u64,
             _ => DEFAULT_ALIGNMENT,
         };
+        // нулевое выравнивание из файла: div_ceil(0) паниковал бы до всяких проверок потребителя
+        if alignment == 0 {
+            crate::bail!("gguf: general.alignment = 0")
+        }
         let tensor_data_offset = position.div_ceil(alignment) * alignment;
         Ok(Self {
             magic,
