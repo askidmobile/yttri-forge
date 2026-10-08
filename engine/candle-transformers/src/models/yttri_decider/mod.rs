@@ -20,6 +20,10 @@
 //! * `Device::Cpu` — lean-путь (`lean.rs`): веса f32, `gemm` напрямую, слитые ядра, AVX2+FMA с проверкой в рантайме
 //!   и запасом на базовом уровне. На i7-9700, L = 256, пул из 4 потоков: p50 ≈ 16 мс, p95 ≈ 18–22 мс; резидентно ≈ 47 МБ
 //!   плюс страницы таблицы эмбеддингов из отображённого файла (RSS ≈ 67 МБ после загрузки, ≈ 100 МБ после тысяч прогонов).
+//!   `gemm` выбирает ядро сам и по одному признаку: есть FMA — ядро x86-64-v3 (AVX2, BMI2…), иначе скалярное (SIMD-ширина 1,
+//!   не SSE2). CPU с FMA, но без остального v3 отклоняется на загрузке (иначе паника `gemm` в каждом `forward`). Без FMA
+//!   считает верно, но медленно: на трансляции без AVX/FMA (Rosetta 2) L = 256 даёт p95 ≈ 75 мс на пуле из 4 потоков и
+//!   ≈ 140 мс на пуле из 2, то есть D-032 там не выполняется; политику для таких CPU решает G8.
 //! * `Device::Cuda` — тензорный путь (`tensor.rs`), f32. **Модуль CUDA сам не поднимает**: устройство создаёт и передаёт
 //!   вызывающий, когда среда CUDA процесса уже активна; на свежей среде это +365 МБ RSS и до 10 с на пустом JIT-кэше, на
 //!   активной — +48 МБ RSS после загрузки и около +70 МБ после сотен прогонов, +40 МБ VRAM (веса 43 МБ). Подряд (L = 256)
@@ -75,8 +79,9 @@ impl YttriDecider {
         Self::load_with(path.as_ref(), device, kern::best_isa())
     }
 
-    /// Как [`load`](Self::load), но ядра CPU-пути на базовом уровне инструкций (SSE2 на x86-64) даже там, где есть AVX2:
-    /// для проверки запасного варианта на машине с AVX2. `gemm` выбирает набор инструкций сам и этим не управляется.
+    /// Как [`load`](Self::load), но собственные ядра CPU-пути (GELU, softmax, LayerNorm, деквантизация) на базовом уровне
+    /// инструкций (SSE2 на x86-64) даже там, где есть AVX2: для проверки запасного варианта на машине с AVX2.
+    /// `gemm` выбирает набор инструкций сам и этим не управляется.
     #[doc(hidden)]
     pub fn load_with_baseline_kernels(path: impl AsRef<Path>, device: &Device) -> Result<Self> {
         Self::load_with(path.as_ref(), device, kern::Isa::Base)
@@ -85,7 +90,10 @@ impl YttriDecider {
     fn load_with(path: &Path, device: &Device, isa: kern::Isa) -> Result<Self> {
         let g = gguf::Gguf::open(path)?;
         let engine = match device {
-            Device::Cpu => Engine::Lean(Box::new(lean::Lean::load(&g, isa)?)),
+            Device::Cpu => {
+                kern::check_gemm_cpu().map_err(|e| candle::Error::msg(format!("yttri_decider: {e}")))?;
+                Engine::Lean(Box::new(lean::Lean::load(&g, isa)?))
+            }
             Device::Cuda(_) => Engine::Tensor(tensor::TensorPath::load(&g, device)?),
             _ => bail!(
                 "yttri_decider: устройство {:?} не поддерживается (Cpu и Cuda)",

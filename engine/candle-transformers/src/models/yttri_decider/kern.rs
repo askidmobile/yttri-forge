@@ -49,6 +49,40 @@ pub(crate) fn best_isa() -> Isa {
     }
 }
 
+/// Признаки x86-64-v3, которых нет на этом CPU (пусто на не-x86-64).
+#[cfg(target_arch = "x86_64")]
+fn x86_v3_missing() -> Vec<&'static str> {
+    macro_rules! missing {
+        ($($f:tt),*) => {
+            [$((!std::is_x86_feature_detected!($f)).then_some($f)),*].into_iter().flatten().collect()
+        };
+    }
+    // ровно набор `pulp::x86::V3` (sse, sse2 и fxsr в x86-64 есть всегда)
+    missing!("sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "bmi1", "bmi2", "fma", "lzcnt")
+}
+
+/// Годится ли этот CPU для `gemm` (gemm-common 0.19): он выбирает ядро по одному признаку `fma`, а само ядро строит на
+/// `pulp::x86::V3` и в каждом вызове делает `V3::try_new().unwrap()`. На CPU с FMA, но без AVX2/BMI2 (AMD Piledriver,
+/// ВМ с замаскированным AVX2) это паника посреди `forward` при успешной загрузке, поэтому отказываем на загрузке.
+/// Без FMA `gemm` идёт скалярным ядром (SIMD-ширина 1, не SSE2): верно, но медленно — решение за G8, здесь не отказ.
+pub(crate) fn check_gemm_cpu() -> Result<(), String> {
+    #[cfg(target_arch = "x86_64")]
+    return gemm_cpu_verdict(std::is_x86_feature_detected!("fma"), &x86_v3_missing());
+    #[cfg(not(target_arch = "x86_64"))]
+    Ok(())
+}
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn gemm_cpu_verdict(fma: bool, missing: &[&str]) -> Result<(), String> {
+    if fma && !missing.is_empty() {
+        return Err(format!(
+            "у CPU есть FMA, но нет {}: gemm выберет ядро x86-64-v3 и будет паниковать в каждом вызове",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 #[inline(always)]
 fn fma<const F: bool>(a: f32, b: f32, c: f32) -> f32 {
     // F = true только внутри функций с `target_feature = "fma"`: иначе `mul_add` уходит в медленный libm
@@ -575,5 +609,16 @@ mod tests {
             assert_eq!(out[i], 0.5 * i as f32);
             assert_eq!(out[32 + i], 2.0 * (-16 + i as i32) as f32);
         }
+    }
+
+    #[test]
+    fn gemm_cpu_verdict_rejects_fma_without_v3_only() {
+        // нет FMA: gemm скалярный, отказа нет, чего бы ни не хватало
+        assert!(gemm_cpu_verdict(false, &["avx2", "fma"]).is_ok());
+        // FMA и весь v3
+        assert!(gemm_cpu_verdict(true, &[]).is_ok());
+        // FMA без AVX2 и BMI2: паника gemm на каждом вызове, отказ называет недостающее
+        let e = gemm_cpu_verdict(true, &["avx2", "bmi2"]).unwrap_err();
+        assert!(e.contains("avx2, bmi2"), "{e}");
     }
 }
