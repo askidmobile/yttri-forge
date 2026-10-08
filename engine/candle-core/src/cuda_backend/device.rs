@@ -66,6 +66,7 @@ pub struct CudaDevice {
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
+    pub(crate) q81_scratch: Arc<crate::quantized::cuda::Q81ScratchPool>,
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -465,6 +466,7 @@ impl CudaDevice {
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
+            q81_scratch: Arc::new(crate::quantized::cuda::Q81ScratchPool::default()),
         })
     }
 }
