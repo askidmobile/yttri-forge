@@ -1,0 +1,5 @@
+# Фикстуры decider на GGUF (T-750, D-035): sha256 файла и golden.json сверяют тесты трёх репозиториев
+# (Yttri, yttri-forge, yttri-decider), поэтому байты не трогаем: .gguf без преобразований концов строк,
+# golden.json — LF на любом чекауте (autocrlf на Windows меняла бы файл и его sha256).
+*.gguf -text
+golden.json text eol=lf
