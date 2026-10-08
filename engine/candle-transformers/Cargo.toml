@@ -17,6 +17,7 @@ candle-flash-attn = { workspace = true, optional = true }
 candle-metal-kernels = { workspace = true, optional = true }
 candle-nn = { workspace = true }
 fancy-regex = { workspace = true }
+gemm = { workspace = true }
 intel-mkl-src = { workspace = true, optional = true }
 memmap2 = { workspace = true }
 num-traits = { workspace = true }

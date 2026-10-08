@@ -138,4 +138,5 @@ pub mod with_tracing;
 pub mod wuerstchen;
 pub mod xlm_roberta;
 pub mod yi;
+pub mod yttri_decider;
 pub mod z_image;
