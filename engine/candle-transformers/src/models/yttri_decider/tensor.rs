@@ -12,7 +12,7 @@
 use super::gguf::{DeciderConfig, Gguf, Table};
 use candle::{bail, Device, Result, Tensor};
 use candle_nn::ops::{layer_norm, softmax_last_dim};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Линейный слой с весом, сохранённым как `[in, out]` (транспонированный вид: cuBLAS читает его без копии).
 struct Lin {
@@ -59,6 +59,9 @@ pub(super) struct TensorPath {
     layers: Vec<Layer>,
     heads: Vec<Head>,
     resident: usize,
+    /// Вызовы одной модели идут по очереди: одно устройство и общий handle cuBLAS. Замок держится на весь `forward` без
+    /// риска для пула rayon: на этом пути rayon не используется (ядра CUDA и копии), вложенных ожиданий нет.
+    lock: Mutex<()>,
 }
 
 /// Матрица (Q8_0, деквантуется на хосте, или F32) + bias на устройство; `scale` домножает и то, и другое
@@ -180,6 +183,7 @@ impl TensorPath {
             layers,
             heads,
             resident,
+            lock: Mutex::new(()),
         })
     }
 
@@ -208,6 +212,8 @@ impl TensorPath {
 
     /// Логиты всех голов подряд в `out`. Вход уже проверен (`YttriDecider::forward`).
     pub(super) fn forward(&self, ids: &[u32], out: &mut [f32]) -> Result<()> {
+        // в замке нет состояния, паника прежнего вызова ему не мешает
+        let _turn = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let (l, hid) = (ids.len(), self.hid);
         let mut x = vec![0f32; l * hid];
         let mut n = 0u32;

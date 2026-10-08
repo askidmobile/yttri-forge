@@ -5,7 +5,8 @@
 //! Веса — f32, деквантованы из Q8_0 при загрузке (`QMatMul` отклонён: в 7,6 раза медленнее и Δz 4,2e-2 при допуске 1e-3).
 //!
 //! Потоки — от вызывающего: все параллельные операции (rayon, `gemm` с `Parallelism::Rayon(0)`) идут в текущем пуле,
-//! то есть в том, внутри которого вызвали `forward` (`ThreadPool::install`); вне пула — в глобальном.
+//! то есть в том, внутри которого вызвали `forward` (`ThreadPool::install`); вне пула — в глобальном. Параллельные
+//! вызовы не мешают друг другу: рабочее пространство у каждого своё, общего замка на вычисление нет (см. `Lean::ws`).
 
 use super::gguf::{DeciderConfig, Gguf, Table};
 use super::kern::{self, Isa};
@@ -102,8 +103,16 @@ pub(super) struct Lean {
     dense_b: Vec<f32>,
     heads: Vec<Head>,
     table: Table,
-    ws: Mutex<Ws>,
+    /// Свободные рабочие пространства. Замок берётся только на «взять» и «вернуть», поверх вычисления его держать нельзя:
+    /// внутри идут вложенные операции rayon, и рабочий поток пула, который их ждёт, берёт из очереди чужое задание —
+    /// например, второй `pool.install(|| forward)`. Оно ждало бы тот же замок, который держит первый вызов, и пул вставал
+    /// навсегда. Параллельные вызовы получают каждый своё пространство (нет свободного — создаётся новое).
+    ws: Mutex<Vec<Ws>>,
 }
+
+/// Сколько свободных рабочих пространств хранить: штатный вызов один, второй бывает при наложении (вызов, не
+/// дождавшийся ответа по таймауту, ещё считается, а следующий уже вошёл); лишние освобождаются в конце вызова.
+const SPARE_WS: usize = 2;
 
 #[derive(Clone, Copy)]
 struct SendPtr(*mut f32);
@@ -233,12 +242,12 @@ impl Lean {
             dense_b,
             heads,
             table: g.table()?,
-            ws: Mutex::new(Ws::new()),
+            ws: Mutex::new(Vec::new()),
         };
         // штатный вход (до max_tokens) считается без аллокаций; более длинный — растит рабочее пространство
         let mut ws = Ws::new();
         ws.ensure(&m, cfg.max_tokens);
-        m.ws = Mutex::new(ws);
+        m.ws = Mutex::new(vec![ws]);
         Ok(m)
     }
 
@@ -264,24 +273,37 @@ impl Lean {
                 + l.ln1_b.len();
             n += l.w1.len() + l.b1.len() + l.w2.len() + l.b2.len() + l.ln2_g.len() + l.ln2_b.len();
         }
-        let ws = self.ws.lock().unwrap_or_else(|e| e.into_inner());
-        n += ws.x.len()
-            + ws.qkv.len()
-            + ws.ctx.len()
-            + ws.tmp.len()
-            + ws.ffn.len()
-            + ws.sc.len()
-            + ws.z.len()
-            + ws.pos.len();
+        // пространства вызовов, идущих в этот момент, из списка взяты и здесь не видны
+        for ws in self.ws.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            n += ws.x.len()
+                + ws.qkv.len()
+                + ws.ctx.len()
+                + ws.tmp.len()
+                + ws.ffn.len()
+                + ws.sc.len()
+                + ws.z.len()
+                + ws.pos.len();
+        }
         n * 4
     }
 
     /// Логиты всех голов подряд в `out`. Вход уже проверен (`YttriDecider::forward`): 1 ≤ L, id < vocab, pad_id + L < positions.
+    /// Вызовы из нескольких потоков идут параллельно: у каждого своё рабочее пространство, общего замка на вычисление нет.
     pub(super) fn forward(&self, ids: &[u32], out: &mut [f32]) -> Result<()> {
+        // Буферы целиком перезаписываются на каждом проходе, поэтому пространство после ошибки годится как есть; после паники
+        // оно просто не возвращается в список (замок при этом не держится, отравиться ему нечем).
+        let popped = self.ws.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let mut ws = popped.unwrap_or_else(Ws::new);
+        let r = self.forward_with(&mut ws, ids, out);
+        let mut spare = self.ws.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.len() < SPARE_WS {
+            spare.push(ws);
+        }
+        r
+    }
+
+    fn forward_with(&self, ws: &mut Ws, ids: &[u32], out: &mut [f32]) -> Result<()> {
         let (l, hid, isa, eps) = (ids.len(), self.hid, self.isa, self.eps);
-        // буферы целиком перезаписываются на каждом проходе: после паники прежнего вызова мьютекс можно брать как есть
-        let mut guard = self.ws.lock().unwrap_or_else(|e| e.into_inner());
-        let ws = &mut *guard;
         ws.ensure(self, l);
 
         // позиции HF: cumsum(ids != pad) · (ids != pad) + pad; литерал <pad> занимает позицию pad и не сдвигает счёт

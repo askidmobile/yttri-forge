@@ -7,7 +7,8 @@
 //! `golden.json` дрейфуют вместе, поэтому хеш из самого golden пару не проверяет).
 //!
 //! Проверяется: хеши, golden на 14 входах (допуск `max_abs_dz` 2e-4 из файла) на обоих наборах ядер, отказы на четырёх
-//! `reject` и на соседних граничных входах, повторяемость при разных пулах потоков и при параллельных вызовах,
+//! `reject` и на соседних граничных входах, повторяемость при разных пулах потоков и при параллельных вызовах
+//! (в том числе `pool.install` из нескольких потоков на одном пуле — со сторожем от взаимной блокировки),
 //! строгость читалки на испорченных копиях файла и **чувствительность самого golden** к eps / GELU / позициям /
 //! маске по `<pad>` — на независимом эталоне (naive f64, читает те же байты файла).
 
@@ -18,7 +19,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 const MODEL_SHA256: &str = "71c184ccc00ff07bb57319612cb3da9ad55196d29c37bb989f5dce1328a601e2";
 const GOLDEN_SHA256: &str = "a5f50db4e5439023ead2a9b494ed4ee1a537bc1f5cbe4c63a226ab54052e4e15";
@@ -286,6 +288,79 @@ fn parallel_callers_share_one_model() {
     for th in threads {
         th.join().unwrap();
     }
+}
+
+/// Сторож: работа идёт в отдельном потоке, тест ждёт её не дольше `secs`. Зависание пула rayon иначе неотличимо от долгого
+/// теста — процесс просто молчит. Паника внутри работы пробрасывается как есть.
+fn within(secs: u64, what: &str, work: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = mpsc::channel();
+    let th = std::thread::spawn(move || {
+        work();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{what}: не завершилось за {secs} с (взаимная блокировка пула?)")
+        }
+        _ => th.join().unwrap(),
+    }
+}
+
+/// Вход длины `l` (`<s>`, токены, `</s>`) и его логиты, посчитанные последовательно, — эталон для параллельных вызовов.
+fn input_with_answer(m: &YttriDecider, l: usize, salt: u32) -> (Vec<u32>, Vec<Vec<f32>>) {
+    let ids: Vec<u32> = std::iter::once(0)
+        .chain((1..l as u32 - 1).map(|i| 3 + (i * 7 + salt) % 200))
+        .chain(std::iter::once(2))
+        .collect();
+    let want = m.forward(&ids).unwrap();
+    (ids, want)
+}
+
+fn same_logits(got: &[Vec<f32>], want: &[Vec<f32>]) -> bool {
+    got.iter()
+        .flatten()
+        .zip(want.iter().flatten())
+        .all(|(a, b)| (a - b).abs() < 1e-5)
+}
+
+/// Документированный вызов — `pool.install(|| model.forward(..))` — из нескольких потоков на ОДНОМ пуле. Замок поверх
+/// вычисления тут вставал навсегда: рабочий поток пула, ждущий вложенные задачи, брал из очереди чужой `install`, а тот
+/// ждал замок первого вызова. Сторож: без него провал выглядел бы как зависший тест.
+#[test]
+fn install_from_many_threads_on_one_pool_does_not_hang() {
+    let m = Arc::new(load_cpu());
+    let base = m.resident_bytes();
+    let pool = Arc::new(pool(4));
+    let inputs: Arc<Vec<_>> = Arc::new(
+        [(32, 1), (64, 2), (100, 3), (128, 4), (200, 5), (256, 6)]
+            .iter()
+            .map(|&(l, salt)| input_with_answer(&m, l, salt))
+            .collect(),
+    );
+    let m2 = m.clone();
+    within(60, "pool.install из 6 потоков на пуле из 4", move || {
+        let callers: Vec<_> = (0..6)
+            .map(|t| {
+                let (m, pool, inputs) = (m2.clone(), pool.clone(), inputs.clone());
+                std::thread::spawn(move || {
+                    for i in 0..100 {
+                        let (ids, want) = &inputs[(i + t) % inputs.len()];
+                        let got = pool.install(|| m.forward(ids)).unwrap();
+                        assert!(same_logits(&got, want), "поток {t}, вызов {i}");
+                    }
+                })
+            })
+            .collect();
+        for c in callers {
+            c.join().unwrap();
+        }
+    });
+    // свободных рабочих пространств хранится не больше двух: после всплеска параллельных вызовов память не раздувается
+    assert!(
+        m.resident_bytes() < 3 * base,
+        "{} байт после всплеска против {base} до",
+        m.resident_bytes()
+    );
 }
 
 // ------------------------------------------------------------------------------------------------ строгость читалки
