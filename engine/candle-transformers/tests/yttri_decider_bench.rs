@@ -9,14 +9,21 @@
 //! * `YTTRI_DECIDER_GGUF` — путь к `model.gguf` (стенд или боевая модель);
 //! * `YTTRI_DECIDER_PARITY` — необязательно: JSON эталона паритета, из него берётся поток реальных токенов (иначе id по Ципфу
 //!   от генератора — для латентности безразлично, для RSS нет: страницы таблицы эмбеддингов подгружаются по обращению);
-//! * `YTTRI_DECIDER_OUT` — куда дописать строки отчёта (JSON Lines), необязательно;
-//! * `YTTRI_FORGE_REV` — ревизия forge, которую нужно записать в каждую строку отчёта (тест её не знает).
+//! * `YTTRI_DECIDER_OUT` — куда записать строки отчёта (JSON Lines), необязательно; файл усекается на первой записи
+//!   процесса, дописывается дальше;
+//! * `YTTRI_FORGE_REV` — ревизия forge для каждой строки отчёта (тест её не знает); **обязательна, если задан
+//!   `YTTRI_DECIDER_OUT`**: строка без ревизии не привязана к коду.
 //!
-//! Продуктовые флаги сборки (релиз Yttri идёт без `target-cpu`): `--config 'build.rustflags=[]'`.
+//! Продуктовые флаги сборки (релиз Yttri идёт без `target-cpu`): `--config 'build.rustflags=[]'`. Каждый замер — отдельный
+//! процесс, один на устройстве и CPU (`--exact --test-threads 1`, как требует `engine/AGENTS.md`): фильтр `bench_cpu` без
+//! `--exact` совпал бы по подстроке ещё и с `bench_cpu_stability` и `bench_cpu_leak`, и libtest запустил бы все три
+//! параллельно — замер D-032 шёл бы под фоном соседей.
 //!
 //! ```text
-//! cargo test -p candle-transformers --release --config 'build.rustflags=[]' --test yttri_decider_bench bench_cpu -- --ignored --nocapture
-//! cargo test -p candle-transformers --release --features cuda --config 'build.rustflags=[]' --test yttri_decider_bench bench_cuda -- --ignored --nocapture
+//! cargo test -p candle-transformers --release --config 'build.rustflags=[]' --test yttri_decider_bench -- --ignored --nocapture --exact bench_cpu --test-threads 1
+//! cargo test -p candle-transformers --release --config 'build.rustflags=[]' --test yttri_decider_bench -- --ignored --nocapture --exact bench_cpu_stability --test-threads 1
+//! cargo test -p candle-transformers --release --config 'build.rustflags=[]' --test yttri_decider_bench -- --ignored --nocapture --exact bench_cpu_leak --test-threads 1
+//! cargo test -p candle-transformers --release --features cuda --config 'build.rustflags=[]' --test yttri_decider_bench -- --ignored --nocapture --exact bench_cuda --test-threads 1
 //! ```
 
 use candle::{Device, Result};
@@ -24,6 +31,9 @@ use candle_transformers::models::yttri_decider::YttriDecider;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const WARMUP: usize = 10;
@@ -34,17 +44,26 @@ fn gguf() -> PathBuf {
     PathBuf::from(std::env::var("YTTRI_DECIDER_GGUF").expect("не задана YTTRI_DECIDER_GGUF"))
 }
 
+/// Строка отчёта: на экран и, если задан `YTTRI_DECIDER_OUT`, в файл (первая запись процесса его усекает). Ревизия forge
+/// нужна, только когда пишется файл: прежние файлы отчётов копили строки без неё рядом со свежими, и числа документации
+/// брались из строк неизвестной ревизии.
 fn report(mut line: Value) {
-    if let (Some(obj), Ok(rev)) = (line.as_object_mut(), std::env::var("YTTRI_FORGE_REV")) {
+    let rev = std::env::var("YTTRI_FORGE_REV").ok();
+    if let (Some(obj), Some(rev)) = (line.as_object_mut(), &rev) {
         obj.insert("forge_rev".into(), json!(rev));
     }
     println!("REPORT {line}");
     if let Ok(path) = std::env::var("YTTRI_DECIDER_OUT") {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .unwrap();
+        assert!(
+            rev.is_some(),
+            "задан YTTRI_DECIDER_OUT, а YTTRI_FORGE_REV нет: строка отчёта без ревизии forge не принимается"
+        );
+        static FIRST: AtomicBool = AtomicBool::new(true);
+        let mut f = if FIRST.swap(false, Ordering::Relaxed) {
+            std::fs::File::create(path).unwrap()
+        } else {
+            std::fs::OpenOptions::new().append(true).open(path).unwrap()
+        };
         writeln!(f, "{line}").unwrap();
     }
 }
@@ -277,8 +296,32 @@ fn bench_cpu() -> Result<()> {
     Ok(())
 }
 
-/// Устойчивость при L = 256 и 4 потоках: пауза между вызовами (письма приходят по одному) и фоновая арифметика на соседних потоках
-/// (остальная нагрузка приложения). Тот же сценарий, что в S0a.
+/// Фон — синтетические потоки на обычном приоритете, тот же генератор, что в S0a (`bench/src/main.rs`, `sweep --bg`):
+/// цепочка умножение-сложение, флаг остановки проверяется раз в 2000 шагов.
+fn spawn_background(n: usize, stop: &Arc<AtomicBool>) -> Vec<JoinHandle<()>> {
+    (0..n)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut x = 1.0f64;
+                while !stop.load(Ordering::Relaxed) {
+                    for _ in 0..2000 {
+                        x = x * 1.000_000_1 + 1e-9;
+                    }
+                    std::hint::black_box(x);
+                }
+            })
+        })
+        .collect()
+}
+
+/// Устойчивость при L = 256 и 4 потоках: пауза между вызовами (письма приходят по одному) и фоновая арифметика на соседних
+/// потоках (остальная нагрузка приложения), тот же сценарий и генератор фона, что в S0a.
+///
+/// Норма D-032 (p95 ≤ 40 мс) проверяется при 2 и 4 занятых фоновых потоках (на 8 ядрах это 6 и 8 потоков в сумме). При 6
+/// фоновых потоках (10 потоков на 8 ядер) её не гарантирует никто: хвост задаёт самый медленный из потоков пула, статически
+/// поделивших работу `gemm`, и вытесненный ОС поток задерживает весь проход (на i7-9700 замерено p95 39–56 мс, S0a: 38,4 в
+/// одиночной выборке из этого разброса). Это число только печатается; политика размера пула на занятой машине — G5.
 #[test]
 #[ignore = "замер: release и YTTRI_DECIDER_GGUF"]
 fn bench_cpu_stability() -> Result<()> {
@@ -294,32 +337,27 @@ fn bench_cpu_stability() -> Result<()> {
     ));
     println!("LAT cpu 4 потока L=256, пауза 200 мс  {}", s.line());
     report(json!({"bench": "cpu-gap200", "p50": s.p50, "p95": s.p95, "p99": s.p99}));
+    let mut under_nfr = Vec::new();
     for bg in [2usize, 4, 6] {
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let workers: Vec<_> = (0..bg)
-            .map(|_| {
-                let stop = stop.clone();
-                std::thread::spawn(move || {
-                    let mut x = 1.000_001f64;
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        for _ in 0..10_000 {
-                            x = (x * 1.000_000_1).sin().abs() + 1.0;
-                        }
-                    }
-                    x
-                })
-            })
-            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers = spawn_background(bg, &stop);
         let s = stats(&measure_cpu(&model, &mut ids, &p, 256, Duration::ZERO));
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        workers.into_iter().for_each(|w| {
-            w.join().unwrap();
-        });
+        stop.store(true, Ordering::Relaxed);
+        workers.into_iter().for_each(|w| w.join().unwrap());
         println!(
             "LAT cpu 4 потока L=256, +{bg} фоновых потоков  {}",
             s.line()
         );
         report(json!({"bench": format!("cpu-bg{bg}"), "p50": s.p50, "p95": s.p95, "p99": s.p99}));
+        if bg <= 4 {
+            under_nfr.push((bg, s.p95));
+        }
+    }
+    for (bg, p95) in under_nfr {
+        assert!(
+            p95 <= NFR_P95_MS,
+            "D-032: p95 {p95:.2} мс > {NFR_P95_MS} мс при {bg} фоновых потоках (L = 256, 4 потока)"
+        );
     }
     Ok(())
 }
@@ -450,27 +488,39 @@ fn bench_cuda() -> Result<()> {
     report(
         json!({"bench": "cuda-memory-after-runs", "rss_mb": rss_runs, "rss_delta_mb": rss_runs - rss_env, "vram_mb": vram_runs}),
     );
-    // редкие вызовы: пауза 1 с (карта успевает сбросить такты)
-    for l in [64usize, 128, 256] {
+    // редкие вызовы: пауза между ними, L × 60 вызовов после прогрева. Видеокарта сбрасывает такты за доли секунды, поэтому
+    // медленный режим (≈ 30 мс при L = 256 против ≈ 3 мс подряд) начинается с паузы между вызовами, а не с простоя в секунды
+    let gap_run = |ids: &mut Ids, l: usize, gap_ms: u64| -> Stats {
         let ms: Vec<f64> = (0..WARMUP + 60)
             .map(|i| {
                 let x = ids.next(l);
                 let t = Instant::now();
                 model.forward(&x).unwrap();
                 let dt = t.elapsed().as_secs_f64() * 1e3;
-                std::thread::sleep(Duration::from_millis(1000));
+                std::thread::sleep(Duration::from_millis(gap_ms));
                 (i, dt)
             })
             .filter(|(i, _)| *i >= WARMUP)
             .map(|(_, dt)| dt)
             .collect();
-        let s = stats(&ms);
+        stats(&ms)
+    };
+    for l in [64usize, 128, 256] {
+        let s = gap_run(&mut ids, l, 1000);
         println!("LAT cuda пауза 1 с L={l:<3}  {}", s.line());
         report(
             json!({"bench": "cuda-gap1s", "l": l, "p50": s.p50, "p95": s.p95, "p99": s.p99, "max": s.max}),
         );
     }
-    // после простоя ≥ 10 с: карта уходит в P8, первый вызов серии разгоняет такты заново
+    // где именно начинается медленный режим: L = 256, паузы от 50 до 500 мс
+    for gap_ms in [50u64, 100, 200, 500] {
+        let s = gap_run(&mut ids, 256, gap_ms);
+        println!("LAT cuda пауза {gap_ms} мс L=256  {}", s.line());
+        report(
+            json!({"bench": "cuda-gap", "gap_ms": gap_ms, "l": 256, "p50": s.p50, "p95": s.p95, "p99": s.p99, "max": s.max}),
+        );
+    }
+    // длинный простой (10 с): тот же медленный режим, что и при паузах выше; норма D-036 (p95 ≤ 40 мс) проверяется здесь
     let ms: Vec<f64> = (0..20)
         .map(|_| {
             std::thread::sleep(Duration::from_secs(10));

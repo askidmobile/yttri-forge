@@ -4,22 +4,33 @@
 //! Эталон — `export_gguf.run_reference` из yttri-decider: HF XLM-R и головы в torch f32 на **деквантованных байтах того же
 //! `model.gguf`** (B = 1 без паддинга, как рантайм). Расхождение даёт только вычисление, а не квантование.
 //!
+//! # Откуда берутся файлы (всё в git, `yttri-decider/bench`)
+//!
+//! ```text
+//! export_gguf.py stand --from models/export-0.1.0 --out <стенд>        # стенд 0.1.0: три новые головы молчат (out_proj = 0)
+//! make_stand_live.py <стенд>/model.gguf <live>/model.gguf              # будит молчащие головы: логиты зависят от входа
+//! gen_parity.py --gguf <live>/model.gguf --out <live>/parity-live.json # эталон torch-f32, ≥ 1000 входов
+//! ```
+//!
+//! Паритет на стенде с молчащими головами пуст: логиты головы постоянны, поэтому max |Δz| = 0 и смен вердикта нет сами
+//! собой. Тест это замечает и падает (`degenerate`), так что годится только стенд `live` (или настоящая модель).
+//!
 //! Переменные окружения — только здесь, в продуктовом коде env не вводим:
 //!
-//! * `YTTRI_DECIDER_GGUF` — путь к `model.gguf` (стенд `export_gguf.py stand`, sha256 `2a5b787c…`);
+//! * `YTTRI_DECIDER_GGUF` — путь к `model.gguf` (стенд `live`, см. выше);
 //! * `YTTRI_DECIDER_PARITY` — JSON эталона: `{"model_sha256", "outputs": [[имя, ширина]…], "cases": [{"name", "kind", "ids",
 //!   "logits": {"logits_<qid>": […]}}]}` (генератор — `gen_parity.py`; состав: state_v1.json, тексты, id по Ципфу и равномерные,
 //!   `<pad>` внутри входа, граничные длины; не меньше 1000 входов);
 //! * `YTTRI_DECIDER_OUT` — куда записать отчёт (числа, без id и текста), необязательно;
 //! * `YTTRI_DECIDER_THREADS` — размер пула rayon для CPU, по умолчанию 4;
-//! * `YTTRI_FORGE_REV` — ревизия forge, которую нужно записать в отчёт (тест её не знает).
+//! * `YTTRI_FORGE_REV` — ревизия forge для отчёта (тест её не знает); **обязательна, если задан `YTTRI_DECIDER_OUT`**.
 //!
 //! Допуски PD-052: max |Δz| ≤ 1e-3 на каждой голове, смен вердикта 0 (FR-017 допускает 2 на 1000; здесь жёстче), max |Δp| —
-//! справочно (допуск `self_check` 0,02 проверяется отдельно).
+//! справочно (допуск `self_check` 0,02 проверяется отдельно). Каждый замер — отдельный процесс (`--exact --test-threads 1`).
 //!
 //! ```text
-//! cargo test -p candle-transformers --release --test yttri_decider_parity -- --ignored --nocapture
-//! cargo test -p candle-transformers --release --features cuda --test yttri_decider_parity -- --ignored --nocapture
+//! cargo test -p candle-transformers --release --test yttri_decider_parity -- --ignored --nocapture --exact parity_cpu --test-threads 1
+//! cargo test -p candle-transformers --release --features cuda --test yttri_decider_parity -- --ignored --nocapture --exact parity_cuda --test-threads 1
 //! ```
 
 use candle::{Device, Result};
@@ -31,6 +42,8 @@ use std::time::Instant;
 
 const MAX_DZ: f64 = 1e-3;
 const MIN_CASES: usize = 1000;
+/// Голова, логиты эталона которой на всём наборе меняются меньше, вырождена: сверять по ней нечего.
+const MIN_SPREAD: f64 = 1e-3;
 // пороги вердикта как в decider.rs / validate_decider.py: noul — p ≥ t_yes «да», p ≤ t_no «нет»; choice — уверенный argmax
 const T_YES: f64 = 0.8;
 const T_NO: f64 = 0.1;
@@ -96,6 +109,31 @@ struct HeadStats {
     max_dp: f64,
     flips: usize,
     min_margin: f64,
+    /// Наименьшее и наибольшее значение каждого выхода эталона по всем входам.
+    lo: Vec<f64>,
+    hi: Vec<f64>,
+}
+
+impl HeadStats {
+    fn seen(&mut self, z_ref: &[f64]) {
+        if self.lo.is_empty() {
+            self.lo = z_ref.to_vec();
+            self.hi = z_ref.to_vec();
+        }
+        for (j, &v) in z_ref.iter().enumerate() {
+            self.lo[j] = self.lo[j].min(v);
+            self.hi[j] = self.hi[j].max(v);
+        }
+    }
+
+    /// Размах логитов эталона: наибольший по выходам (max − min по всем входам).
+    fn spread(&self) -> f64 {
+        self.lo
+            .iter()
+            .zip(&self.hi)
+            .map(|(lo, hi)| hi - lo)
+            .fold(0.0, f64::max)
+    }
 }
 
 fn run(device: Device, label: &str) -> Result<()> {
@@ -197,6 +235,7 @@ fn run(device: Device, label: &str) -> Result<()> {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0, f64::max);
             let s = &mut stats[h];
+            s.seen(&z_ref);
             s.dz.push(dz);
             s.max_dp = s.max_dp.max(dp);
             s.flips += (verdict(&z_ref) != verdict(&z_got)) as usize;
@@ -225,17 +264,20 @@ fn run(device: Device, label: &str) -> Result<()> {
             *s.dz.last().unwrap(),
             s.dz.iter().sum::<f64>() / s.dz.len() as f64,
         );
+        let spread = s.spread();
+        let degenerate = spread <= MIN_SPREAD;
         println!(
-            "{label} {name:<30} n={width:<3} max|dz| {max:.3e}  mean {mean:.2e}  p99 {:.2e}  max|dp| {:.2e}  смен вердикта {}  мин. зазор {:.3}",
+            "{label} {name:<30} n={width:<3} max|dz| {max:.3e}  mean {mean:.2e}  p99 {:.2e}  max|dp| {:.2e}  смен вердикта {}  мин. зазор {:.3}  размах эталона {spread:.3}{}",
             percentile(&s.dz, 0.99),
             s.max_dp,
             s.flips,
-            s.min_margin
+            s.min_margin,
+            if degenerate { "  ВЫРОЖДЕНА" } else { "" }
         );
-        ok &= max <= MAX_DZ && s.flips == 0;
+        ok &= max <= MAX_DZ && s.flips == 0 && !degenerate;
         per_head.insert(
             name.clone(),
-            json!({"n": width, "max_dz": max, "mean_dz": mean, "p99_dz": percentile(&s.dz, 0.99), "max_dp": s.max_dp, "flips": s.flips, "min_margin": s.min_margin}),
+            json!({"n": width, "max_dz": max, "mean_dz": mean, "p99_dz": percentile(&s.dz, 0.99), "max_dp": s.max_dp, "flips": s.flips, "min_margin": s.min_margin, "ref_spread": spread, "degenerate": degenerate}),
         );
     }
     println!(
@@ -248,8 +290,11 @@ fn run(device: Device, label: &str) -> Result<()> {
         worst.1
     );
     if let Ok(out) = std::env::var("YTTRI_DECIDER_OUT") {
+        let rev = std::env::var("YTTRI_FORGE_REV").expect(
+            "задан YTTRI_DECIDER_OUT, а YTTRI_FORGE_REV нет: отчёт без ревизии forge не принимается",
+        );
         let report = json!({
-            "device": label, "forge_rev": std::env::var("YTTRI_FORGE_REV").ok(), "threads": if on_cpu { threads } else { 0 }, "cases": cases.len(), "model_sha256": file_sha,
+            "device": label, "forge_rev": rev, "threads": if on_cpu { threads } else { 0 }, "cases": cases.len(), "model_sha256": file_sha,
             "tolerance": {"max_dz": MAX_DZ, "max_flips": 0}, "load_ms": load_ms,
             "forward_ms": {"p50": percentile(&ms, 0.5), "p95": percentile(&ms, 0.95)}, "heads": per_head,
         });
@@ -257,7 +302,7 @@ fn run(device: Device, label: &str) -> Result<()> {
     }
     assert!(
         ok,
-        "паритет {label}: допуск max|dz| ≤ {MAX_DZ:e} и 0 смен вердикта нарушен"
+        "паритет {label}: допуск max|dz| ≤ {MAX_DZ:e} и 0 смен вердикта нарушен, либо голова вырождена (размах логитов эталона ≤ {MIN_SPREAD:e}: стенд с молчащими головами, нужен make_stand_live.py)"
     );
     Ok(())
 }
