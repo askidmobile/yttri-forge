@@ -562,6 +562,8 @@ pub struct Qwen35BatchAdapter {
     /// consumes explicitly loaded component and per-request payloads.
     vision: Option<Qwen35Vision>,
     mtp: Option<Qwen35Mtp>,
+    /// Trie-маска последнего tree-verify: пары [start,end] по строкам дерева.
+    verify_trie: Option<Tensor>,
     /// Per-slot MTP state matches the target state. Prefix-cache snapshots
     /// currently contain only the target model; after injecting one, the MTP
     /// head has neither its attention KV nor the previous target hidden row.
@@ -801,6 +803,7 @@ impl Qwen35BatchAdapter {
             graph_failures: 0,
             vision: None,
             mtp: None,
+            verify_trie: None,
             mtp_slot_aligned: vec![true; num_slots],
             debug_alloc: None,
             target_transactions: (0..num_slots).map(|_| None).collect(),
@@ -2191,7 +2194,7 @@ impl BatchModel for Qwen35BatchAdapter {
                 ));
             }
             let rope_host: Vec<u32> = rope_positions.iter().map(|&p| p as u32).collect();
-            let (flat, hidden, _) = self.paged_graph_run(true, slot, pos, inputs, rope_host)?;
+            let (flat, hidden, _) = self.paged_graph_run(true, slot, pos, inputs, rope_host, self.verify_trie.as_ref())?;
             self.model.paged_ctx.as_mut().unwrap().kv_len_host[slot] = (pos + k) as u32;
             // Графовый путь зовёт forward_verify_paged с shadow=true: при k>1
             // теневые снимки записаны, откат может на них опереться.
@@ -2564,7 +2567,7 @@ impl Qwen35BatchAdapter {
             .map(|p| p as u32)
             .collect();
         let (flat, hidden, hit_flag) =
-            self.paged_graph_run(false, slot, chunk.start_pos, &chunk.tokens, rope_host)?;
+            self.paged_graph_run(false, slot, chunk.start_pos, &chunk.tokens, rope_host, None)?;
 
         // hidden отдаём наружу, а не вызываем catch_up здесь: пусть графовая
         // ветка prefill_chunk заполнит mtp_inputs тем же способом, что и eager,
@@ -2698,6 +2701,7 @@ impl Qwen35BatchAdapter {
         start_pos: usize,
         tokens: &[u32],
         rope_host: Vec<u32>,
+        trie_ranges: Option<&Tensor>,
     ) -> Result<(Vec<f32>, Tensor, bool)> {
         let Device::Cuda(cuda_dev) = &self.device else {
             return Err(anyhow!("paged graph: не CUDA-устройство"));
@@ -2741,7 +2745,7 @@ impl Qwen35BatchAdapter {
         };
         let fwd = |m: &mut ModelWeights, emb: &Tensor, rope: &Tensor| -> Result<(Tensor, Tensor)> {
             let r = if verify {
-                m.forward_verify_graphed(emb, rope, t, slot_u)
+                m.forward_verify_tree_graphed(emb, rope, t, slot_u, trie_ranges)
             } else {
                 m.forward_prefill_graphed(emb, rope, t)
             };
