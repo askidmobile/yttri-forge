@@ -85,11 +85,6 @@ struct TreeDraftState {
     path_score: f32,
 }
 
-/// Top-k host для tree-драфта. Токены уже id (shortlist map выполняется выше).
-fn top_k_host(logits: &[f32], k: usize) -> Vec<crate::spec_tree::TreeDraftCandidate> {
-    crate::spec_tree::top_k_candidates(logits, k)
-}
-
 pub struct Qwen35Mtp {
     profile: MtpProfile,
     device: Device,
@@ -728,6 +723,32 @@ impl Qwen35Mtp {
         Ok(out)
     }
 
+    /// Top-k кандидатов tree-драфта с отображением shortlist → реальные token id.
+    fn tree_candidates(
+        &self,
+        logits: &[f32],
+        k: usize,
+    ) -> Vec<crate::spec_tree::TreeDraftCandidate> {
+        let raw = crate::spec_tree::top_k_candidates(logits, k);
+        let Some(short) = self.short_head.as_ref() else {
+            return raw;
+        };
+        let mut out: Vec<crate::spec_tree::TreeDraftCandidate> = Vec::with_capacity(raw.len());
+        for candidate in raw {
+            let Some(&id) = short.ids_host.get(candidate.token as usize) else {
+                continue;
+            };
+            if out.iter().any(|existing| existing.token == id) {
+                continue;
+            }
+            out.push(crate::spec_tree::TreeDraftCandidate {
+                token: id,
+                logprob: candidate.logprob,
+            });
+        }
+        out
+    }
+
     /// Ветвящийся драфт для tree speculative decoding.
     ///
     /// Реализация остаётся eager: каждый узел считается одним проходом MTP.
@@ -773,7 +794,7 @@ impl Qwen35Mtp {
                 let Some(state) = nodes[node].clone() else {
                     candle_core::bail!("tree draft node {node} is missing");
                 };
-                for candidate in top_k_host(&state.logits, branching) {
+                for candidate in self.tree_candidates(&state.logits, branching) {
                     proposals.push((node, state.clone(), candidate));
                 }
             }
