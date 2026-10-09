@@ -24,6 +24,63 @@ pub struct FlatTrie {
     nodes: Vec<FlatTrieNode>,
 }
 
+/// Кандидат ветвящегося драфта.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TreeDraftCandidate {
+    pub token: u32,
+    pub logprob: f32,
+}
+
+/// Параметры построения дерева.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeDraftSpec {
+    /// Общее число узлов, включая root-sentinel.
+    pub budget: usize,
+    pub depth: usize,
+    pub branching: usize,
+}
+
+/// Узлы для CUDA-стейджинга tree-verify.
+///
+/// Порядок — линейный порядок `FlatTrie`: одна строка запроса на узел.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeStaging {
+    pub tokens: Vec<u32>,
+    pub parents: Vec<usize>,
+    pub depths: Vec<u32>,
+    pub starts: Vec<u32>,
+    pub ends: Vec<u32>,
+}
+
+/// Стабильный top-k по logprob. При равных значениях выигрывает меньший token id.
+pub fn top_k_candidates(logits: &[f32], k: usize) -> Vec<TreeDraftCandidate> {
+    assert!(!logits.is_empty(), "logits must not be empty");
+    assert!(k > 0, "branching must be positive");
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exp_sum: f32 = logits
+        .iter()
+        .map(|&v| (v - max).exp())
+        .sum::<f32>()
+        .max(1e-30);
+    let normalizer = exp_sum.ln() + max;
+
+    let mut candidates: Vec<TreeDraftCandidate> = logits
+        .iter()
+        .enumerate()
+        .map(|(token, &logit)| TreeDraftCandidate {
+            token: token as u32,
+            logprob: logit - normalizer,
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        b.logprob
+            .total_cmp(&a.logprob)
+            .then_with(|| a.token.cmp(&b.token))
+    });
+    candidates.truncate(k);
+    candidates
+}
+
 impl FlatTrie {
     /// Отбор узлов по бюджету.
     ///
@@ -120,6 +177,72 @@ impl FlatTrie {
         Self { nodes }
     }
 
+    /// Построить дерево ветвящегося драфта.
+    ///
+    /// `next_candidates(parent)` возвращает кандидатов для продолжения узла.
+    /// На каждом уровне выбираются лучшие кандидаты по суммарному logprob пути,
+    /// поэтому общий префикс расходует бюджет один раз, а не дублируется в
+    /// каждой ветке. `budget` включает root-sentinel.
+    pub fn build_tree(
+        spec: TreeDraftSpec,
+        mut next_candidates: impl FnMut(usize) -> Vec<TreeDraftCandidate>,
+    ) -> Self {
+        assert!(spec.budget > 0, "budget must keep at least the root");
+        assert!(spec.depth > 0, "depth must be positive");
+        assert!(spec.branching > 0, "branching must be positive");
+
+        let mut edges = Vec::new();
+        let mut path_scores = vec![0f32];
+        let mut frontier = vec![0usize];
+
+        for _ in 0..spec.depth {
+            if frontier.is_empty() || edges.len() + 1 >= spec.budget {
+                break;
+            }
+
+            let mut proposals = Vec::new();
+            for &parent in &frontier {
+                for candidate in next_candidates(parent) {
+                    proposals.push((parent, candidate));
+                }
+            }
+            proposals.sort_by(|a, b| {
+                let score_a = path_scores[a.0] + a.1.logprob;
+                let score_b = path_scores[b.0] + b.1.logprob;
+                score_b
+                    .total_cmp(&score_a)
+                    .then_with(|| a.1.token.cmp(&b.1.token))
+            });
+
+            let remaining = spec.budget - edges.len() - 1;
+            let mut next_frontier = Vec::new();
+            for (parent, candidate) in proposals.into_iter().take(remaining) {
+                let index = edges.len() + 1;
+                edges.push((parent, candidate.token, candidate.logprob));
+                path_scores.push(path_scores[parent] + candidate.logprob);
+                next_frontier.push(index);
+            }
+            frontier = next_frontier;
+        }
+
+        Self::from_edges(&edges)
+    }
+
+    /// Стейджинг для CUDA: токены, родители, глубины и диапазоны поддеревьев.
+    pub fn staging(&self) -> TreeStaging {
+        TreeStaging {
+            tokens: self.nodes.iter().map(|n| n.node.token).collect(),
+            parents: self
+                .nodes
+                .iter()
+                .map(|n| n.node.parent.unwrap_or(0))
+                .collect(),
+            depths: self.nodes.iter().map(|n| n.depth as u32).collect(),
+            starts: self.nodes.iter().map(|n| n.start as u32).collect(),
+            ends: self.nodes.iter().map(|n| n.end as u32).collect(),
+        }
+    }
+
     pub fn nodes(&self) -> &[FlatTrieNode] {
         &self.nodes
     }
@@ -153,10 +276,6 @@ impl FlatTrie {
         accepted
     }
 
-    /// Путь root → node (включая оба конца).
-    ///
-    /// Нужен для отката DeltaNet/KV к границе принятого префикса: accepted-путь
-    /// удобно проверять от корня, а не от листа.
     /// Индексы поддерева узла (включая сам узел).
     ///
     /// Диапазон `[start, end]` — это линейная часть дерева, видимая узлом
@@ -166,6 +285,10 @@ impl FlatTrie {
         self.nodes[node].start..=self.nodes[node].end
     }
 
+    /// Путь root → node (включая оба конца).
+    ///
+    /// Нужен для отката DeltaNet/KV к границе принятого префикса: accepted-путь
+    /// удобно проверять от корня, а не от листа.
     pub fn path_to_root(&self, node: usize) -> Vec<usize> {
         let mut path = Vec::with_capacity(self.nodes[node].depth + 1);
         let mut current = Some(node);
@@ -260,6 +383,54 @@ mod tests {
     fn path_to_root_follows_parents() {
         let trie = FlatTrie::from_edges(&[(0, 1, -1.0), (1, 2, -2.0), (2, 3, -3.0)]);
         assert_eq!(trie.path_to_root(3), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn top_k_candidates_prefers_probability_and_lower_id() {
+        let candidates = top_k_candidates(&[1.0, 3.0, 3.0, 0.0], 3);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.token)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+        assert!(candidates[0].logprob >= candidates[1].logprob);
+    }
+
+    #[test]
+    fn build_tree_respects_budget_and_depth() {
+        let trie = FlatTrie::build_tree(
+            TreeDraftSpec {
+                budget: 5,
+                depth: 4,
+                branching: 2,
+            },
+            |parent| {
+                top_k_candidates(
+                    match parent {
+                        0 => &[0.0, 2.0, 1.0],
+                        1 => &[3.0, 1.0],
+                        2 => &[2.0, 0.0],
+                        _ => &[0.0, 1.0],
+                    },
+                    2,
+                )
+            },
+        );
+        assert_eq!(trie.len(), 5);
+        assert_eq!(trie.nodes().last().unwrap().depth, 2);
+    }
+
+    #[test]
+    fn staging_matches_flat_order() {
+        let trie = FlatTrie::from_edges(&[(0, 1, -1.0), (1, 2, -2.0), (0, 3, -3.0)]);
+        let staging = trie.staging();
+        assert_eq!(staging.tokens, vec![0, 1, 2, 3]);
+        assert_eq!(staging.parents, vec![0, 0, 1, 0]);
+        assert_eq!(staging.depths, vec![0, 1, 2, 1]);
+        assert_eq!(staging.starts, vec![0, 1, 2, 3]);
+        assert_eq!(staging.ends, vec![3, 2, 2, 3]);
     }
 
     #[test]
