@@ -28,6 +28,7 @@ use crate::real::model_weights::{
     BatchedStateCheckpoint, BlockStateSnap, ModelWeights, StateSnapshot, DECODE_BATCH_CAPACITY,
 };
 use crate::real::mtp::Qwen35Mtp;
+use crate::spec_tree::FlatTrie;
 use crate::real::multimodal::{GridThw, PositionPlan};
 use crate::real::vision::Qwen35Vision;
 
@@ -2163,6 +2164,65 @@ impl BatchModel for Qwen35BatchAdapter {
             .ok_or_else(|| anyhow!("MTP component is not loaded"))?
             .draft(slot, token, rope_pos, max_tokens, &self.model)
             .map_err(|error| anyhow!("MTP draft: {error}"))
+    }
+
+    /// Eager draft-tree для tree speculative decoding.
+    ///
+    /// Возвращает `FlatTrie` и одновременно загружает trie-маску в adapter:
+    /// scheduler должен немедленно вызвать `speculative_verify` с токенами
+    /// этого же дерева (см. `tree_verify_inputs`).
+    pub fn draft_tree(
+        &mut self,
+        slot: usize,
+        token: u32,
+        rope_pos: usize,
+        budget: usize,
+        depth: usize,
+        branching: usize,
+    ) -> Result<FlatTrie> {
+        let tree = self
+            .mtp
+            .as_mut()
+            .ok_or_else(|| anyhow!("MTP component is not loaded"))?
+            .draft_tree(
+                slot,
+                token,
+                rope_pos,
+                budget,
+                depth,
+                branching,
+                &self.model,
+            )
+            .map_err(|error| anyhow!("MTP draft tree: {error}"))?;
+        let staging = tree.staging();
+        let trie_ranges = staging
+            .starts
+            .iter()
+            .zip(&staging.ends)
+            .flat_map(|(&start, &end)| [start as i32, end as i32])
+            .collect::<Vec<_>>();
+        self.set_speculative_tree(Some(trie_ranges), Some((1..tree.len()).collect()))?;
+        Ok(tree)
+    }
+
+    /// Inputs для tree-verify.
+    ///
+    /// Target проверяет каждый узел как «input + предсказание следующего»:
+    /// input узла — токен родителя. Root-sentinel не подаётся, поэтому строки
+    /// 1..len соответствуют узлам 1..len. Для листьев это даёт логиты их
+    /// продолжений; приём пути использует только первые `accepted` строк.
+    pub fn tree_verify_inputs(&self, current_token: u32, tree: &FlatTrie) -> Vec<u32> {
+        let staging = tree.staging();
+        (1..tree.len())
+            .map(|node| {
+                let parent = staging.parents[node];
+                if parent == 0 {
+                    current_token
+                } else {
+                    staging.tokens[parent]
+                }
+            })
+            .collect()
     }
 
     /// Один multi-token target-forward на K позиций одного слота. Батчевая ось
