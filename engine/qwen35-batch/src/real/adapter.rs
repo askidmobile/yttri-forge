@@ -44,6 +44,12 @@ struct PendingVerify {
     /// `speculative_accept` при частичном приёме обязан смотреть на это, а не
     /// на `paged_authority`: иначе восстанавливается снимок, которого нет.
     shadow_written: bool,
+    /// Индексы исходных строк tree-verify, попавшие в `inputs`.
+    ///
+    /// При линейном MTP это `0..k`. Tree-verify отдаёт подмножество узлов
+    /// дерева: DeltaNet по-прежнему прогоняет их последовательно, поэтому
+    /// accepted-индекс должен пересчитываться из узла дерева в строку прогона.
+    tree_rows: Option<Vec<usize>>,
 }
 
 /// Адаптер реальной Qwen3.5-4B над `BatchModel` (true batched decode).
@@ -564,6 +570,7 @@ pub struct Qwen35BatchAdapter {
     mtp: Option<Qwen35Mtp>,
     /// Trie-маска последнего tree-verify: пары [start,end] по строкам дерева.
     verify_trie: Option<Tensor>,
+    verify_tree_rows: Option<Vec<usize>>,
     /// Per-slot MTP state matches the target state. Prefix-cache snapshots
     /// currently contain only the target model; after injecting one, the MTP
     /// head has neither its attention KV nor the previous target hidden row.
@@ -804,6 +811,7 @@ impl Qwen35BatchAdapter {
             vision: None,
             mtp: None,
             verify_trie: None,
+            verify_tree_rows: None,
             mtp_slot_aligned: vec![true; num_slots],
             debug_alloc: None,
             target_transactions: (0..num_slots).map(|_| None).collect(),
@@ -2165,7 +2173,13 @@ impl BatchModel for Qwen35BatchAdapter {
     /// Метод отделён от `speculative_verify`, чтобы scheduler сначала построил
     /// дерево/inputs, затем передал его в адаптер, а потом вызвал verify.
     /// `None` очищает маску и возвращает обычную причинную проверку.
-    pub fn set_verify_tree(&mut self, trie_ranges: Option<Vec<i32>>) -> Result<()> {
+    pub fn set_verify_tree(
+        &mut self,
+        trie_ranges: Option<Vec<i32>>,
+        tree_rows: Option<Vec<usize>>,
+    ) -> Result<()> {
+        self.verify_tree_rows = tree_rows;
+
         match trie_ranges {
             Some(mut ranges) => {
                 if ranges.len() % 2 != 0 {
@@ -2243,6 +2257,7 @@ impl BatchModel for Qwen35BatchAdapter {
             pos,
             hidden,
             shadow_written,
+            tree_rows: self.verify_tree_rows.take(),
         });
         let vocab = self.vocab_size();
         if flat.len() != k * vocab {
@@ -2268,6 +2283,10 @@ impl BatchModel for Qwen35BatchAdapter {
                 "speculative accept {consumed} exceeds verified {k}"
             ));
         }
+        // Tree-verify подаёт не все узлы подряд. Теневой откат DeltaNet по
+        // «строке consumed-1» здесь неприменим: соседние строки могут быть
+        // чужими ветками. Поэтому tree-режим всегда откатывается к checkpoint
+        // и перепрогоняет только принятый путь.
         #[cfg(feature = "cuda")]
         let paged = self.paged_authority(slot);
         #[cfg(not(feature = "cuda"))]
@@ -2277,7 +2296,7 @@ impl BatchModel for Qwen35BatchAdapter {
             // shadow=true при b>1). Построчный `verify_eager` их не пишет, и
             // без этой проверки restore_slot_from_shadow подсунул бы состояние
             // чужого раунда.
-            if paged && consumed > 0 && pending.shadow_written {
+            if paged && consumed > 0 && pending.shadow_written && pending.tree_rows.is_none() {
                 // Ф3: без перепрогона. DeltaNet возвращается к теневому снимку
                 // после строки consumed-1 — он снят внутри графа проверки
                 // (delta_rule_batched_cuda::dispatch_delta_rule_batched_seq,
