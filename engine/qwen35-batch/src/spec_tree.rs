@@ -69,6 +69,40 @@ impl FlatTrie {
         &self.nodes
     }
 
+    /// Индексы прямых детей узла.
+    pub fn children(&self, node: usize) -> impl Iterator<Item = usize> + '_ {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(move |(i, n)| i != &node && n.node.parent == Some(node))
+            .map(|(i, _)| i)
+    }
+
+    /// Принять путь по фактическим токенам target.
+    ///
+    /// Root — sentinel-узел, поэтому первый target-токен сравнивается с детьми root.
+    /// Возвращает индексы принятых узлов; пустой вектор — ни один draft-токен не принят.
+    pub fn accept(&self, target: &[u32]) -> Vec<usize> {
+        let mut current = 0;
+        let mut accepted = Vec::new();
+        for &token in target {
+            let Some(next) = self.children(current).find(|&i| self.nodes[i].node.token == token) else {
+                break;
+            };
+            accepted.push(next);
+            current = next;
+        }
+        accepted
+    }
+
+    /// Токены по индексам пути.
+    pub fn path_tokens(&self, indices: &[usize]) -> Vec<u32> {
+        indices
+            .iter()
+            .map(|&i| self.nodes[i].node.token)
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -95,6 +129,21 @@ mod tests {
         assert_eq!(nodes[2].end, 3);
         assert_eq!(nodes[3].start, 3);
         assert_eq!(nodes[3].end, 3);
+    }
+
+    #[test]
+    fn accept_follows_branch() {
+        let trie = FlatTrie::from_edges(&[(0, 1, -1.0), (1, 2, -2.0), (1, 3, -3.0), (2, 4, -4.0)]);
+        let accepted = trie.accept(&[1, 2, 4]);
+        assert_eq!(accepted, vec![1, 2, 4]);
+        assert_eq!(trie.path_tokens(&accepted), vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn accept_stops_on_mismatch() {
+        let trie = FlatTrie::from_edges(&[(0, 1, -1.0), (1, 2, -2.0), (1, 3, -3.0)]);
+        assert_eq!(trie.accept(&[1, 9]), vec![1]);
+        assert_eq!(trie.accept(&[9, 1]), Vec::<usize>::new());
     }
 
     #[test]
