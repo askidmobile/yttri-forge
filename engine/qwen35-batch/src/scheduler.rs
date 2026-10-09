@@ -213,6 +213,17 @@ pub struct BatchScheduler<M: BatchModel> {
     fully_primed_logits: HashMap<usize, Vec<f32>>,
     stats: SchedulerStats,
     eos: u32,
+    /// Tree speculative decoding. None — прежний линейный MTP.
+    tree: Option<TreeSpec>,
+}
+
+/// Конфигурация tree speculative decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeSpec {
+    /// Общее число узлов, включая root-sentinel.
+    pub budget: usize,
+    pub depth: usize,
+    pub branching: usize,
 }
 
 /// Результат одного шага scheduler'а.
@@ -275,7 +286,22 @@ impl<M: BatchModel> BatchScheduler<M> {
             fully_primed_logits: HashMap::new(),
             stats: SchedulerStats::default(),
             eos,
+            tree: None,
         }
+    }
+
+    /// Включить tree speculative decoding. Значения проверяются в adapter;
+    /// здесь достаточно fail-fast для очевидных нулей.
+    pub fn set_speculative_tree_spec(&mut self, spec: Option<TreeSpec>) {
+        if let Some(spec) = spec {
+            assert!(
+                spec.budget > 1,
+                "tree budget must include at least one draft node"
+            );
+            assert!(spec.depth > 0, "tree depth must be positive");
+            assert!(spec.branching > 0, "tree branching must be positive");
+        }
+        self.tree = spec;
     }
 
     /// Как `submit`, но первый prefill-чанк режется до `first_chunk` токенов.
@@ -628,35 +654,75 @@ impl<M: BatchModel> BatchScheduler<M> {
         }
         let t_draft = Instant::now();
 
-        let draft = match self.model.speculative_draft(
-            slot,
-            self.slots[slot].current_token(),
-            self.slots[slot].next_pos(),
-            self.slots[slot].next_pos(),
-            width,
-        ) {
-            Ok(draft) if !draft.is_empty() => draft,
-            other => {
-                // Ветка покрывает и пустой черновик, и ошибку — печатаем обе,
-                // иначе срыв до проверки неотличим от штатного пропуска раунда.
-                match other {
-                    Err(e) => eprintln!("[mtp] черновик сорвался: {e}"),
-                    Ok(_) => eprintln!("[mtp] черновик пуст, раунд пропущен"),
-                }
-                self.model.speculative_rollback(slot)?;
-                self.sampler.restore(slot, sampler_checkpoint)?;
-                return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Draft));
+        let (draft, tree) = match self.tree {
+            Some(spec) => {
+                let tree = match self.model.speculative_draft_tree(
+                    slot,
+                    self.slots[slot].current_token(),
+                    self.slots[slot].next_pos(),
+                    spec.budget,
+                    spec.depth,
+                    spec.branching,
+                ) {
+                    Ok(tree) if tree.len() > 1 => tree,
+                    other => {
+                        let reason = match other {
+                            Err(e) => format!(": {e}"),
+                            Ok(tree) => format!(" (len={})", tree.len()),
+                        };
+                        eprintln!("[mtp-tree] черновик сорвался{reason}");
+                        self.model.speculative_rollback(slot)?;
+                        self.sampler.restore(slot, sampler_checkpoint)?;
+                        return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Draft));
+                    }
+                };
+                let draft = tree.path_tokens(&(1..tree.len()).collect::<Vec<_>>());
+                (draft, Some(tree))
+            }
+            None => {
+                let draft = match self.model.speculative_draft(
+                    slot,
+                    self.slots[slot].current_token(),
+                    self.slots[slot].next_pos(),
+                    self.slots[slot].next_pos(),
+                    width,
+                ) {
+                    Ok(draft) if !draft.is_empty() => draft,
+                    other => {
+                        // Ветка покрывает и пустой черновик, и ошибку — печатаем обе,
+                        // иначе срыв до проверки неотличим от штатного пропуска раунда.
+                        match other {
+                            Err(e) => eprintln!("[mtp] черновик сорвался: {e}"),
+                            Ok(_) => eprintln!("[mtp] черновик пуст, раунд пропущен"),
+                        }
+                        self.model.speculative_rollback(slot)?;
+                        self.sampler.restore(slot, sampler_checkpoint)?;
+                        return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Draft));
+                    }
+                };
+                (draft, None)
             }
         };
         self.speculative[slot].drafted += draft.len();
 
-        // Batched verify: ОДИН multi-token target-forward на все K позиций.
-        // Inputs: current_token + драфт без последнего (draft[K-1] только
-        // сравнивается, как input он не подавался и в последовательной схеме).
+        // Batched verify: ОДИН multi-token target-forward на все позиции.
+        // Линейный MTP: current_token + draft без последнего.
+        // Tree: каждый узел получает токен родителя; target возвращает логиты
+        // продолжения каждого узла. Маска уже загружена adapter'ом при draft.
         let pos = self.slots[slot].next_pos();
         let mut inputs = Vec::with_capacity(draft.len());
-        inputs.push(self.slots[slot].current_token());
-        inputs.extend_from_slice(&draft[..draft.len() - 1]);
+        match tree.as_ref() {
+            Some(tree) => {
+                inputs = self
+                    .model
+                    .speculative_tree_inputs(self.slots[slot].current_token(), tree);
+                debug_assert_eq!(inputs.len(), draft.len());
+            }
+            None => {
+                inputs.push(self.slots[slot].current_token());
+                inputs.extend_from_slice(&draft[..draft.len() - 1]);
+            }
+        }
         let t_verify = Instant::now();
         let rows = match self.model.speculative_verify(slot, &inputs, pos) {
             Ok(rows) if rows.len() == inputs.len() => rows,

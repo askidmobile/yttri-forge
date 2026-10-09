@@ -221,6 +221,28 @@ pub trait BatchModel {
         anyhow::bail!("model does not support speculative transactions")
     }
 
+    /// Построить ветвящийся драфт. Возвращает `FlatTrie`; реализация обязана
+    /// загрузить trie-маску перед последующим `speculative_verify`.
+    fn speculative_draft_tree(
+        &mut self,
+        _slot: usize,
+        _token: u32,
+        _rope_pos: usize,
+        _budget: usize,
+        _depth: usize,
+        _branching: usize,
+    ) -> Result<crate::spec_tree::FlatTrie> {
+        anyhow::bail!("model does not support speculative tree draft")
+    }
+    /// Inputs для tree-verify: вход узла — токен его родителя.
+    fn speculative_tree_inputs(
+        &self,
+        _current_token: u32,
+        _tree: &crate::spec_tree::FlatTrie,
+    ) -> Vec<u32> {
+        Vec::new()
+    }
+
     /// Загрузить маску дерева для следующего `speculative_verify`.
     ///
     /// Контракт tree speculative decoding:
@@ -294,11 +316,41 @@ impl<T: BatchModel + ?Sized> BatchModel for &mut T {
     fn speculative_begin(&mut self, slot: usize) -> Result<()> {
         (**self).speculative_begin(slot)
     }
-    fn speculative_draft(&mut self, slot: usize, token: u32, cp: usize, rp: usize, max_tok: usize) -> Result<Vec<u32>> {
+    fn speculative_draft(
+        &mut self,
+        slot: usize,
+        token: u32,
+        cp: usize,
+        rp: usize,
+        max_tok: usize,
+    ) -> Result<Vec<u32>> {
         (**self).speculative_draft(slot, token, cp, rp, max_tok)
     }
-    fn speculative_verify(&mut self, slot: usize, inputs: &[u32], pos: usize) -> Result<Vec<Vec<f32>>> {
+    fn speculative_verify(
+        &mut self,
+        slot: usize,
+        inputs: &[u32],
+        pos: usize,
+    ) -> Result<Vec<Vec<f32>>> {
         (**self).speculative_verify(slot, inputs, pos)
+    }
+    fn speculative_draft_tree(
+        &mut self,
+        slot: usize,
+        token: u32,
+        rope_pos: usize,
+        budget: usize,
+        depth: usize,
+        branching: usize,
+    ) -> Result<crate::spec_tree::FlatTrie> {
+        (**self).speculative_draft_tree(slot, token, rope_pos, budget, depth, branching)
+    }
+    fn speculative_tree_inputs(
+        &self,
+        current_token: u32,
+        tree: &crate::spec_tree::FlatTrie,
+    ) -> Vec<u32> {
+        (**self).speculative_tree_inputs(current_token, tree)
     }
     fn speculative_accept(&mut self, slot: usize, consumed: usize) -> Result<()> {
         (**self).speculative_accept(slot, consumed)

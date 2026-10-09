@@ -11,8 +11,8 @@ use super::{
     model_profile::{ModelProfile, MtpProfile},
     model_weights::ModelWeights,
     moe::{
-        ForwardMode, MoeRouter, PackedExperts, Qwen35MoeBlock, Qwen35MoeConfig,
-        select_backend, SharedExpert,
+        select_backend, ForwardMode, MoeRouter, PackedExperts, Qwen35MoeBlock, Qwen35MoeConfig,
+        SharedExpert,
     },
     multimodal::MROPE_DIMENSION_SOURCES,
 };
@@ -86,10 +86,7 @@ struct TreeDraftState {
 }
 
 /// Top-k host для tree-драфта. Токены уже id (shortlist map выполняется выше).
-fn top_k_host(
-    logits: &[f32],
-    k: usize,
-) -> Vec<crate::spec_tree::TreeDraftCandidate> {
+fn top_k_host(logits: &[f32], k: usize) -> Vec<crate::spec_tree::TreeDraftCandidate> {
     crate::spec_tree::top_k_candidates(logits, k)
 }
 
@@ -226,7 +223,11 @@ fn draft_id_log() -> bool {
 /// MTP_GRAPH_CHECK=1 — после каждого replay повторить проход eager на
 /// тех же входах и сравнить id и hidden; печать по проходу. Состояние после
 /// проверки — от eager-прохода (строка кеша перезаписана тем же значением).
-fn moe_meta_u32(content: &candle_core::quantized::gguf_file::Content, key: &str, default: u32) -> u32 {
+fn moe_meta_u32(
+    content: &candle_core::quantized::gguf_file::Content,
+    key: &str,
+    default: u32,
+) -> u32 {
     content
         .metadata
         .get(key)
@@ -246,7 +247,10 @@ fn moe_intermediate(content: &candle_core::quantized::gguf_file::Content, _prefi
     moe_meta_u32(content, "qwen35moe.expert_feed_forward_length", 512) as usize
 }
 
-fn moe_shared_intermediate(content: &candle_core::quantized::gguf_file::Content, _prefix: &str) -> usize {
+fn moe_shared_intermediate(
+    content: &candle_core::quantized::gguf_file::Content,
+    _prefix: &str,
+) -> usize {
     moe_meta_u32(content, "qwen35moe.expert_shared_feed_forward_length", 512) as usize
 }
 
@@ -264,8 +268,8 @@ impl Qwen35Mtp {
         shared_head: QMatMul,
     ) -> Result<Self> {
         let file = File::open(path).map_err(candle_core::Error::wrap)?;
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-            .map_err(candle_core::Error::wrap)?;
+        let mmap =
+            unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(candle_core::Error::wrap)?;
         let mmap = Arc::new(mmap);
         // Формат-независимо: GGUF или самостоятельный контейнер .ytf.
         let content = crate::real::ytf16::content_any(mmap.as_ref())?;
@@ -286,7 +290,9 @@ impl Qwen35Mtp {
         // FR-011: MoE-вариант (35B-A3B): nextn-слой содержит routed experts
         // + router + shared expert вместо плотного FFN. Эксперты всегда
         // VRAM-резиденты (D-007, ~307 МиБ).
-        let is_moe = content.tensor_infos.contains_key(&format!("{prefix}.ffn_gate_exps.weight"));
+        let is_moe = content
+            .tensor_infos
+            .contains_key(&format!("{prefix}.ffn_gate_exps.weight"));
         let ffn = if is_moe {
             #[cfg(feature = "cuda")]
             {
@@ -299,7 +305,11 @@ impl Qwen35Mtp {
                     norm_topk_prob: true,
                 };
                 // Router: ffn_gate_inp → dequantize → F32 Linear.
-                let router_qt = content.tensor_from_slice(data, &format!("{prefix}.ffn_gate_inp.weight"), &device)?;
+                let router_qt = content.tensor_from_slice(
+                    data,
+                    &format!("{prefix}.ffn_gate_inp.weight"),
+                    &device,
+                )?;
                 let router_w = router_qt.dequantize(&device)?.to_dtype(DType::F32)?;
                 let router = MoeRouter::new(
                     candle_nn::Linear::new(router_w, None),
@@ -308,10 +318,28 @@ impl Qwen35Mtp {
                     moe_cfg.norm_topk_prob,
                 );
                 // Routed experts: VRAM-резиденты (D-007).
-                let gate_qt = content.tensor_from_slice(data, &format!("{prefix}.ffn_gate_exps.weight"), &device)?;
-                let up_qt = content.tensor_from_slice(data, &format!("{prefix}.ffn_up_exps.weight"), &device)?;
-                let down_qt = content.tensor_from_slice(data, &format!("{prefix}.ffn_down_exps.weight"), &device)?;
-                let backend = select_backend(None, device.is_cuda(), gate_qt.dtype(), up_qt.dtype(), down_qt.dtype())?;
+                let gate_qt = content.tensor_from_slice(
+                    data,
+                    &format!("{prefix}.ffn_gate_exps.weight"),
+                    &device,
+                )?;
+                let up_qt = content.tensor_from_slice(
+                    data,
+                    &format!("{prefix}.ffn_up_exps.weight"),
+                    &device,
+                )?;
+                let down_qt = content.tensor_from_slice(
+                    data,
+                    &format!("{prefix}.ffn_down_exps.weight"),
+                    &device,
+                )?;
+                let backend = select_backend(
+                    None,
+                    device.is_cuda(),
+                    gate_qt.dtype(),
+                    up_qt.dtype(),
+                    down_qt.dtype(),
+                )?;
                 let routed = PackedExperts {
                     gate: Arc::new(gate_qt),
                     up: Arc::new(up_qt),
@@ -319,8 +347,14 @@ impl Qwen35Mtp {
                     n_experts: moe_cfg.n_experts,
                 };
                 // Shared expert.
-                let shexp_gate_inp_qt = content.tensor_from_slice(data, &format!("{prefix}.ffn_gate_inp_shexp.weight"), &device)?;
-                let shexp_gate_inp_w = shexp_gate_inp_qt.dequantize(&device)?.to_dtype(DType::F32)?;
+                let shexp_gate_inp_qt = content.tensor_from_slice(
+                    data,
+                    &format!("{prefix}.ffn_gate_inp_shexp.weight"),
+                    &device,
+                )?;
+                let shexp_gate_inp_w = shexp_gate_inp_qt
+                    .dequantize(&device)?
+                    .to_dtype(DType::F32)?;
                 let shexp_gate_inp_w = if shexp_gate_inp_w.rank() == 1 {
                     let h = shexp_gate_inp_w.dim(0)?;
                     shexp_gate_inp_w.reshape((1, h))?
@@ -444,7 +478,10 @@ impl Qwen35Mtp {
             let full_logits = self.shared_head.forward(&x)?.flatten_all()?; // [vocab]
             let short_logits = proj.forward(&x)?.flatten_all()?; // [n]
             let picked = full_logits.index_select(&ids_t, 0)?; // [n]
-            let diff = (short_logits.clone() - &picked)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            let diff = (short_logits.clone() - &picked)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
             let exact = short_logits
                 .to_vec1::<f32>()?
                 .iter()
@@ -497,8 +534,7 @@ impl Qwen35Mtp {
         self.check_slot(slot)?;
         if let Some(transaction) = self.transactions[slot].take() {
             self.slots[slot].kv = transaction.checkpoint.kv;
-            self.slots[slot].pending_target_hidden =
-                transaction.checkpoint.pending_target_hidden;
+            self.slots[slot].pending_target_hidden = transaction.checkpoint.pending_target_hidden;
         }
         Ok(())
     }
@@ -512,8 +548,7 @@ impl Qwen35Mtp {
             .ok_or_else(|| candle_core::Error::Msg("MTP transaction is not active".into()))?;
         if verified_target_hidden.is_empty() {
             self.slots[slot].kv = transaction.checkpoint.kv;
-            self.slots[slot].pending_target_hidden =
-                transaction.checkpoint.pending_target_hidden;
+            self.slots[slot].pending_target_hidden = transaction.checkpoint.pending_target_hidden;
             return Ok(());
         }
         let base = transaction
@@ -561,13 +596,19 @@ impl Qwen35Mtp {
             embeddings.clone()
         };
         let (_, seq, hidden) = embeddings.dims3()?;
-        if target_hidden.dims() != [1, seq, self.profile.hidden_size] || hidden != self.profile.hidden_size {
+        if target_hidden.dims() != [1, seq, self.profile.hidden_size]
+            || hidden != self.profile.hidden_size
+        {
             candle_core::bail!("MTP catch-up shape mismatch");
         }
         let previous = self.slots[slot]
             .pending_target_hidden
             .clone()
-            .unwrap_or(Tensor::zeros((1, self.profile.hidden_size), DType::F32, &self.device)?);
+            .unwrap_or(Tensor::zeros(
+                (1, self.profile.hidden_size),
+                DType::F32,
+                &self.device,
+            )?);
         let shifted = if seq == 1 {
             previous.unsqueeze(1)?
         } else {
@@ -580,8 +621,7 @@ impl Qwen35Mtp {
             )?
         };
         let _ = self.forward_rows(slot, &embeddings, &shifted, start_pos, rope_positions)?;
-        self.slots[slot].pending_target_hidden =
-            Some(target_hidden.i((.., seq - 1, ..))?);
+        self.slots[slot].pending_target_hidden = Some(target_hidden.i((.., seq - 1, ..))?);
         Ok(())
     }
 
@@ -605,12 +645,13 @@ impl Qwen35Mtp {
         // остаётся CUDA-тензором (H2D один раз в начале, D2H один раз в конце).
         // Раньше каждый шаг делал D2H-sync (argmax→u32) + H2D (from_vec),
         // дважды осушая pipeline на итерацию: ~3 мс × width на раунд.
-        let mut token_t =
-            Tensor::from_vec(vec![first_token], (1, 1), &self.device)?;
+        let mut token_t = Tensor::from_vec(vec![first_token], (1, 1), &self.device)?;
         let mut hidden = self.slots[slot]
             .pending_target_hidden
             .clone()
-            .ok_or_else(|| candle_core::Error::Msg("MTP target hidden is not initialized".into()))?;
+            .ok_or_else(|| {
+                candle_core::Error::Msg("MTP target hidden is not initialized".into())
+            })?;
         let mut tokens_gpu: Vec<Tensor> = Vec::with_capacity(width);
         for offset in 0..width {
             let embedding = target.embed_tokens(&token_t, &self.device)?;
@@ -659,7 +700,9 @@ impl Qwen35Mtp {
                 };
                 tokens_gpu.push(Tensor::from_vec(vec![id], (1, 1), &self.device)?);
             } else {
-                let idx = logits.argmax(candle_core::D::Minus1)?.to_dtype(DType::U32)?;
+                let idx = logits
+                    .argmax(candle_core::D::Minus1)?
+                    .to_dtype(DType::U32)?;
                 let id = match &self.short_head {
                     Some(sh) => sh.ids.index_select(&idx.flatten_all()?, 0)?,
                     None => idx.flatten_all()?,
@@ -713,14 +756,10 @@ impl Qwen35Mtp {
         let mut root_hidden = self.slots[slot]
             .pending_target_hidden
             .clone()
-            .ok_or_else(|| candle_core::Error::Msg("MTP target hidden is not initialized".into()))?;
-        let root = self.forward_node(
-            slot,
-            target,
-            first_token,
-            root_hidden,
-            start_pos,
-        )?;
+            .ok_or_else(|| {
+                candle_core::Error::Msg("MTP target hidden is not initialized".into())
+            })?;
+        let root = self.forward_node(slot, target, first_token, root_hidden, start_pos)?;
         nodes[0] = Some(root);
 
         let mut edges = Vec::new();
@@ -749,10 +788,7 @@ impl Qwen35Mtp {
             let mut next_frontier = Vec::new();
             for (parent, state, candidate) in proposals.into_iter().take(remaining) {
                 let index = edges.len() + 1;
-                let parent_depth = nodes[parent]
-                    .as_ref()
-                    .map(|node| node.depth)
-                    .unwrap_or(0);
+                let parent_depth = nodes[parent].as_ref().map(|node| node.depth).unwrap_or(0);
                 let child = self.forward_node(
                     slot,
                     target,
@@ -855,11 +891,11 @@ impl Qwen35Mtp {
         rope_positions: Option<&[Vec<u32>; 3]>,
     ) -> Result<Tensor> {
         let (_, seq, _) = xs.dims3()?;
-        let qg = self.q.forward(xs)?.reshape((1, seq, self.profile.head_count, HEAD_DIM * 2))?;
-        let q = qg
-            .narrow(3, 0, HEAD_DIM)?
-            .transpose(1, 2)?
-            .contiguous()?;
+        let qg = self
+            .q
+            .forward(xs)?
+            .reshape((1, seq, self.profile.head_count, HEAD_DIM * 2))?;
+        let q = qg.narrow(3, 0, HEAD_DIM)?.transpose(1, 2)?.contiguous()?;
         let gate = qg
             .narrow(3, HEAD_DIM, HEAD_DIM)?
             .transpose(1, 2)?
@@ -874,14 +910,18 @@ impl Qwen35Mtp {
             .forward(xs)?
             .reshape((1, seq, self.profile.kv_head_count, HEAD_DIM))?
             .transpose(1, 2)?;
-        let q = self
-            .q_norm
-            .forward(&q.flatten(0, 2)?)?
-            .reshape((1, self.profile.head_count, seq, HEAD_DIM))?;
-        let k = self
-            .k_norm
-            .forward(&k.flatten(0, 2)?)?
-            .reshape((1, self.profile.kv_head_count, seq, HEAD_DIM))?;
+        let q = self.q_norm.forward(&q.flatten(0, 2)?)?.reshape((
+            1,
+            self.profile.head_count,
+            seq,
+            HEAD_DIM,
+        ))?;
+        let k = self.k_norm.forward(&k.flatten(0, 2)?)?.reshape((
+            1,
+            self.profile.kv_head_count,
+            seq,
+            HEAD_DIM,
+        ))?;
         let (cos, sin) = match rope_positions {
             Some(positions) => mrope_tables(positions, &self.device)?,
             None => rope_tables(start_pos, seq, &self.device)?,
@@ -927,13 +967,20 @@ impl Qwen35Mtp {
     ) -> Result<(Tensor, Tensor, usize)> {
         let (_, seq, _kv_heads, _hd) = k_new.dims4()?;
         self.ensure_kv_capacity(slot, seq)?;
-        let cache = self.slots[slot].kv.as_mut().expect("ensure_kv_capacity создаёт кеш");
+        let cache = self.slots[slot]
+            .kv
+            .as_mut()
+            .expect("ensure_kv_capacity создаёт кеш");
         let past = cache.len;
         let total = past + seq;
         cache.k.slice_set(k_new, 1, past)?;
         cache.v.slice_set(v_new, 1, past)?;
         cache.len = total;
-        Ok((cache.k.narrow(1, 0, total)?, cache.v.narrow(1, 0, total)?, total))
+        Ok((
+            cache.k.narrow(1, 0, total)?,
+            cache.v.narrow(1, 0, total)?,
+            total,
+        ))
     }
 
     /// Кеш K/V головы вмещает ещё `extra` строк; рост — перевыделение с копией
@@ -941,7 +988,11 @@ impl Qwen35Mtp {
     fn ensure_kv_capacity(&mut self, slot: usize, extra: usize) -> Result<()> {
         let kv_heads = self.profile.kv_head_count;
         let hd = HEAD_DIM;
-        let past = self.slots[slot].kv.as_ref().map(|cache| cache.len).unwrap_or(0);
+        let past = self.slots[slot]
+            .kv
+            .as_ref()
+            .map(|cache| cache.len)
+            .unwrap_or(0);
         let total = past + extra;
         let fits = self.slots[slot]
             .kv
@@ -952,7 +1003,12 @@ impl Qwen35Mtp {
         if !fits {
             // Удвоение, а не +GROW: старые буферы остаются жить (retired_kv),
             // геометрический рост держит их суммарный объём в пределах 2×.
-            let old_cap = self.slots[slot].kv.as_ref().map(|c| c.k.dim(1)).transpose()?.unwrap_or(0);
+            let old_cap = self.slots[slot]
+                .kv
+                .as_ref()
+                .map(|c| c.k.dim(1))
+                .transpose()?
+                .unwrap_or(0);
             let cap = total.max(old_cap * 2).next_multiple_of(MTP_KV_GROW);
             // Граф черновика запёк адреса старого K/V. Освободить буферы под
             // живым графом нельзя: следующая аллокация падала с
@@ -963,13 +1019,17 @@ impl Qwen35Mtp {
             #[cfg(feature = "cuda")]
             if let Some(old_graph) = self.draft_graphs[slot].take() {
                 if let Device::Cuda(d) = &self.device {
-                    d.cuda_stream()
-                        .synchronize()
-                        .map_err(|e| candle_core::Error::Msg(format!("mtp kv grow: sync before graph drop: {e:?}")))?;
+                    d.cuda_stream().synchronize().map_err(|e| {
+                        candle_core::Error::Msg(format!(
+                            "mtp kv grow: sync before graph drop: {e:?}"
+                        ))
+                    })?;
                     drop(old_graph);
-                    d.cuda_stream()
-                        .synchronize()
-                        .map_err(|e| candle_core::Error::Msg(format!("mtp kv grow: sync after graph drop: {e:?}")))?;
+                    d.cuda_stream().synchronize().map_err(|e| {
+                        candle_core::Error::Msg(format!(
+                            "mtp kv grow: sync after graph drop: {e:?}"
+                        ))
+                    })?;
                 }
                 eprintln!(
                     "[mtp] граф черновика слота {slot} снят до перевыделения кеша K/V ({past}+{extra} → cap {cap})"
@@ -1063,10 +1123,14 @@ impl Qwen35Mtp {
             _ => candle_core::bail!("draft_graphed: устройство не CUDA"),
         };
         // Ёмкость под все проходы — ДО захвата: рост меняет адреса кеша.
-        self.ensure_kv_capacity(slot, width)
-            .map_err(|e| candle_core::Error::Msg(format!("draft_graphed/ensure_kv_capacity: {e}")))?;
+        self.ensure_kv_capacity(slot, width).map_err(|e| {
+            candle_core::Error::Msg(format!("draft_graphed/ensure_kv_capacity: {e}"))
+        })?;
         let (k_ptr, cap, len) = {
-            let cache = self.slots[slot].kv.as_ref().expect("ensure_kv_capacity создаёт кеш");
+            let cache = self.slots[slot]
+                .kv
+                .as_ref()
+                .expect("ensure_kv_capacity создаёт кеш");
             (
                 crate::real::paged_kv_cuda::tensor_cuda_ptr(&cache.k)?,
                 cache.k.dim(1)?,
@@ -1096,21 +1160,29 @@ impl Qwen35Mtp {
                     // Разрушать только на пустом стриме и не выделять ничего до
                     // следующей синхронизации: освобождение внешних буферов графа
                     // рядом с instantiate соседнего ломало аллокатор (OQ-7).
-                    cuda_dev
-                        .cuda_stream()
-                        .synchronize()
-                        .map_err(|e| candle_core::Error::Msg(format!("draft_graphed/stale sync before drop: {e:?}")))?;
+                    cuda_dev.cuda_stream().synchronize().map_err(|e| {
+                        candle_core::Error::Msg(format!(
+                            "draft_graphed/stale sync before drop: {e:?}"
+                        ))
+                    })?;
                     drop(old);
-                    cuda_dev
-                        .cuda_stream()
-                        .synchronize()
-                        .map_err(|e| candle_core::Error::Msg(format!("draft_graphed/stale sync after drop: {e:?}")))?;
+                    cuda_dev.cuda_stream().synchronize().map_err(|e| {
+                        candle_core::Error::Msg(format!(
+                            "draft_graphed/stale sync after drop: {e:?}"
+                        ))
+                    })?;
                 }
                 if stale {
-                    eprintln!("[mtp] граф черновика слота {slot} перезахвачен: кеш K/V перевыделен");
+                    eprintln!(
+                        "[mtp] граф черновика слота {slot} перезахвачен: кеш K/V перевыделен"
+                    );
                 }
             }
-            let stage = |what: &'static str| move |e: candle_core::Error| candle_core::Error::Msg(format!("draft_graphed/{what}: {e}"));
+            let stage = |what: &'static str| {
+                move |e: candle_core::Error| {
+                    candle_core::Error::Msg(format!("draft_graphed/{what}: {e}"))
+                }
+            };
             let st = match self.slots[slot].draft_staging.as_ref() {
                 Some(st) => st.clone(),
                 None => {
@@ -1121,12 +1193,19 @@ impl Qwen35Mtp {
                 }
             };
             if offset == 0 {
-                st.hidden_in.slice_set(&hidden0, 0, 0).map_err(stage("hidden_in"))?;
-                st.len_dev.slice_set(&len_t, 0, 0).map_err(stage("len_dev"))?;
+                st.hidden_in
+                    .slice_set(&hidden0, 0, 0)
+                    .map_err(stage("hidden_in"))?;
+                st.len_dev
+                    .slice_set(&len_t, 0, 0)
+                    .map_err(stage("len_dev"))?;
             }
-            let emb = target.embed_for_graph(&[token], &self.device).map_err(stage("embed_for_graph"))?; // [1,1,H] F32
+            let emb = target
+                .embed_for_graph(&[token], &self.device)
+                .map_err(stage("embed_for_graph"))?; // [1,1,H] F32
             st.emb_in.slice_set(&emb, 0, 0).map_err(stage("emb_in"))?;
-            let (cos, sin) = rope_tables(start_pos + offset, 1, &self.device).map_err(stage("rope_tables"))?;
+            let (cos, sin) =
+                rope_tables(start_pos + offset, 1, &self.device).map_err(stage("rope_tables"))?;
             st.cos_in.slice_set(&cos, 0, 0).map_err(stage("cos_in"))?;
             st.sin_in.slice_set(&sin, 0, 0).map_err(stage("sin_in"))?;
 
@@ -1135,7 +1214,8 @@ impl Qwen35Mtp {
                 // (не исполняется). Guard: параметры ядер — через htod-кэш,
                 // иначе в захват попал бы pageable memcpy.
                 let _guard = cuda_dev.enable_cuda_graph_htod_cache();
-                self.draft_pass_body(slot, &st).map_err(stage("prime_pass"))?;
+                self.draft_pass_body(slot, &st)
+                    .map_err(stage("prime_pass"))?;
                 let stream = cuda_dev.cuda_stream();
                 let captured = (|| -> Result<(csys::CUgraphExec, csys::CUgraph)> {
                     unsafe {
@@ -1144,13 +1224,19 @@ impl Qwen35Mtp {
                             csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
                         )
                     }
-                    .map_err(|e| candle_core::Error::Msg(format!("draft_graphed/begin_capture: {e:?}")))?;
+                    .map_err(|e| {
+                        candle_core::Error::Msg(format!("draft_graphed/begin_capture: {e:?}"))
+                    })?;
                     if let Err(e) = self.draft_pass_body(slot, &st) {
                         let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
-                        return Err(candle_core::Error::Msg(format!("draft_graphed/capture_pass: {e}")));
+                        return Err(candle_core::Error::Msg(format!(
+                            "draft_graphed/capture_pass: {e}"
+                        )));
                     }
                     let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
-                        .map_err(|e| candle_core::Error::Msg(format!("draft_graphed/end_capture: {e:?}")))?;
+                        .map_err(|e| {
+                            candle_core::Error::Msg(format!("draft_graphed/end_capture: {e:?}"))
+                        })?;
                     if cu_graph.is_null() {
                         candle_core::bail!("end_capture вернул пустой граф");
                     }
@@ -1199,7 +1285,10 @@ impl Qwen35Mtp {
                     let row = len_before.to_vec1::<u32>()?[0] as usize;
                     let (k_row_g, v_row_g) = {
                         let cache = self.slots[slot].kv.as_ref().expect("кеш есть");
-                        (cache.k.narrow(1, row, 1)?.copy()?, cache.v.narrow(1, row, 1)?.copy()?)
+                        (
+                            cache.k.narrow(1, row, 1)?.copy()?,
+                            cache.v.narrow(1, row, 1)?.copy()?,
+                        )
                     };
                     // Тот же проход eager на тех же входах.
                     st.hidden_in.slice_set(&hidden_before, 0, 0)?;
@@ -1242,7 +1331,10 @@ impl Qwen35Mtp {
             // Лог id черновика: печатается там, где D2H уже произошёл, поэтому
             // сам замер синхронизации не добавляет и окно гонки не сдвигает.
             if draft_id_log() {
-                eprintln!("[mtp-draft] slot={slot} pass={offset} pos={} id={token}", start_pos + offset);
+                eprintln!(
+                    "[mtp-draft] slot={slot} pass={offset} pos={} id={token}",
+                    start_pos + offset
+                );
             }
             // Зеркало длины на хосте (граф инкрементировал len_dev).
             self.slots[slot].kv.as_mut().expect("кеш есть").len += 1;
@@ -1254,11 +1346,25 @@ impl Qwen35Mtp {
     /// head_norm + shared_head + argmax, но все входы — из `st`, все выходы —
     /// в `st`, длина кеша — на устройстве. Захватывается графом целиком.
     fn draft_pass_body(&mut self, slot: usize, st: &DraftStaging) -> Result<()> {
-        let body = |what: &'static str| move |e: candle_core::Error| candle_core::Error::Msg(format!("pass_body/{what}: {e}"));
+        let body = |what: &'static str| {
+            move |e: candle_core::Error| candle_core::Error::Msg(format!("pass_body/{what}: {e}"))
+        };
         let e = self.enorm.forward(&st.emb_in).map_err(body("enorm"))?;
         let h = self.hnorm.forward(&st.hidden_in).map_err(body("hnorm"))?;
-        let projected = self.eh_proj.forward(&Tensor::cat(&[&e, &h], 2).map_err(body("cat"))?).map_err(body("eh_proj"))?;
-        let mixed = self.attention_graphed(slot, &self.attn_norm.forward(&projected).map_err(body("attn_norm"))?, st).map_err(body("attention_graphed"))?;
+        let projected = self
+            .eh_proj
+            .forward(&Tensor::cat(&[&e, &h], 2).map_err(body("cat"))?)
+            .map_err(body("eh_proj"))?;
+        let mixed = self
+            .attention_graphed(
+                slot,
+                &self
+                    .attn_norm
+                    .forward(&projected)
+                    .map_err(body("attn_norm"))?,
+                st,
+            )
+            .map_err(body("attention_graphed"))?;
         let after_attention = (mixed + &projected)?;
         let ffn = self.ffn_norm.forward(&after_attention)?;
         let pre = match &self.ffn {
@@ -1273,7 +1379,10 @@ impl Qwen35Mtp {
             }
         }?; // [1,1,H] — unwrap Result<Tensor> для .i() ниже
         let pre_head = pre.i((.., 0, ..)).map_err(body("pre_head"))?; // [1,H]
-        let normalized = self.head_norm.forward(&pre_head).map_err(body("head_norm"))?;
+        let normalized = self
+            .head_norm
+            .forward(&pre_head)
+            .map_err(body("head_norm"))?;
         let logits = match &self.short_head {
             Some(sh) => sh.proj.forward(&normalized)?, // [1, n_short]
             None => self.shared_head.forward(&normalized)?, // [1, V]
@@ -1288,7 +1397,9 @@ impl Qwen35Mtp {
         };
         st.out_id.slice_set(&id, 0, 0).map_err(body("out_id"))?;
         // hidden следующего прохода = pre_head (как в eager-цикле).
-        st.hidden_in.slice_set(&pre, 0, 0).map_err(body("hidden_next"))?;
+        st.hidden_in
+            .slice_set(&pre, 0, 0)
+            .map_err(body("hidden_next"))?;
         // len += 1 — после внимания: ядро дописи и seqlens читали прежнюю длину.
         let next = st.len_dev.broadcast_add(&st.one_u32)?;
         st.len_dev.slice_set(&next, 0, 0)?;
@@ -1303,7 +1414,10 @@ impl Qwen35Mtp {
         let kv_heads = self.profile.kv_head_count;
         let qg = self.q.forward(xs)?.reshape((1, 1, heads, HEAD_DIM * 2))?;
         let q = qg.narrow(3, 0, HEAD_DIM)?.transpose(1, 2)?.contiguous()?; // [1,H,1,hd]
-        let gate = qg.narrow(3, HEAD_DIM, HEAD_DIM)?.transpose(1, 2)?.contiguous()?;
+        let gate = qg
+            .narrow(3, HEAD_DIM, HEAD_DIM)?
+            .transpose(1, 2)?
+            .contiguous()?;
         let k = self
             .k
             .forward(xs)?
@@ -1335,10 +1449,22 @@ impl Qwen35Mtp {
         })?;
         let cap = cache.k.dim(1)?;
         crate::real::paged_kv_cuda::launch_kv_append_flat_f16(
-            &dev, &cache.k, &cache.v, &k_new, &v_new, &st.len_dev, kv_heads, HEAD_DIM, cap,
+            &dev,
+            &cache.k,
+            &cache.v,
+            &k_new,
+            &v_new,
+            &st.len_dev,
+            kv_heads,
+            HEAD_DIM,
+            cap,
         )?;
         crate::real::paged_kv_cuda::launch_seqlens_from_len(
-            &dev, &st.len_dev, &st.zero_slot, &st.seqlens_k, 1,
+            &dev,
+            &st.len_dev,
+            &st.zero_slot,
+            &st.seqlens_k,
+            1,
         )?;
         let scale = 1.0 / (HEAD_DIM as f64).sqrt();
         let q_f = q
@@ -1413,11 +1539,7 @@ fn mrope_tables(positions: &[Vec<u32>; 3], device: &Device) -> Result<(Tensor, T
 
 fn apply_partial_rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let (_, _, _, dim) = xs.dims4()?;
-    let rotated = candle_nn::rotary_emb::rope(
-        &xs.narrow(3, 0, ROPE_DIM)?.contiguous()?,
-        cos,
-        sin,
-    )?;
+    let rotated = candle_nn::rotary_emb::rope(&xs.narrow(3, 0, ROPE_DIM)?.contiguous()?, cos, sin)?;
     Tensor::cat(&[&rotated, &xs.narrow(3, ROPE_DIM, dim - ROPE_DIM)?], 3)
 }
 

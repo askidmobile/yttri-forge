@@ -28,9 +28,9 @@ use crate::real::model_weights::{
     BatchedStateCheckpoint, BlockStateSnap, ModelWeights, StateSnapshot, DECODE_BATCH_CAPACITY,
 };
 use crate::real::mtp::Qwen35Mtp;
-use crate::spec_tree::FlatTrie;
 use crate::real::multimodal::{GridThw, PositionPlan};
 use crate::real::vision::Qwen35Vision;
+use crate::spec_tree::FlatTrie;
 
 /// Незавершённый batched verify: K inputs съедены multi-token forward'ом,
 /// hidden-строки всех K позиций ждут `speculative_accept` (выравнивание state
@@ -735,7 +735,6 @@ impl Qwen35BatchAdapter {
                 .map_err(|e| anyhow!("prepare expert offload: {e}"))?;
         }
 
-
         // F16-GEMM сайдкара по умолчанию аккумулирует в F32 (как в pytorch).
         // На Ampere это вдвое медленнее F16-аккумуляции. F16_FAST_ACC=1
         // включает CUBLAS_COMPUTE_16F — быстрее, но копит ошибку по K=2560;
@@ -911,7 +910,9 @@ impl Qwen35BatchAdapter {
     /// запись prefix-кеша вызывающий, чтобы попадание «ровно в длину» не
     /// требовало ни одного токена prefill'а.
     pub fn take_prefill_logits(&mut self, slot: usize) -> Option<Vec<f32>> {
-        self.slot_prefill_logits.get_mut(slot).and_then(|l| l.take())
+        self.slot_prefill_logits
+            .get_mut(slot)
+            .and_then(|l| l.take())
     }
 
     /// Поколение промпта в слоте (см. `slot_gen`).
@@ -1138,7 +1139,11 @@ impl Qwen35BatchAdapter {
 #[cfg(feature = "cuda")]
 fn trim_pool_cuda(device: &candle_core::Device) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var("YTTRI_TRIM").map(|v| v != "0").unwrap_or(true));
+    let on = *ON.get_or_init(|| {
+        std::env::var("YTTRI_TRIM")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    });
     if !on {
         return;
     }
@@ -1504,7 +1509,9 @@ impl BatchModel for Qwen35BatchAdapter {
         let capture_position = chunk.start_pos >= prefix_cache_min_pos()
             && chunk.start_pos <= prefix_limit
             && (capture_boundary || capture_final);
-        let already_captured = self.slot_prefix_snaps[sidx].iter().any(|(pos, _)| *pos == chunk.start_pos);
+        let already_captured = self.slot_prefix_snaps[sidx]
+            .iter()
+            .any(|(pos, _)| *pos == chunk.start_pos);
         if self.capture_prefix && capture_position && !already_captured {
             let t_cap = std::time::Instant::now();
             // Снимок остаётся device-side: перенос в host-память (~186 мс и
@@ -1628,7 +1635,8 @@ impl BatchModel for Qwen35BatchAdapter {
             // ([1, T]), поэтому embedding отдаёт rank-3 и лишний unsqueeze
             // давал rank-4 [1,1,T,H] — forward падал с «unexpected rank ... got: 4».
             // Приводим форму явно, не завязываясь на ранг входа.
-            let embeds_3d = embeds.reshape((1usize, chunk.tokens.len(), self.model.hidden_size()))?;
+            let embeds_3d =
+                embeds.reshape((1usize, chunk.tokens.len(), self.model.hidden_size()))?;
             let (logits, hidden) = self
                 .model
                 .forward_embeds_with_hidden(&embeds_3d, chunk.start_pos)
@@ -1669,34 +1677,34 @@ impl BatchModel for Qwen35BatchAdapter {
         // их читает только финальный (scheduler.step сэмплирует первый токен
         // лишь когда промпт исчерпан). Синхронный D2H при этом держит хост
         // ~5 с на чанк и не даёт ставить следующие ядра заранее.
-        let skip_mid_logits = !chunk.is_final
-            && std::env::var("PREFILL_SKIP_MID_LOGITS").as_deref() == Ok("1");
+        let skip_mid_logits =
+            !chunk.is_final && std::env::var("PREFILL_SKIP_MID_LOGITS").as_deref() == Ok("1");
         let logits_f32 = if skip_mid_logits {
             Vec::new()
         } else {
             match logits {
-            // Логиты снимаются через pinned-буфер (тот же, что в декоде):
-            // `to_vec1()` идёт через pageable staging и на этом объёме
-            // (993 КБ) стоит ~360 мс на чанк по [pfa] — 0.7 с на 30k-префил.
-            Some(l) => {
-                #[cfg(feature = "cuda")]
-                {
-                    pinned_logits::to_vec_f32(&self.device, &l)
-                        .map_err(|e| anyhow!("prefill logits (pinned): {e}"))?
+                // Логиты снимаются через pinned-буфер (тот же, что в декоде):
+                // `to_vec1()` идёт через pageable staging и на этом объёме
+                // (993 КБ) стоит ~360 мс на чанк по [pfa] — 0.7 с на 30k-префил.
+                Some(l) => {
+                    #[cfg(feature = "cuda")]
+                    {
+                        pinned_logits::to_vec_f32(&self.device, &l)
+                            .map_err(|e| anyhow!("prefill logits (pinned): {e}"))?
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        l.squeeze(0)
+                            .map_err(|e| anyhow!("prefill logits squeeze: {e}"))?
+                            .to_dtype(DType::F32)
+                            .map_err(|e| anyhow!("prefill logits to_dtype: {e}"))?
+                            .to_vec1()
+                            .map_err(|e| anyhow!("prefill logits to_vec1: {e}"))?
+                    }
                 }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    l.squeeze(0)
-                        .map_err(|e| anyhow!("prefill logits squeeze: {e}"))?
-                        .to_dtype(DType::F32)
-                        .map_err(|e| anyhow!("prefill logits to_dtype: {e}"))?
-                        .to_vec1()
-                        .map_err(|e| anyhow!("prefill logits to_vec1: {e}"))?
-                }
-            }
-            None => pg_logits
-                .clone()
-                .ok_or_else(|| anyhow!("prefill: логиты не посчитаны"))?,
+                None => pg_logits
+                    .clone()
+                    .ok_or_else(|| anyhow!("prefill: логиты не посчитаны"))?,
             }
         };
         let pf_logits = pf_l0.elapsed();
@@ -1796,11 +1804,7 @@ impl BatchModel for Qwen35BatchAdapter {
             // Полный промпт — отдельная запись кеша (см. prefix_cache_full_hit_enabled):
             // KV едет как Arc-вид на single-slot кэш, воркер копирует его в host
             // асинхронно, поэтому на критическом пути остаётся только клон Arc.
-            if self.capture_prefix
-                && !pg_used
-                && prefix_cache_full_hit_enabled()
-                && new_pos > 0
-            {
+            if self.capture_prefix && !pg_used && prefix_cache_full_hit_enabled() && new_pos > 0 {
                 let t_full = std::time::Instant::now();
                 let cache_snap = if prefix_cache_pool_backed() {
                     self.model
@@ -1830,10 +1834,15 @@ impl BatchModel for Qwen35BatchAdapter {
             #[cfg(feature = "cuda")]
             let seeded_device = {
                 // Откат для A/B: QWEN36_D2D_SEED=0 возвращает host-путь seed'а.
-                if std::env::var("QWEN36_D2D_SEED").map(|v| v != "0").unwrap_or(true) {
+                if std::env::var("QWEN36_D2D_SEED")
+                    .map(|v| v != "0")
+                    .unwrap_or(true)
+                {
                     self.model
                         .seed_slot_batched_from_device(sidx, snap_ref)
-                        .map_err(|error| anyhow!("prefill seed(from device) slot {sidx}: {error}"))?;
+                        .map_err(|error| {
+                            anyhow!("prefill seed(from device) slot {sidx}: {error}")
+                        })?;
                     true
                 } else {
                     false
@@ -2021,7 +2030,8 @@ impl BatchModel for Qwen35BatchAdapter {
         // CUDA-graph decode: один cuGraphLaunch на весь forward. None → eager.
         #[cfg(feature = "cuda")]
         {
-            let graphed = self.decode_batch_graphed(b, &tokens, &rope_positions, &slots, &positions);
+            let graphed =
+                self.decode_batch_graphed(b, &tokens, &rope_positions, &slots, &positions);
             if crate::scheduler::trace_on() {
                 static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2171,7 +2181,7 @@ impl BatchModel for Qwen35BatchAdapter {
     /// Возвращает `FlatTrie` и одновременно загружает trie-маску в adapter:
     /// scheduler должен немедленно вызвать `speculative_verify` с токенами
     /// этого же дерева (см. `tree_verify_inputs`).
-    pub fn draft_tree(
+    fn speculative_draft_tree(
         &mut self,
         slot: usize,
         token: u32,
@@ -2184,15 +2194,7 @@ impl BatchModel for Qwen35BatchAdapter {
             .mtp
             .as_mut()
             .ok_or_else(|| anyhow!("MTP component is not loaded"))?
-            .draft_tree(
-                slot,
-                token,
-                rope_pos,
-                budget,
-                depth,
-                branching,
-                &self.model,
-            )
+            .draft_tree(slot, token, rope_pos, budget, depth, branching, &self.model)
             .map_err(|error| anyhow!("MTP draft tree: {error}"))?;
         let staging = tree.staging();
         let trie_ranges = staging
@@ -2211,7 +2213,7 @@ impl BatchModel for Qwen35BatchAdapter {
     /// input узла — токен родителя. Root-sentinel не подаётся, поэтому строки
     /// 1..len соответствуют узлам 1..len. Для листьев это даёт логиты их
     /// продолжений; приём пути использует только первые `accepted` строк.
-    pub fn tree_verify_inputs(&self, current_token: u32, tree: &FlatTrie) -> Vec<u32> {
+    fn speculative_tree_inputs(&self, current_token: u32, tree: &FlatTrie) -> Vec<u32> {
         let staging = tree.staging();
         (1..tree.len())
             .map(|node| {
@@ -2247,10 +2249,7 @@ impl BatchModel for Qwen35BatchAdapter {
                 if ranges.len() % 2 != 0 {
                     anyhow::bail!("trie_ranges must contain [start,end] pairs");
                 }
-                if ranges
-                    .iter()
-                    .any(|&v| usize::try_from(v).is_err())
-                {
+                if ranges.iter().any(|&v| usize::try_from(v).is_err()) {
                     anyhow::bail!("trie_ranges values must be non-negative");
                 }
                 self.verify_trie = Some(Tensor::from_vec(
@@ -2298,7 +2297,14 @@ impl BatchModel for Qwen35BatchAdapter {
                 ));
             }
             let rope_host: Vec<u32> = rope_positions.iter().map(|&p| p as u32).collect();
-            let (flat, hidden, _) = self.paged_graph_run(true, slot, pos, inputs, rope_host, self.verify_trie.as_ref())?;
+            let (flat, hidden, _) = self.paged_graph_run(
+                true,
+                slot,
+                pos,
+                inputs,
+                rope_host,
+                self.verify_trie.as_ref(),
+            )?;
             self.model.paged_ctx.as_mut().unwrap().kv_len_host[slot] = (pos + k) as u32;
             // Графовый путь зовёт forward_verify_paged с shadow=true: при k>1
             // теневые снимки записаны, откат может на них опереться.
