@@ -77,6 +77,22 @@ struct ShortHead {
     ids_host: Vec<u32>,
 }
 
+#[derive(Clone)]
+struct TreeDraftState {
+    hidden: Tensor,
+    logits: Vec<f32>,
+    depth: usize,
+    path_score: f32,
+}
+
+/// Top-k host для tree-драфта. Токены уже id (shortlist map выполняется выше).
+fn top_k_host(
+    logits: &[f32],
+    k: usize,
+) -> Vec<crate::spec_tree::TreeDraftCandidate> {
+    crate::spec_tree::top_k_candidates(logits, k)
+}
+
 pub struct Qwen35Mtp {
     profile: MtpProfile,
     device: Device,
@@ -667,6 +683,129 @@ impl Qwen35Mtp {
             out.push(tg.flatten_all()?.to_vec1::<u32>()?[0]);
         }
         Ok(out)
+    }
+
+    /// Ветвящийся драфт для tree speculative decoding.
+    ///
+    /// Реализация остаётся eager: каждый узел считается одним проходом MTP.
+    /// Это первый корректный контур: он даёт дерево для однопроходной проверки
+    /// target, но пока не даёт главного выигрыша в самом draft. Узлы хранятся в
+    /// linear-порядке `FlatTrie`, где parent всегда раньше child.
+    pub fn draft_tree(
+        &mut self,
+        slot: usize,
+        first_token: u32,
+        start_pos: usize,
+        budget: usize,
+        depth: usize,
+        branching: usize,
+        target: &ModelWeights,
+    ) -> Result<crate::spec_tree::FlatTrie> {
+        self.check_slot(slot)?;
+        if self.transactions[slot].is_none() {
+            candle_core::bail!("MTP draft requires active transaction");
+        }
+        if budget == 0 || depth == 0 || branching == 0 {
+            candle_core::bail!("tree draft requires positive budget/depth/branching");
+        }
+
+        let mut nodes: Vec<Option<TreeDraftState>> = vec![None];
+        let mut root_hidden = self.slots[slot]
+            .pending_target_hidden
+            .clone()
+            .ok_or_else(|| candle_core::Error::Msg("MTP target hidden is not initialized".into()))?;
+        let root = self.forward_node(
+            slot,
+            target,
+            first_token,
+            root_hidden,
+            start_pos,
+        )?;
+        nodes[0] = Some(root);
+
+        let mut edges = Vec::new();
+        let mut frontier = vec![0usize];
+        for _ in 0..depth {
+            if frontier.is_empty() || edges.len() + 1 >= budget {
+                break;
+            }
+            let mut proposals = Vec::new();
+            for &node in &frontier {
+                let Some(state) = nodes[node].clone() else {
+                    candle_core::bail!("tree draft node {node} is missing");
+                };
+                for candidate in top_k_host(&state.logits, branching) {
+                    proposals.push((node, state.clone(), candidate));
+                }
+            }
+            proposals.sort_by(|a, b| {
+                let score_a = a.1.path_score + a.2.logprob;
+                let score_b = b.1.path_score + b.2.logprob;
+                score_b
+                    .total_cmp(&score_a)
+                    .then_with(|| a.2.token.cmp(&b.2.token))
+            });
+            let remaining = budget - edges.len() - 1;
+            let mut next_frontier = Vec::new();
+            for (parent, state, candidate) in proposals.into_iter().take(remaining) {
+                let index = edges.len() + 1;
+                let parent_depth = nodes[parent]
+                    .as_ref()
+                    .map(|node| node.depth)
+                    .unwrap_or(0);
+                let child = self.forward_node(
+                    slot,
+                    target,
+                    candidate.token,
+                    state.hidden,
+                    start_pos + parent_depth + 1,
+                )?;
+                nodes.push(Some(TreeDraftState {
+                    hidden: child.hidden,
+                    logits: child.logits,
+                    depth: parent_depth + 1,
+                    path_score: state.path_score + candidate.logprob,
+                }));
+                edges.push((parent, candidate.token, candidate.logprob));
+                next_frontier.push(index);
+            }
+            frontier = next_frontier;
+        }
+        Ok(crate::spec_tree::FlatTrie::from_edges(&edges))
+    }
+
+    fn forward_node(
+        &mut self,
+        slot: usize,
+        target: &ModelWeights,
+        token: u32,
+        target_hidden: Tensor,
+        rope_pos: usize,
+    ) -> Result<TreeDraftState> {
+        let token_t = Tensor::from_vec(vec![token], (1, 1), &self.device)?;
+        let embedding = target.embed_tokens(&token_t, &self.device)?;
+        let mtp_hidden = self.forward_rows(
+            slot,
+            &embedding,
+            &target_hidden.unsqueeze(1)?,
+            rope_pos,
+            None,
+        )?;
+        let pre_head = mtp_hidden.i((.., 0, ..))?;
+        let normalized = self.head_norm.forward(&pre_head)?;
+        let logits = match &self.short_head {
+            Some(sh) => sh.proj.forward(&normalized)?,
+            None => self.shared_head.forward(&normalized)?,
+        }?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+        Ok(TreeDraftState {
+            hidden: pre_head,
+            logits,
+            depth: 0,
+            path_score: 0.0,
+        })
     }
 
     fn forward_rows(
