@@ -147,19 +147,24 @@ struct Mask {
         if (trie_ranges == nullptr || col_idx >= max_seqlen_k) {
             return false;
         }
-        const int node_idx = rows_per_position > 1 ? row_idx / rows_per_position : row_idx;
+        const int query_node = rows_per_position > 1 ? row_idx / rows_per_position : row_idx;
         const int tree_len = rows_per_position > 1 ? max_seqlen_q / rows_per_position : max_seqlen_q;
         const int prefix_len = max_seqlen_k - tree_len;
-        if (prefix_len < 0 || node_idx >= tree_len) {
+        if (prefix_len < 0 || query_node >= tree_len) {
             return false;
         }
         if (col_idx < prefix_len) {
             return true;
         }
-        const int suffix_idx = col_idx - prefix_len;
-        const int start = trie_ranges[node_idx * 2];
-        const int end = trie_ranges[node_idx * 2 + 1];
-        return suffix_idx >= start && suffix_idx <= end;
+        const int key_node = col_idx - prefix_len;
+        if (key_node >= tree_len) {
+            return false;
+        }
+        // Диапазон принадлежит КЛЮЧУ: query видит key, если query-строка
+        // лежит в поддереве key (root виден всем, sibling — только своей ветке).
+        const int start = trie_ranges[key_node * 2];
+        const int end = trie_ranges[key_node * 2 + 1];
+        return query_node >= start && query_node <= end;
     }
 
     __forceinline__ __device__ bool mm_prefix_allowed(const int row_idx, const int col_idx) const {

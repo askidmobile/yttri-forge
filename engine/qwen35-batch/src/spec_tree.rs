@@ -57,19 +57,22 @@ pub struct TreeStaging {
 /// `prefix_len` — длина committed-префикса; узел дерева занимает суффикс после него.
 /// Это host-эталон для CUDA-маски: полезен в тестах и CPU-fallback.
 pub fn trie_mask_allows(staging: &TreeStaging, prefix_len: usize, row: usize, key: usize) -> bool {
-    let Some(&node) = staging.depths.get(row) else {
+    if row >= staging.depths.len() {
         return false;
-    };
+    }
     if key < prefix_len {
         return true;
     }
-    if node as usize >= staging.depths.len() {
+    let key_node = key - prefix_len;
+    if key_node >= staging.depths.len() {
         return false;
     }
-    let suffix = key - prefix_len;
-    let start = staging.starts[row] as usize;
-    let end = staging.ends[row] as usize;
-    suffix >= start && suffix <= end
+    // Диапазон принадлежит КЛЮЧУ: строка `row` видит ключ `key_node`,
+    // если она лежит в поддереве этого ключа. Так root виден всем строкам,
+    // а брат/сестра — только строкам своей ветки.
+    let start = staging.starts[key_node] as usize;
+    let end = staging.ends[key_node] as usize;
+    row >= start && row <= end
 }
 
 /// Стабильный top-k по logprob. При равных значениях выигрывает меньший token id.
@@ -458,16 +461,17 @@ mod tests {
         let trie = FlatTrie::from_edges(&[(0, 1, -1.0), (1, 2, -2.0), (0, 3, -3.0), (3, 4, -4.0)]);
         let staging = trie.staging();
         let prefix_len = 7;
-        // Узел 1 видит prefix и своё поддерево 1..2, но не соседнюю ветку 3..4.
-        assert!(trie_mask_allows(&staging, prefix_len, 1, 6));
+        // Root-ключ (suffix 0) виден всем строкам дерева.
+        assert!(trie_mask_allows(&staging, prefix_len, 1, 7));
+        assert!(trie_mask_allows(&staging, prefix_len, 3, 7));
+        // Ключ узла 1 виден строкам его поддерева 1..2, но не соседней ветке.
         assert!(trie_mask_allows(&staging, prefix_len, 1, 8));
-        assert!(trie_mask_allows(&staging, prefix_len, 1, 9));
-        assert!(!trie_mask_allows(&staging, prefix_len, 1, 10));
-        assert!(!trie_mask_allows(&staging, prefix_len, 1, 11));
-        // Соседний узел 3 видит свою ветку 3..4, но не узел 2.
+        assert!(trie_mask_allows(&staging, prefix_len, 2, 8));
+        assert!(!trie_mask_allows(&staging, prefix_len, 3, 8));
+        // Ключ узла 3 виден только своей ветке 3..4.
         assert!(trie_mask_allows(&staging, prefix_len, 3, 10));
-        assert!(trie_mask_allows(&staging, prefix_len, 3, 11));
-        assert!(!trie_mask_allows(&staging, prefix_len, 3, 9));
+        assert!(trie_mask_allows(&staging, prefix_len, 4, 10));
+        assert!(!trie_mask_allows(&staging, prefix_len, 1, 10));
     }
 
     #[test]
