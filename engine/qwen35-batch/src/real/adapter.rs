@@ -2160,6 +2160,34 @@ impl BatchModel for Qwen35BatchAdapter {
     /// Attention batched decode обрабатывает строки по порядку (append по
     /// cache_len), DeltaNet сериализует одинаковые слоты — те же decode-ядра,
     /// что и K одиночных шагов, бит-эксактно.
+    /// Загрузить trie-маску tree-verify. Пары [start,end] идут по строкам дерева.
+    ///
+    /// Метод отделён от `speculative_verify`, чтобы scheduler сначала построил
+    /// дерево/inputs, затем передал его в адаптер, а потом вызвал verify.
+    /// `None` очищает маску и возвращает обычную причинную проверку.
+    pub fn set_verify_tree(&mut self, trie_ranges: Option<Vec<i32>>) -> Result<()> {
+        match trie_ranges {
+            Some(mut ranges) => {
+                if ranges.len() % 2 != 0 {
+                    anyhow::bail!("trie_ranges must contain [start,end] pairs");
+                }
+                if ranges
+                    .iter()
+                    .any(|&v| usize::try_from(v).is_err())
+                {
+                    anyhow::bail!("trie_ranges values must be non-negative");
+                }
+                self.verify_trie = Some(Tensor::from_vec(
+                    ranges,
+                    (ranges.len() / 2, 2usize),
+                    &self.device,
+                )?);
+            }
+            None => self.verify_trie = None,
+        }
+        Ok(())
+    }
+
     fn speculative_verify(
         &mut self,
         slot: usize,
