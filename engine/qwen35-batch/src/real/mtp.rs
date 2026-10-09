@@ -832,7 +832,7 @@ impl Qwen35Mtp {
         let logits = match &self.short_head {
             Some(sh) => sh.proj.forward(&normalized)?,
             None => self.shared_head.forward(&normalized)?,
-        }?
+        }
         .to_dtype(DType::F32)?
         .flatten_all()?
         .to_vec1::<f32>()?;

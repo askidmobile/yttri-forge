@@ -2245,18 +2245,15 @@ impl BatchModel for Qwen35BatchAdapter {
         self.verify_tree_rows = tree_rows;
 
         match trie_ranges {
-            Some(mut ranges) => {
+            Some(ranges) => {
                 if ranges.len() % 2 != 0 {
                     anyhow::bail!("trie_ranges must contain [start,end] pairs");
                 }
                 if ranges.iter().any(|&v| usize::try_from(v).is_err()) {
                     anyhow::bail!("trie_ranges values must be non-negative");
                 }
-                self.verify_trie = Some(Tensor::from_vec(
-                    ranges,
-                    (ranges.len() / 2, 2usize),
-                    &self.device,
-                )?);
+                let shape = (ranges.len() / 2, 2usize);
+                self.verify_trie = Some(Tensor::from_vec(ranges, shape, &self.device)?);
             }
             None => self.verify_trie = None,
         }
