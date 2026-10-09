@@ -2173,7 +2173,7 @@ impl BatchModel for Qwen35BatchAdapter {
     /// Метод отделён от `speculative_verify`, чтобы scheduler сначала построил
     /// дерево/inputs, затем передал его в адаптер, а потом вызвал verify.
     /// `None` очищает маску и возвращает обычную причинную проверку.
-    pub fn set_verify_tree(
+    fn set_speculative_tree(
         &mut self,
         trie_ranges: Option<Vec<i32>>,
         tree_rows: Option<Vec<usize>>,
@@ -2252,14 +2252,17 @@ impl BatchModel for Qwen35BatchAdapter {
                 self.verify_eager(inputs, &cache_positions, &rope_positions, &slots)?;
             (flat, hidden, false)
         };
+        let tree_rows = self.verify_tree_rows.take();
+        let verify_trie = self.verify_trie.take();
         self.verify_pending[slot] = Some(PendingVerify {
             inputs: inputs.to_vec(),
             pos,
             hidden,
             shadow_written,
-            tree_rows: self.verify_tree_rows.take(),
+            tree_rows,
         });
         let vocab = self.vocab_size();
+        let _ = verify_trie;
         if flat.len() != k * vocab {
             return Err(anyhow!(
                 "speculative verify logits length {} != {k} * vocab {vocab}",

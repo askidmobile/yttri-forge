@@ -221,6 +221,22 @@ pub trait BatchModel {
         anyhow::bail!("model does not support speculative transactions")
     }
 
+    /// Загрузить маску дерева для следующего `speculative_verify`.
+    ///
+    /// Контракт tree speculative decoding:
+    /// - `trie_ranges` — пары [start,end] по строкам запроса;
+    /// - `tree_rows` — отображение строки запроса в узел исходного дерева.
+    ///
+    /// Модель обязана очистить состояние после accept/rollback. Реализация
+    /// без tree-поддержки должна вернуть ошибку при непустой маске.
+    fn set_speculative_tree(
+        &mut self,
+        _trie_ranges: Option<Vec<i32>>,
+        _tree_rows: Option<Vec<usize>>,
+    ) -> Result<()> {
+        anyhow::bail!("model does not support speculative tree verify")
+    }
+
     /// Выровнять target state после verify: оставить ровно `consumed` первых
     /// inputs (при consumed < K — откат к checkpoint'у транзакции и re-run
     /// принятого префикса одним чанком) и удержать hidden-строки 0..consumed
@@ -286,6 +302,13 @@ impl<T: BatchModel + ?Sized> BatchModel for &mut T {
     }
     fn speculative_accept(&mut self, slot: usize, consumed: usize) -> Result<()> {
         (**self).speculative_accept(slot, consumed)
+    }
+    fn set_speculative_tree(
+        &mut self,
+        trie_ranges: Option<Vec<i32>>,
+        tree_rows: Option<Vec<usize>>,
+    ) -> Result<()> {
+        (**self).set_speculative_tree(trie_ranges, tree_rows)
     }
     fn speculative_commit(&mut self, slot: usize) -> Result<()> {
         (**self).speculative_commit(slot)
