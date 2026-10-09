@@ -21,6 +21,7 @@
 
 pub mod model;
 pub mod scheduler;
+pub mod spec_tree;
 pub mod slot;
 
 /// Реальная GGUF-модель Qwen3.5 (порт из Yttri) — только за фичей `real-model`.
