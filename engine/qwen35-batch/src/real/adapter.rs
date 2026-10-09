@@ -2197,11 +2197,14 @@ impl BatchModel for Qwen35BatchAdapter {
             .draft_tree(slot, token, rope_pos, budget, depth, branching, &self.model)
             .map_err(|error| anyhow!("MTP draft tree: {error}"))?;
         let staging = tree.staging();
+        // Rows дерева начинаются с узла 1: root-sentinel не подаётся как input.
+        // Поэтому диапазоны ключей переводятся из индексов дерева в индексы строк.
         let trie_ranges = staging
             .starts
             .iter()
             .zip(&staging.ends)
-            .flat_map(|(&start, &end)| [start as i32, end as i32])
+            .skip(1)
+            .flat_map(|(&start, &end)| [start as i32 - 1, end as i32 - 1])
             .collect::<Vec<_>>();
         self.set_speculative_tree(Some(trie_ranges), Some((1..tree.len()).collect()))?;
         Ok(tree)
