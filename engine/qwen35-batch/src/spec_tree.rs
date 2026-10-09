@@ -52,6 +52,26 @@ pub struct TreeStaging {
     pub ends: Vec<u32>,
 }
 
+/// Проверить, видит ли строка `row` ключ `key` в host-маске tree-attention.
+///
+/// `prefix_len` — длина committed-префикса; узел дерева занимает суффикс после него.
+/// Это host-эталон для CUDA-маски: полезен в тестах и CPU-fallback.
+pub fn trie_mask_allows(staging: &TreeStaging, prefix_len: usize, row: usize, key: usize) -> bool {
+    let Some(&node) = staging.depths.get(row) else {
+        return false;
+    };
+    if key < prefix_len {
+        return true;
+    }
+    if node as usize >= staging.depths.len() {
+        return false;
+    }
+    let suffix = key - prefix_len;
+    let start = staging.starts[row] as usize;
+    let end = staging.ends[row] as usize;
+    suffix >= start && suffix <= end
+}
+
 /// Стабильный top-k по logprob. При равных значениях выигрывает меньший token id.
 pub fn top_k_candidates(logits: &[f32], k: usize) -> Vec<TreeDraftCandidate> {
     assert!(!logits.is_empty(), "logits must not be empty");
@@ -431,6 +451,23 @@ mod tests {
         assert_eq!(staging.depths, vec![0, 1, 2, 1]);
         assert_eq!(staging.starts, vec![0, 1, 2, 3]);
         assert_eq!(staging.ends, vec![3, 2, 2, 3]);
+    }
+
+    #[test]
+    fn host_mask_allows_prefix_and_subtree_only() {
+        let trie = FlatTrie::from_edges(&[(0, 1, -1.0), (1, 2, -2.0), (0, 3, -3.0), (3, 4, -4.0)]);
+        let staging = trie.staging();
+        let prefix_len = 7;
+        // Узел 1 видит prefix и своё поддерево 1..2, но не соседнюю ветку 3..4.
+        assert!(trie_mask_allows(&staging, prefix_len, 1, 6));
+        assert!(trie_mask_allows(&staging, prefix_len, 1, 8));
+        assert!(trie_mask_allows(&staging, prefix_len, 1, 9));
+        assert!(!trie_mask_allows(&staging, prefix_len, 1, 10));
+        assert!(!trie_mask_allows(&staging, prefix_len, 1, 11));
+        // Соседний узел 3 видит свою ветку 3..4, но не узел 2.
+        assert!(trie_mask_allows(&staging, prefix_len, 3, 10));
+        assert!(trie_mask_allows(&staging, prefix_len, 3, 11));
+        assert!(!trie_mask_allows(&staging, prefix_len, 3, 9));
     }
 
     #[test]
