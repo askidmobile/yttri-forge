@@ -2294,14 +2294,9 @@ impl BatchModel for Qwen35BatchAdapter {
                 ));
             }
             let rope_host: Vec<u32> = rope_positions.iter().map(|&p| p as u32).collect();
-            let (flat, hidden, _) = self.paged_graph_run(
-                true,
-                slot,
-                pos,
-                inputs,
-                rope_host,
-                self.verify_trie.as_ref(),
-            )?;
+            let verify_trie = self.verify_trie.clone();
+            let (flat, hidden, _) =
+                self.paged_graph_run(true, slot, pos, inputs, rope_host, verify_trie.as_ref())?;
             self.model.paged_ctx.as_mut().unwrap().kv_len_host[slot] = (pos + k) as u32;
             // Графовый путь зовёт forward_verify_paged с shadow=true: при k>1
             // теневые снимки записаны, откат может на них опереться.

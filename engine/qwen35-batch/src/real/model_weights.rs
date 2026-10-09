@@ -1181,9 +1181,7 @@ impl DenseMlp {
             }
             off += len;
         }
-        out.ok_or_else(|| {
-            candle_core::Error::Msg("DenseMlp::forward_prefill: пустой вход".into())
-        })
+        out.ok_or_else(|| candle_core::Error::Msg("DenseMlp::forward_prefill: пустой вход".into()))
     }
 
     /// Один проход FFN без разбиения: F16-сайдкар, если подключён, иначе GGUF-квант.
@@ -4292,6 +4290,7 @@ impl GatedAttentionLayer {
             page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
             shared_block_table: false,
             rows_per_position: 0,
+            trie_ranges: None,
         }
         .forward()?;
 
@@ -4505,6 +4504,7 @@ impl GatedAttentionLayer {
                     page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
                     shared_block_table: false,
                     rows_per_position: 0,
+                    trie_ranges: None,
                 }
                 .forward()?;
             }
@@ -4541,6 +4541,7 @@ impl GatedAttentionLayer {
                 page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
                 shared_block_table: true,
                 rows_per_position: 0,
+                trie_ranges: None,
             }
             .forward()?;
         } else if verify_onepass {
@@ -4635,6 +4636,7 @@ impl GatedAttentionLayer {
                 page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
                 shared_block_table: false,
                 rows_per_position: 0,
+                trie_ranges: None,
             }
             .forward()?;
         }
@@ -6090,11 +6092,11 @@ impl ModelWeights {
             let mut per_slot_total = 0u64;
             for store in &stores {
                 let st = store.lock().expect("expert store");
-                per_slot_total += (st.gate.expert_bytes + st.up.expert_bytes + st.down.expert_bytes) as u64;
+                per_slot_total +=
+                    (st.gate.expert_bytes + st.up.expert_bytes + st.down.expert_bytes) as u64;
             }
             let topk = runtime.k as u64;
-            let experts_bytes_per_token_mib =
-                per_slot_total * topk as u64 / 1024 / 1024;
+            let experts_bytes_per_token_mib = per_slot_total * topk as u64 / 1024 / 1024;
             let (free_vram, _total) = c
                 .cuda_stream()
                 .context()
@@ -6142,10 +6144,7 @@ impl ModelWeights {
             } else {
                 0.0
             };
-            let f_target = super::expert_store::f_target(
-                10.6,
-                experts_bytes_per_token_mib as f64,
-            );
+            let f_target = super::expert_store::f_target(10.6, experts_bytes_per_token_mib as f64);
             if f < f_target {
                 log::warn!(
                     "[moe] cache f={f:.2} < target {f_target:.2} (B=10.6 ГБ/с, трафик {experts_bytes_per_token_mib} МиБ/ток) — декод может просесть, кэш прогреется LRU"
@@ -6724,15 +6723,14 @@ impl ModelWeights {
         // при загрузке, числа и причина в лог; fail-closed (FR-008).
         // На не-CUDA `ram` отвергается: там единая память, выгрузке некуда идти.
         #[cfg(not(feature = "cuda"))]
-        let moe_experts_ram = if is_moe
-            && matches!(std::env::var("MOE_EXPERTS").ok().as_deref(), Some("ram"))
-        {
-            candle_core::bail!(
+        let moe_experts_ram =
+            if is_moe && matches!(std::env::var("MOE_EXPERTS").ok().as_deref(), Some("ram")) {
+                candle_core::bail!(
                 "MOE_EXPERTS=ram поддерживается только на CUDA (FR-009); на Metal/CPU единая память"
             );
-        } else {
-            false
-        };
+            } else {
+                false
+            };
         let requested_moe_backend = std::env::var("MOE_BACKEND").ok();
         #[cfg(feature = "cuda")]
         let (moe_experts_ram, moe_experts_bytes, n_moe_layers) = if is_moe && device.is_cuda() {
@@ -6781,9 +6779,7 @@ impl ModelWeights {
                 );
             }
             let (ram, reason) = match requested {
-                super::expert_store::ExpertPlacement::Vram => {
-                    (false, "запрошено vram".to_string())
-                }
+                super::expert_store::ExpertPlacement::Vram => (false, "запрошено vram".to_string()),
                 super::expert_store::ExpertPlacement::Ram => {
                     super::expert_store::check_host_ram_free(experts_bytes, prefix_cache_mib)?;
                     (true, "запрошено ram".to_string())
@@ -6807,9 +6803,22 @@ impl ModelWeights {
                         .min(model_context_length as u64)
                         .max(2048);
                     let q8 = crate::real::paged_kv_cuda::kv_pool_is_q8();
-                    let kv_bytes_per_head = if q8 { attn_head_dim + 2 } else { attn_head_dim * 2 };
-                    let pool_bytes = attn_layers * b * 2 * attn_head_count_kv as u64 * kv_bytes_per_head as u64 * ctx_req;
-                    let staging_bytes = if n_moe_layers > 0 { experts_bytes / n_moe_layers as u64 } else { 0 };
+                    let kv_bytes_per_head = if q8 {
+                        attn_head_dim + 2
+                    } else {
+                        attn_head_dim * 2
+                    };
+                    let pool_bytes = attn_layers
+                        * b
+                        * 2
+                        * attn_head_count_kv as u64
+                        * kv_bytes_per_head as u64
+                        * ctx_req;
+                    let staging_bytes = if n_moe_layers > 0 {
+                        experts_bytes / n_moe_layers as u64
+                    } else {
+                        0
+                    };
                     let headroom = std::env::var("VRAM_HEADROOM_MIB")
                         .ok()
                         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -6819,15 +6828,23 @@ impl ModelWeights {
                     let need_resident = trunk_bytes + experts_bytes + pool_bytes + headroom;
                     let need_ram = trunk_bytes + pool_bytes + staging_bytes + headroom;
                     let (ram, why) = super::expert_store::resolve_auto_needs(
-                        free_vram as u64, need_resident, need_ram, experts_bytes,
+                        free_vram as u64,
+                        need_resident,
+                        need_ram,
+                        experts_bytes,
                     );
                     if ram {
                         super::expert_store::check_host_ram_free(experts_bytes, prefix_cache_mib)?;
                     }
-                    (ram, format!("auto: need_resident={:.0} need_ram={:.0} free={:.0} МиБ — {why}",
-                        need_resident as f64 / 1024.0 / 1024.0,
-                        need_ram as f64 / 1024.0 / 1024.0,
-                        free_vram as f64 / 1024.0 / 1024.0))
+                    (
+                        ram,
+                        format!(
+                            "auto: need_resident={:.0} need_ram={:.0} free={:.0} МиБ — {why}",
+                            need_resident as f64 / 1024.0 / 1024.0,
+                            need_ram as f64 / 1024.0 / 1024.0,
+                            free_vram as f64 / 1024.0 / 1024.0
+                        ),
+                    )
                 }
             };
             log::info!(
@@ -6856,13 +6873,12 @@ impl ModelWeights {
         })?;
         // EMB_RAM_COPY=0 — диагностика: оставить mmap и при выгрузке (A/B паритета).
         #[cfg(feature = "cuda")]
-        let tok_embeddings = if moe_experts_ram
-            && std::env::var("EMB_RAM_COPY").as_deref() != Ok("0")
-        {
-            QuantizedEmbedding::from_ram_copy(mmap, emb_info, ct.tensor_data_offset)?
-        } else {
-            QuantizedEmbedding::from_mmap(Arc::clone(mmap), emb_info, ct.tensor_data_offset)?
-        };
+        let tok_embeddings =
+            if moe_experts_ram && std::env::var("EMB_RAM_COPY").as_deref() != Ok("0") {
+                QuantizedEmbedding::from_ram_copy(mmap, emb_info, ct.tensor_data_offset)?
+            } else {
+                QuantizedEmbedding::from_mmap(Arc::clone(mmap), emb_info, ct.tensor_data_offset)?
+            };
         #[cfg(not(feature = "cuda"))]
         let tok_embeddings =
             QuantizedEmbedding::from_mmap(Arc::clone(mmap), emb_info, ct.tensor_data_offset)?;
@@ -6888,8 +6904,7 @@ impl ModelWeights {
                     // целиком, и на 27B эмбеддинг съедал VRAM, после чего графы всё
                     // равно отключались по своему порогу — худшее из двух.
                     let has_vram_headroom = if let Ok(cuda_dev) = device.as_cuda_device() {
-                        let force_graphs =
-                            std::env::var("CUDA_GRAPHS").as_deref() == Ok("1");
+                        let force_graphs = std::env::var("CUDA_GRAPHS").as_deref() == Ok("1");
                         // Фактический размер тензора из GGUF-заголовка (флэтовая
                         // планка 1 GiB пропускала ~0.8 GiB эмбеддинг на 27B при
                         // free 2.5 GiB — и модель переставала помещаться в prefill).
@@ -7202,9 +7217,7 @@ impl ModelWeights {
             }
         });
         if !matches!(kv_cache_dtype.as_str(), "q8" | "q8_f16") {
-            candle_core::bail!(
-                "KV_CACHE_DTYPE must be q8 or q8_f16, got {kv_cache_dtype:?}"
-            );
+            candle_core::bail!("KV_CACHE_DTYPE must be q8 or q8_f16, got {kv_cache_dtype:?}");
         }
         let use_q8_f16_kv_cache = kv_cache_dtype == "q8_f16";
         eprintln!("[{tag}] batched KV cache: {kv_cache_dtype}");
@@ -7266,8 +7279,11 @@ impl ModelWeights {
                     .tensor_infos
                     .get(&format!("{prefix}.ffn_down_exps.weight"))
                     .ok_or_else(|| candle_core::Error::Msg("нет ffn_down_exps".into()))?;
-                let (gate_dtype, up_dtype, down_dtype) =
-                    (gate_info.ggml_dtype, up_info.ggml_dtype, down_info.ggml_dtype);
+                let (gate_dtype, up_dtype, down_dtype) = (
+                    gate_info.ggml_dtype,
+                    up_info.ggml_dtype,
+                    down_info.ggml_dtype,
+                );
 
                 // Shared expert: scalar gate_inp (Linear) + SwiGLU gate/up/down (QMatMul).
                 let shexp_gate_inp_qt = load_heavy(&format!("{prefix}.ffn_gate_inp_shexp.weight"))?;
@@ -7305,28 +7321,29 @@ impl ModelWeights {
                 #[cfg(feature = "cuda")]
                 let ff = if moe_experts_ram {
                     let cuda_dev = device.as_cuda_device()?;
-                    let load_experts = |name: &str,
-                                        info: &gguf_file::TensorInfo|
-                     -> Result<super::expert_store::ExpertMatrix> {
-                        let dims = info.shape.dims();
-                        if dims.len() != 3 {
-                            candle_core::bail!(
-                                "{name}: ожидается [n_experts, n, k], ранг {}",
-                                dims.len()
-                            );
-                        }
-                        let (start, size) = ct.tensor_byte_range(name)?;
-                        super::expert_store::ExpertMatrix::load(
-                            cuda_dev,
-                            info.ggml_dtype,
-                            dims[0],
-                            dims[1],
-                            dims[2],
-                            data,
-                            start,
-                            size,
-                        )
-                    };
+                    let load_experts =
+                        |name: &str,
+                         info: &gguf_file::TensorInfo|
+                         -> Result<super::expert_store::ExpertMatrix> {
+                            let dims = info.shape.dims();
+                            if dims.len() != 3 {
+                                candle_core::bail!(
+                                    "{name}: ожидается [n_experts, n, k], ранг {}",
+                                    dims.len()
+                                );
+                            }
+                            let (start, size) = ct.tensor_byte_range(name)?;
+                            super::expert_store::ExpertMatrix::load(
+                                cuda_dev,
+                                info.ggml_dtype,
+                                dims[0],
+                                dims[1],
+                                dims[2],
+                                data,
+                                start,
+                                size,
+                            )
+                        };
                     let store = super::expert_store::SharedLayerStore::new(std::sync::Mutex::new(
                         super::expert_store::ExpertLayerStore {
                             idx: layer_idx,
@@ -7438,15 +7455,14 @@ impl ModelWeights {
                 // ── DeltaNet Layer ──
                 // Слитая проекция qkv+z+b+a — опциональна: контейнер .ytf её
                 // несёт, GGUF нет. Отключается NO_FUSED_IN_PROJ=1.
-                let in_proj_fused =
-                    if std::env::var("NO_FUSED_IN_PROJ").as_deref() == Ok("1") {
-                        None
-                    } else {
-                        match load_heavy(&format!("{prefix}.attn_in_proj.weight")) {
-                            Ok(qt) => Some(QMatMul::from_qtensor(qt)?),
-                            Err(_) => None,
-                        }
-                    };
+                let in_proj_fused = if std::env::var("NO_FUSED_IN_PROJ").as_deref() == Ok("1") {
+                    None
+                } else {
+                    match load_heavy(&format!("{prefix}.attn_in_proj.weight")) {
+                        Ok(qt) => Some(QMatMul::from_qtensor(qt)?),
+                        Err(_) => None,
+                    }
+                };
                 let wqkv = load_heavy(&format!("{prefix}.attn_qkv.weight"))?;
                 let wgate = load_heavy(&format!("{prefix}.attn_gate.weight"))?;
                 let w_beta = load_heavy(&format!("{prefix}.ssm_beta.weight"))?;
@@ -9174,7 +9190,11 @@ impl ModelWeights {
                         layer_in = layer_in.to_device(&block_dev)?;
                     }
                     layer_in = block.forward_prefill(&layer_in, index_pos)?;
-                    dump_layer(bi as i64, if block.is_deltanet() { "delta" } else { "attn" }, &layer_in);
+                    dump_layer(
+                        bi as i64,
+                        if block.is_deltanet() { "delta" } else { "attn" },
+                        &layer_in,
+                    );
                     // Бисекция недетерминизма: BISECT_HIDDEN=N — после
                     // слоя N печатать FNV-1a checksum hidden (первые 4 строки
                     // каждого чанка). Два прогона в одном процессе покажут
@@ -9239,7 +9259,10 @@ impl ModelWeights {
                             hash ^= x.to_bits() as u64;
                             hash = hash.wrapping_mul(0x100000001b3);
                         }
-                        eprintln!("[bisect] decode after block {bi}: fnv={hash:016x} n={}", v.len());
+                        eprintln!(
+                            "[bisect] decode after block {bi}: fnv={hash:016x} n={}",
+                            v.len()
+                        );
                     }
                 }
             }
@@ -9593,8 +9616,13 @@ impl ModelWeights {
             .ok_or_else(|| candle_core::Error::Msg("verify graph: paged ctx missing".into()))?;
         let slots = vec![slot; k];
         for block in self.blocks.iter_mut() {
-            layer_in =
-                block.forward_verify_tree_paged(&layer_in, ctx, rope_pos_dev, &slots, trie_ranges)?;
+            layer_in = block.forward_verify_tree_paged(
+                &layer_in,
+                ctx,
+                rope_pos_dev,
+                &slots,
+                trie_ranges,
+            )?;
         }
         ctx.launch_increment_t(1, k)?;
         let hidden = self.norm.forward(&layer_in.i((.., 0, ..))?)?;
@@ -10451,7 +10479,10 @@ impl ModelWeights {
     pub fn embed_tokens(&self, tokens: &Tensor, device: &Device) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if let Some(emb) = self.tok_embeddings_cuda.as_ref() {
-            return emb.embedding(tokens)?.to_dtype(DType::F32)?.to_device(device);
+            return emb
+                .embedding(tokens)?
+                .to_dtype(DType::F32)?
+                .to_device(device);
         }
         self.tok_embeddings.forward(tokens)?.to_device(device)
     }
@@ -11312,7 +11343,10 @@ mod snapshot_host_device_tests {
         let back = snap.to_host()?.to_device(&dev)?;
         match &back.blocks[0] {
             BlockStateSnap::Attention(Some(kv)) => {
-                assert!(kv.is_q8(), "после переноса снимок перестал быть Q8: масштабы потеряны");
+                assert!(
+                    kv.is_q8(),
+                    "после переноса снимок перестал быть Q8: масштабы потеряны"
+                );
                 assert_eq!(kv.k_scale.as_ref().expect("k_scale").dims3()?, (1, 2, 4));
                 assert!(kv.from_pool, "признак страничного пула потерян");
             }
@@ -11332,7 +11366,8 @@ mod snapshot_host_device_tests {
 /// слоя, поэтому ключ — порядковый номер (у обоих бэкендов порядок один).
 fn dump_path() -> Option<&'static str> {
     static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| std::env::var("LAYER_DEBUG").ok()).as_deref()
+    PATH.get_or_init(|| std::env::var("LAYER_DEBUG").ok())
+        .as_deref()
 }
 
 static DUMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -11350,12 +11385,19 @@ fn dump_write(layer: i64, tag: &str, x: &Tensor) {
     };
     let vals = (|| -> Result<Vec<f32>> {
         let t = x.dim(1)?;
-        x.i((0, t - 1))?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+        x.i((0, t - 1))?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()
     })();
     let Ok(vals) = vals else {
         return;
     };
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
         return;
     };
     use std::io::Write;
@@ -11384,12 +11426,7 @@ fn dump_sub(tag: &str, x: &Tensor) {
 mod ffn_subchunk_equiv_tests {
     use super::*;
 
-    fn build_mlp(
-        h: usize,
-        f: usize,
-        dev: &Device,
-        sidecar: bool,
-    ) -> Result<DenseMlp> {
+    fn build_mlp(h: usize, f: usize, dev: &Device, sidecar: bool) -> Result<DenseMlp> {
         let w1 = Tensor::randn(0f32, 0.02f32, (f, h), dev)?;
         let w3 = Tensor::randn(0f32, 0.02f32, (f, h), dev)?;
         let w2 = Tensor::randn(0f32, 0.02f32, (h, f), dev)?;
