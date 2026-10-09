@@ -4331,6 +4331,18 @@ impl GatedAttentionLayer {
         rope_pos_dev: &Tensor,
         per_row_gqa: bool,
     ) -> Result<Tensor> {
+        self.forward_attn_prefill_paged_tree(x, ctx, rope_pos_dev, per_row_gqa, None)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn forward_attn_prefill_paged_tree(
+        &mut self,
+        x: &Tensor,
+        ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
+        rope_pos_dev: &Tensor,
+        per_row_gqa: bool,
+        trie_ranges: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         if b_sz != 1 {
             candle_core::bail!("paged prefill: b_sz must be 1");
@@ -4581,6 +4593,7 @@ impl GatedAttentionLayer {
                 page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
                 shared_block_table: false,
                 rows_per_position: ngroups,
+                trie_ranges,
             }
             .forward()?;
             // Обратная переукладка выхода в [k, nh, hd] для общего gate+wo.
@@ -5750,6 +5763,18 @@ impl HybridBlock {
         rope_pos_dev: &Tensor,
         slots: &[u32],
     ) -> Result<Tensor> {
+        self.forward_verify_tree_paged(x, ctx, rope_pos_dev, slots, None)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn forward_verify_tree_paged(
+        &mut self,
+        x: &Tensor,
+        ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
+        rope_pos_dev: &Tensor,
+        slots: &[u32],
+        trie_ranges: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (k, _, n_embd) = x.dims3()?;
         let residual = x;
         let normed = self.attn_norm.forward(x)?;
@@ -5758,11 +5783,12 @@ impl HybridBlock {
                 delta.forward_decode_batch_rows(&normed, slots, true, Some(&ctx.slots_dev))?
             }
             HybridLayerType::Attention(attn) => attn
-                .forward_attn_prefill_paged(
+                .forward_attn_prefill_paged_tree(
                     &normed.reshape((1, k, n_embd))?,
                     ctx,
                     rope_pos_dev,
                     true,
+                    trie_ranges,
                 )?
                 .reshape((k, 1, n_embd))?,
         };
@@ -9528,8 +9554,37 @@ impl ModelWeights {
         k: usize,
         slot: u32,
     ) -> Result<(Tensor, Tensor)> {
+        self.forward_verify_tree_graphed(emb_in, rope_pos_dev, k, slot, None)
+    }
+
+    /// Tree-verify: те же `k` строк, но attention использует trie-маску
+    /// (`trie_ranges`, пары [start,end] по строкам дерева). DeltaNet пока
+    /// остаётся последовательным по всем строкам и снимает теневые состояния —
+    /// это корректно, но не использует параллелизм дерева; следующий шаг —
+    /// специализированное tree-ядро DeltaNet.
+    #[cfg(feature = "cuda")]
+    pub fn forward_verify_tree_graphed(
+        &mut self,
+        emb_in: &Tensor,
+        rope_pos_dev: &Tensor,
+        k: usize,
+        slot: u32,
+        trie_ranges: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
         if emb_in.dims() != [k, 1, self.hidden_size()] {
             candle_core::bail!("verify graph: embeddings shape {:?}", emb_in.dims());
+        }
+        if let Some(trie) = trie_ranges {
+            if trie.dtype() != DType::I32 {
+                candle_core::bail!("verify graph: trie_ranges must be I32");
+            }
+            if trie.elem_count() != k * 2 {
+                candle_core::bail!(
+                    "verify graph: trie_ranges has {} elements, expected {}",
+                    trie.elem_count(),
+                    k * 2
+                );
+            }
         }
         let mut layer_in = emb_in.clone();
         let ctx = self
@@ -9538,7 +9593,8 @@ impl ModelWeights {
             .ok_or_else(|| candle_core::Error::Msg("verify graph: paged ctx missing".into()))?;
         let slots = vec![slot; k];
         for block in self.blocks.iter_mut() {
-            layer_in = block.forward_verify_paged(&layer_in, ctx, rope_pos_dev, &slots)?;
+            layer_in =
+                block.forward_verify_tree_paged(&layer_in, ctx, rope_pos_dev, &slots, trie_ranges)?;
         }
         ctx.launch_increment_t(1, k)?;
         let hidden = self.norm.forward(&layer_in.i((.., 0, ..))?)?;
