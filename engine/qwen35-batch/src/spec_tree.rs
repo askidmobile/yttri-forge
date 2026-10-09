@@ -25,6 +25,53 @@ pub struct FlatTrie {
 }
 
 impl FlatTrie {
+    /// Отбор узлов по бюджету.
+    ///
+    /// Узел с большим суммарным logprob получает приоритет. Возврат —
+    /// отсортированные индексы, включая root, поэтому бюджет задаёт общее
+    /// число узлов дерева, а не только драфт-токенов.
+    pub fn prune_to_budget(&self, budget: usize) -> Vec<usize> {
+        assert!(budget > 0, "budget must keep at least the root");
+
+        let mut sums = vec![0f32; self.nodes.len()];
+        let mut order: Vec<usize> = (1..self.nodes.len()).collect();
+        // Индексы уже упорядочены по depth: parent всегда встречается раньше child.
+        for &idx in &order {
+            let parent = self.nodes[idx]
+                .node
+                .parent
+                .expect("non-root nodes must have a parent");
+            sums[idx] = sums[parent] + self.nodes[idx].node.logprob;
+        }
+        order.sort_by(|&a, &b| sums[b].total_cmp(&sums[a]));
+
+        let mut kept = vec![false; self.nodes.len()];
+        kept[0] = true;
+        for &idx in order.iter().take(budget.saturating_sub(1)) {
+            kept[idx] = true;
+        }
+
+        // Держать родителей всех выбранных узлов: дерево без разрывов —
+        // обязательный инвариант для trie-маски и приёма пути.
+        for idx in (1..self.nodes.len()).rev() {
+            if kept[idx] {
+                let mut parent = self.nodes[idx]
+                    .node
+                    .parent
+                    .expect("non-root nodes must have a parent");
+                while parent != 0 {
+                    kept[parent] = true;
+                    parent = self.nodes[parent]
+                        .node
+                        .parent
+                        .expect("non-root nodes must have a parent");
+                }
+            }
+        }
+
+        (0..self.nodes.len()).filter(|&idx| kept[idx]).collect()
+    }
+
     pub fn from_edges(edges: &[(usize, u32, f32)]) -> Self {
         let mut nodes = Vec::with_capacity(edges.len() + 1);
         nodes.push(FlatTrieNode {
@@ -106,6 +153,30 @@ impl FlatTrie {
         accepted
     }
 
+    /// Путь root → node (включая оба конца).
+    ///
+    /// Нужен для отката DeltaNet/KV к границе принятого префикса: accepted-путь
+    /// удобно проверять от корня, а не от листа.
+    /// Индексы поддерева узла (включая сам узел).
+    ///
+    /// Диапазон `[start, end]` — это линейная часть дерева, видимая узлом
+    /// при trie-маске внимания: строка запроса node может читать свой prefix
+    /// и все узлы этого диапазона, но не чужие ветки.
+    pub fn subtree(&self, node: usize) -> std::ops::RangeInclusive<usize> {
+        self.nodes[node].start..=self.nodes[node].end
+    }
+
+    pub fn path_to_root(&self, node: usize) -> Vec<usize> {
+        let mut path = Vec::with_capacity(self.nodes[node].depth + 1);
+        let mut current = Some(node);
+        while let Some(idx) = current {
+            path.push(idx);
+            current = self.nodes[idx].node.parent;
+        }
+        path.reverse();
+        path
+    }
+
     /// Токены по индексам пути.
     pub fn path_tokens(&self, indices: &[usize]) -> Vec<u32> {
         indices.iter().map(|&i| self.nodes[i].node.token).collect()
@@ -152,6 +223,43 @@ mod tests {
         let trie = FlatTrie::from_edges(&[(0, 1, -1.0), (1, 2, -2.0), (1, 3, -3.0)]);
         assert_eq!(trie.accept(&[1, 9]), vec![1]);
         assert_eq!(trie.accept(&[9, 1]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn prune_to_budget_keeps_best_connected_path() {
+        let trie = FlatTrie::from_edges(&[
+            (0, 1, -1.0),
+            (1, 2, -0.1),
+            (1, 3, -4.0),
+            (2, 4, -0.2),
+            (0, 5, -0.5),
+        ]);
+        // Root + три лучших узла. Узел 3 отрезается как худшая ветка.
+        let kept = trie.prune_to_budget(4);
+        assert_eq!(kept, vec![0, 1, 2, 5]);
+    }
+
+    #[test]
+    fn prune_to_budget_includes_parent_chain() {
+        let trie = FlatTrie::from_edges(&[(0, 1, -1.0), (1, 2, -1.0), (2, 3, -0.1), (0, 4, -3.0)]);
+        // По бюджету выбирается узел 3, но его родительская цепь обязательна.
+        let kept = trie.prune_to_budget(4);
+        assert_eq!(kept, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn subtree_range_is_contiguous() {
+        let trie = FlatTrie::from_edges(&[(0, 1, -1.0), (1, 2, -2.0), (1, 3, -3.0), (0, 4, -4.0)]);
+        assert_eq!(trie.subtree(0), 0..=4);
+        assert_eq!(trie.subtree(1), 1..=3);
+        assert_eq!(trie.subtree(2), 2..=2);
+        assert_eq!(trie.subtree(4), 4..=4);
+    }
+
+    #[test]
+    fn path_to_root_follows_parents() {
+        let trie = FlatTrie::from_edges(&[(0, 1, -1.0), (1, 2, -2.0), (2, 3, -3.0)]);
+        assert_eq!(trie.path_to_root(3), vec![0, 1, 2, 3]);
     }
 
     #[test]
