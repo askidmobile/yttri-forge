@@ -1111,6 +1111,8 @@ impl Qwen35BatchAdapter {
         for pending in &mut self.verify_pending {
             *pending = None;
         }
+        self.verify_trie = None;
+        self.verify_tree_rows = None;
         for position in &mut self.transaction_snapshot_positions {
             *position = None;
         }
@@ -2396,6 +2398,8 @@ impl BatchModel for Qwen35BatchAdapter {
         self.target_transactions[slot] = None;
         self.verified_target_hidden[slot].clear();
         self.transaction_snapshot_positions[slot] = None;
+        self.verify_trie = None;
+        self.verify_tree_rows = None;
         Ok(())
     }
 
@@ -2430,6 +2434,8 @@ impl BatchModel for Qwen35BatchAdapter {
         self.verified_target_hidden[slot].clear();
         self.verify_pending[slot] = None;
         self.transaction_snapshot_positions[slot] = None;
+        self.verify_trie = None;
+        self.verify_tree_rows = None;
         Ok(())
     }
 
