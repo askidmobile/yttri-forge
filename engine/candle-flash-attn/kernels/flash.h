@@ -111,6 +111,11 @@ struct Flash_fwd_params : public Qkv_params {
     // KV-блоков считаются по позиции, а не по строке.
     int rows_per_position;
 
+    // Tree speculative decoding: пары [start,end] поддеревьев на узел.
+    // nullptr — обычная причинная маска. Индекс узла — строка запроса
+    // (при GQA-свёртке: row / rows_per_position).
+    int *__restrict__ trie_ranges;
+
     // The dropout probability (probability of keeping an activation).
     float p_dropout;
     // uint32_t p_dropout_in_uint;

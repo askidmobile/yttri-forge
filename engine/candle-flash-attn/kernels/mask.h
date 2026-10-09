@@ -119,6 +119,9 @@ struct Mask {
     // Строк запроса на одну позицию (свёртка GQA, one-pass verify). 0/1 — выкл.
     const int rows_per_position;
 
+    // Tree speculative decoding: пары [start,end] поддеревьев на узел.
+    const int *__restrict__ trie_ranges;
+
     __forceinline__ __device__ Mask(const int max_seqlen_k, const int max_seqlen_q,
                                     const int window_size_left, const int window_size_right,
                                     const float alibi_slope=0.f,
@@ -126,6 +129,7 @@ struct Mask {
                                     const int mm_prefix_range_batch_stride=0,
                                     const int max_mm_prefix_ranges=0,
                                     const int rows_per_position_=0,
+                                    const int *__restrict__ trie_ranges_=nullptr,
                                     const int bidb=0)
         : max_seqlen_k(max_seqlen_k)
         , max_seqlen_q(max_seqlen_q)
@@ -135,8 +139,28 @@ struct Mask {
         , mm_prefix_ranges(mm_prefix_ranges == nullptr ? nullptr : mm_prefix_ranges + bidb * mm_prefix_range_batch_stride)
         , mm_prefix_range_batch_stride(mm_prefix_range_batch_stride)
         , max_mm_prefix_ranges(max_mm_prefix_ranges)
-        , rows_per_position(rows_per_position_) {
+        , rows_per_position(rows_per_position_)
+        , trie_ranges(trie_ranges_) {
     };
+
+    __forceinline__ __device__ bool trie_allowed(const int row_idx, const int col_idx) const {
+        if (trie_ranges == nullptr || col_idx >= max_seqlen_k) {
+            return false;
+        }
+        const int node_idx = rows_per_position > 1 ? row_idx / rows_per_position : row_idx;
+        const int tree_len = rows_per_position > 1 ? max_seqlen_q / rows_per_position : max_seqlen_q;
+        const int prefix_len = max_seqlen_k - tree_len;
+        if (prefix_len < 0 || node_idx >= tree_len) {
+            return false;
+        }
+        if (col_idx < prefix_len) {
+            return true;
+        }
+        const int suffix_idx = col_idx - prefix_len;
+        const int start = trie_ranges[node_idx * 2];
+        const int end = trie_ranges[node_idx * 2 + 1];
+        return suffix_idx >= start && suffix_idx <= end;
+    }
 
     __forceinline__ __device__ bool mm_prefix_allowed(const int row_idx, const int col_idx) const {
         if (mm_prefix_ranges == nullptr || col_idx >= max_seqlen_k) {
@@ -224,7 +248,8 @@ struct Mask {
                                 }
                                 if constexpr (Causal_mask) {
                                     if (col_idx >= col_idx_limit_right
-                                        && !mm_prefix_allowed(row_idx, col_idx)) {
+                                        && !mm_prefix_allowed(row_idx, col_idx)
+                                        && !trie_allowed(row_idx, col_idx)) {
                                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                                     }
                                 }

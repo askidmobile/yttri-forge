@@ -331,7 +331,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     flash::Mask<Is_causal, Is_local, Has_alibi> mask(
         binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right,
         alibi_slope, params.mm_prefix_ranges, params.mm_prefix_range_batch_stride,
-        params.max_mm_prefix_ranges, params.rows_per_position, bidb);
+        params.max_mm_prefix_ranges, params.rows_per_position, params.trie_ranges, bidb);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -1058,7 +1058,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     flash::Mask<Is_causal, Is_local, Has_alibi> mask(
         binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right,
         alibi_slope, params.mm_prefix_ranges, params.mm_prefix_range_batch_stride,
-        params.max_mm_prefix_ranges, params.rows_per_position, bidb);
+        params.max_mm_prefix_ranges, params.rows_per_position, params.trie_ranges, bidb);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.

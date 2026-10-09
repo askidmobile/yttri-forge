@@ -52,6 +52,9 @@ pub struct PagedAttn<'a> {
     /// запроса [k*ngroups, h_k, d] — это (позиция r/ngroups, группа r%ngroups),
     /// и причинная граница маски считается по позиции. 0 — обычная раскладка.
     pub rows_per_position: usize,
+    /// Tree speculative decoding: пары [start,end] поддеревьев на узел.
+    /// None — обычная причинная маска; Some — однопроходная trie-маска.
+    pub trie_ranges: Option<&'a Tensor>,
 }
 
 fn round_multiple(x: usize, m: usize) -> usize {
@@ -115,6 +118,23 @@ impl PagedAttn<'_> {
             candle_core::bail!(
                 "paged_attn: block_table имеет {table_rows} строк, нужно {required_rows}"
             );
+        }
+        if let Some(trie) = self.trie_ranges {
+            if trie.dtype() != DType::I32 {
+                candle_core::bail!("paged_attn: trie_ranges должен быть I32");
+            }
+            let tree_nodes = if self.rows_per_position > 1 {
+                self.q.dim(0)? / self.rows_per_position
+            } else {
+                self.q.dim(0)?
+            };
+            let expected = tree_nodes * 2;
+            let trie_len = trie.elem_count();
+            if trie_len != expected {
+                candle_core::bail!(
+                    "paged_attn: trie_ranges имеет {trie_len} элементов, нужно {expected}"
+                );
+            }
         }
         Ok(())
     }
@@ -246,6 +266,10 @@ impl PagedAttn<'_> {
                 scale_row_stride,
                 kv_is_q8,
                 self.rows_per_position as i32,
+                self.trie_ranges
+                    .map(|trie| tensor_cuda_ptr(trie).map(|p| p as *const i32))
+                    .transpose()?
+                    .unwrap_or(std::ptr::null()),
                 q_int8_ptr,
                 q_scale_ptr,
                 stream.cu_stream() as *mut std::ffi::c_void,

@@ -147,6 +147,10 @@ extern "C" void run_mha(
     // раскладка; >1 — причинная граница по позиции (см. mask.h).
     int rows_per_position,
 
+    // Tree speculative decoding: пары [start,end] поддеревьев на узел.
+    // nullptr — обычная причинная маска.
+    int32_t *trie_ranges_ptr,
+
     // int8-QK: nullptr → прежний путь (распаковка K + f16-MMA).
     void *q_int8_ptr,
     void *q_scale_ptr,
@@ -239,6 +243,7 @@ extern "C" void run_mha(
     params.v_scale_head_stride = 1;
     params.kv_is_q8 = kv_is_q8 != 0;
     params.rows_per_position = rows_per_position;
+    params.trie_ranges = trie_ranges_ptr;
     params.q_int8_ptr = q_int8_ptr;
     params.q_scale_ptr = q_scale_ptr;
 
