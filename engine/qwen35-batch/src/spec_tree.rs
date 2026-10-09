@@ -28,7 +28,11 @@ impl FlatTrie {
     pub fn from_edges(edges: &[(usize, u32, f32)]) -> Self {
         let mut nodes = Vec::with_capacity(edges.len() + 1);
         nodes.push(FlatTrieNode {
-            node: TrieNode { token: 0, parent: None, logprob: 0.0 },
+            node: TrieNode {
+                token: 0,
+                parent: None,
+                logprob: 0.0,
+            },
             start: 0,
             end: 0,
             depth: 0,
@@ -37,7 +41,11 @@ impl FlatTrie {
         for &(parent, token, logprob) in edges {
             let idx = nodes.len();
             nodes.push(FlatTrieNode {
-                node: TrieNode { token, parent: Some(parent), logprob },
+                node: TrieNode {
+                    token,
+                    parent: Some(parent),
+                    logprob,
+                },
                 start: idx,
                 end: idx,
                 depth: nodes[parent].depth + 1,
@@ -86,7 +94,10 @@ impl FlatTrie {
         let mut current = 0;
         let mut accepted = Vec::new();
         for &token in target {
-            let Some(next) = self.children(current).find(|&i| self.nodes[i].node.token == token) else {
+            let Some(next) = self
+                .children(current)
+                .find(|&i| self.nodes[i].node.token == token)
+            else {
                 break;
             };
             accepted.push(next);
@@ -97,10 +108,7 @@ impl FlatTrie {
 
     /// Токены по индексам пути.
     pub fn path_tokens(&self, indices: &[usize]) -> Vec<u32> {
-        indices
-            .iter()
-            .map(|&i| self.nodes[i].node.token)
-            .collect()
+        indices.iter().map(|&i| self.nodes[i].node.token).collect()
     }
 
     pub fn len(&self) -> usize {
