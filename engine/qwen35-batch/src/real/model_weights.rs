@@ -4462,6 +4462,11 @@ impl GatedAttentionLayer {
         let verify_onepass = per_row_gqa
             && seq_len > 1
             && std::env::var("VERIFY_ONEPASS").ok().as_deref() == Some("1");
+        if trie_ranges.is_some() {
+            eprintln!(
+                "[mtp-tree] attn branch seq_len={seq_len} per_row={per_row_gqa} fused={verify_fused} onepass={verify_onepass}"
+            );
+        }
         if per_row_gqa && !verify_fused && !verify_onepass {
             // Построчно: строка i — декодный вызов (seqlen_q = 1, маска noop),
             // ключи 0..kv0+i задаются через seqlens_k = kv0+i+1. Строки уже
@@ -9597,6 +9602,10 @@ impl ModelWeights {
         if emb_in.dims() != [k, 1, self.hidden_size()] {
             candle_core::bail!("verify graph: embeddings shape {:?}", emb_in.dims());
         }
+        eprintln!(
+            "[mtp-tree] model verify entry k={k} slot={slot} trie={}",
+            trie_ranges.is_some()
+        );
         if let Some(trie) = trie_ranges {
             if trie.dtype() != DType::I32 {
                 candle_core::bail!("verify graph: trie_ranges must be I32");
@@ -9626,6 +9635,7 @@ impl ModelWeights {
         }
         ctx.launch_increment_t(1, k)?;
         let hidden = self.norm.forward(&layer_in.i((.., 0, ..))?)?;
+        eprintln!("[mtp-tree] model verify exit k={k} slot={slot}");
         Ok((self.output.forward(&hidden)?, hidden))
     }
 

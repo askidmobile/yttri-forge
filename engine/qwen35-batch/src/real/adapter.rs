@@ -2190,12 +2190,20 @@ impl BatchModel for Qwen35BatchAdapter {
         depth: usize,
         branching: usize,
     ) -> Result<FlatTrie> {
+        eprintln!(
+            "[mtp-tree] adapter draft_tree begin slot={slot} pos={rope_pos} budget={budget} depth={depth} branching={branching}"
+        );
         let tree = self
             .mtp
             .as_mut()
             .ok_or_else(|| anyhow!("MTP component is not loaded"))?
             .draft_tree(slot, token, rope_pos, budget, depth, branching, &self.model)
             .map_err(|error| anyhow!("MTP draft tree: {error}"))?;
+        eprintln!(
+            "[mtp-tree] adapter draft_tree end slot={slot} nodes={} rows={}",
+            tree.len(),
+            tree.len().saturating_sub(1)
+        );
         let staging = tree.staging();
         // Rows дерева начинаются с узла 1: root-sentinel не подаётся как input.
         // Поэтому диапазоны ключей переводятся из индексов дерева в индексы строк.
@@ -2206,7 +2214,12 @@ impl BatchModel for Qwen35BatchAdapter {
             .skip(1)
             .flat_map(|(&start, &end)| [start as i32 - 1, end as i32 - 1])
             .collect::<Vec<_>>();
+        eprintln!(
+            "[mtp-tree] adapter trie staged slot={slot} nodes={} ranges={trie_ranges:?}",
+            trie_ranges.len() / 2
+        );
         self.set_speculative_tree(Some(trie_ranges), Some((1..tree.len()).collect()))?;
+        eprintln!("[mtp-tree] adapter trie loaded slot={slot}");
         Ok(tree)
     }
 
@@ -2276,6 +2289,10 @@ impl BatchModel for Qwen35BatchAdapter {
             return Err(anyhow!("speculative verify requires inputs"));
         }
         let k = inputs.len();
+        eprintln!(
+            "[mtp-tree] adapter verify begin slot={slot} k={k} pos={pos} trie={}",
+            self.verify_trie.is_some()
+        );
         let cache_positions: Vec<usize> = (pos..pos + k).collect();
         let rope_positions = self.rope_positions_for(slot, pos, k)?;
         let slots = vec![slot as u32; k];
@@ -2298,15 +2315,22 @@ impl BatchModel for Qwen35BatchAdapter {
             }
             let rope_host: Vec<u32> = rope_positions.iter().map(|&p| p as u32).collect();
             let verify_trie = self.verify_trie.clone();
+            eprintln!("[mtp-tree] adapter verify graph begin slot={slot} k={k} pos={pos}");
             let (flat, hidden, _) =
                 self.paged_graph_run(true, slot, pos, inputs, rope_host, verify_trie.as_ref())?;
+            eprintln!(
+                "[mtp-tree] adapter verify graph end slot={slot} k={k} flat={}",
+                flat.len()
+            );
             self.model.paged_ctx.as_mut().unwrap().kv_len_host[slot] = (pos + k) as u32;
             // Графовый путь зовёт forward_verify_paged с shadow=true: при k>1
             // теневые снимки записаны, откат может на них опереться.
             (flat, hidden, k > 1)
         } else {
+            eprintln!("[mtp-tree] adapter verify eager begin slot={slot} k={k}");
             let (flat, hidden) =
                 self.verify_eager(inputs, &cache_positions, &rope_positions, &slots)?;
+            eprintln!("[mtp-tree] adapter verify eager end slot={slot} k={k}");
             (flat, hidden, false)
         };
         #[cfg(not(feature = "cuda"))]
@@ -2332,6 +2356,7 @@ impl BatchModel for Qwen35BatchAdapter {
                 flat.len()
             ));
         }
+        eprintln!("[mtp-tree] adapter verify end slot={slot} k={k}");
         Ok(flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect())
     }
 

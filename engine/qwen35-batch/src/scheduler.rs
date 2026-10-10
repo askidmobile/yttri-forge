@@ -652,10 +652,23 @@ impl<M: BatchModel> BatchScheduler<M> {
             self.sampler.restore(slot, sampler_checkpoint)?;
             return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Begin));
         }
+        if self.tree.is_some() {
+            eprintln!(
+                "[mtp-tree] begin ok slot={slot} pos={} width={width}",
+                self.slots[slot].next_pos()
+            );
+        }
         let t_draft = Instant::now();
 
         let (draft, tree) = match self.tree {
             Some(spec) => {
+                eprintln!(
+                    "[mtp-tree] draft begin slot={slot} pos={} budget={} depth={} branching={}",
+                    self.slots[slot].next_pos(),
+                    spec.budget,
+                    spec.depth,
+                    spec.branching
+                );
                 let tree = match self.model.speculative_draft_tree(
                     slot,
                     self.slots[slot].current_token(),
@@ -677,6 +690,11 @@ impl<M: BatchModel> BatchScheduler<M> {
                     }
                 };
                 let draft = tree.path_tokens(&(1..tree.len()).collect::<Vec<_>>());
+                eprintln!(
+                    "[mtp-tree] draft done slot={slot} nodes={} path={} tokens={draft:?}",
+                    tree.len(),
+                    draft.len()
+                );
                 (draft, Some(tree))
             }
             None => {
@@ -723,6 +741,12 @@ impl<M: BatchModel> BatchScheduler<M> {
                 inputs.extend_from_slice(&draft[..draft.len() - 1]);
             }
         }
+        if tree.is_some() {
+            eprintln!(
+                "[mtp-tree] verify begin slot={slot} k={} pos={pos} inputs={inputs:?}",
+                inputs.len()
+            );
+        }
         let t_verify = Instant::now();
         let rows = match self.model.speculative_verify(slot, &inputs, pos) {
             Ok(rows) if rows.len() == inputs.len() => rows,
@@ -747,6 +771,12 @@ impl<M: BatchModel> BatchScheduler<M> {
                 return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Commit));
             }
         };
+        if tree.is_some() {
+            eprintln!(
+                "[mtp-tree] verify done slot={slot} rows={}",
+                rows.len()
+            );
+        }
         let t_sample = Instant::now();
         let mut verified = Vec::with_capacity(draft.len());
         let mut accepted = 0usize;
@@ -767,18 +797,32 @@ impl<M: BatchModel> BatchScheduler<M> {
             }
         }
         let t_accept = Instant::now();
+        if tree.is_some() {
+            eprintln!(
+                "[mtp-tree] accept begin slot={slot} verified={} targets={verified:?}",
+                verified.len()
+            );
+        }
         // Выровнять target state: verify съел все K inputs, принято verified.len().
-        if self.model.speculative_accept(slot, verified.len()).is_err() {
+        if let Err(e) = self.model.speculative_accept(slot, verified.len()) {
+            eprintln!("[mtp] accept сорвался, откат раунда: {e}");
             self.model.speculative_rollback(slot)?;
             self.sampler.restore(slot, sampler_checkpoint)?;
             return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Commit));
         }
+        if tree.is_some() {
+            eprintln!("[mtp-tree] accept ok slot={slot}");
+        }
         let t_commit = Instant::now();
 
-        if self.model.speculative_commit(slot).is_err() {
+        if let Err(e) = self.model.speculative_commit(slot) {
+            eprintln!("[mtp] commit сорвался, откат раунда: {e}");
             self.model.speculative_rollback(slot)?;
             self.sampler.restore(slot, sampler_checkpoint)?;
             return Ok(SpeculativeStep::Fallback(SpeculativeFallback::Commit));
+        }
+        if tree.is_some() {
+            eprintln!("[mtp-tree] commit ok slot={slot}");
         }
         // Конец шести фаз begin..commit (см. печать ниже).
         let t_phases_end = Instant::now();
@@ -865,6 +909,12 @@ impl<M: BatchModel> BatchScheduler<M> {
                 phases,
                 gap,
                 phases + sync_ms + push_ms + gap,
+            );
+        }
+        if tree.is_some() {
+            eprintln!(
+                "[mtp-tree] round done slot={slot} drafted={} accepted={accepted}",
+                draft.len()
             );
         }
         self.slot_last_round_end[slot] = Some(Instant::now());
