@@ -837,7 +837,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             );
         }
         // Выровнять target state: verify съел все K inputs, принято verified.len().
-        if let Err(e) = self.model.speculative_accept(slot, verified.len()) {
+        if let Err(e) = self.model.speculative_accept(slot, &verified) {
             eprintln!("[mtp] accept сорвался, откат раунда: {e}");
             self.model.speculative_rollback(slot)?;
             self.sampler.restore(slot, sampler_checkpoint)?;

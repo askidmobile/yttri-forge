@@ -263,7 +263,7 @@ pub trait BatchModel {
     /// inputs (при consumed < K — откат к checkpoint'у транзакции и re-run
     /// принятого префикса одним чанком) и удержать hidden-строки 0..consumed
     /// для MTP commit.
-    fn speculative_accept(&mut self, _slot: usize, _consumed: usize) -> Result<()> {
+    fn speculative_accept(&mut self, _slot: usize, _accepted: &[u32]) -> Result<()> {
         anyhow::bail!("model does not support speculative transactions")
     }
 
@@ -352,8 +352,8 @@ impl<T: BatchModel + ?Sized> BatchModel for &mut T {
     ) -> Vec<u32> {
         (**self).speculative_tree_inputs(current_token, tree)
     }
-    fn speculative_accept(&mut self, slot: usize, consumed: usize) -> Result<()> {
-        (**self).speculative_accept(slot, consumed)
+    fn speculative_accept(&mut self, slot: usize, accepted: &[u32]) -> Result<()> {
+        (**self).speculative_accept(slot, accepted)
     }
     fn set_speculative_tree(
         &mut self,

@@ -2387,8 +2387,9 @@ impl BatchModel for Qwen35BatchAdapter {
     /// по отвергнутым inputs → откат к checkpoint'у транзакции + re-run принятого
     /// префикса одним чанком (логиты не читаем — без D2H). Hidden-строки
     /// 0..consumed уходят в verified_target_hidden для MTP commit.
-    fn speculative_accept(&mut self, slot: usize, consumed: usize) -> Result<()> {
-        let pending = self.verify_pending[slot]
+    fn speculative_accept(&mut self, slot: usize, accepted: &[u32]) -> Result<()> {
+        let consumed = accepted.len();
+        let mut pending = self.verify_pending[slot]
             .take()
             .ok_or_else(|| anyhow!("speculative accept without verify for slot {slot}"))?;
         let k = pending.inputs.len();
@@ -2405,6 +2406,64 @@ impl BatchModel for Qwen35BatchAdapter {
         let paged = self.paged_authority(slot);
         #[cfg(not(feature = "cuda"))]
         let paged = false;
+
+        // Tree-verify: принятый путь — не префикс линейного порядка строк.
+        // Откатываемся к checkpoint и одним causal prefill-проходом
+        // перестраиваем paged pool/DeltaNet по фактическим принятым токенам.
+        if pending.tree_rows.is_some() && consumed > 0 {
+            let checkpoint = self.target_transactions[slot]
+                .as_ref()
+                .ok_or_else(|| anyhow!("MTP transaction is not active for slot {slot}"))?;
+            self.model
+                .restore_slot_batched(&self.device, checkpoint)
+                .map_err(|error| anyhow!("speculative accept tree restore: {error}"))?;
+
+            #[cfg(feature = "cuda")]
+            {
+                if paged {
+                    let ctx = self.model.paged_ctx.as_mut().unwrap();
+                    let mut lens = ctx.kv_len_host.clone();
+                    lens[slot] = pending.pos as u32;
+                    ctx.reset_kv_len(&lens)
+                        .map_err(|e| anyhow!("accept tree reset_kv_len: {e}"))?;
+                }
+                let rope_host: Vec<u32> = (pending.pos..pending.pos + consumed)
+                    .map(|p| p as u32)
+                    .collect();
+                let (_, hidden, _) = self
+                    .paged_graph_run(false, slot, pending.pos, accepted, rope_host, None)
+                    .map_err(|e| anyhow!("speculative accept tree rebuild: {e}"))?;
+                // prefill-граф отдаёт hidden [1,T,H]; для commit нужен [T,H].
+                pending.hidden = hidden.reshape((consumed, self.model.hidden_size()))?;
+                if paged {
+                    self.model
+                        .paged_ctx
+                        .as_mut()
+                        .unwrap()
+                        .kv_len_host[slot] = (pending.pos + consumed) as u32;
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = accepted;
+                anyhow::bail!("tree speculative accept is CUDA-only");
+            }
+
+            self.verified_target_hidden[slot].clear();
+            for row in 0..consumed {
+                self.verified_target_hidden[slot]
+                    .push(pending.hidden.i(row)?.unsqueeze(0)?);
+            }
+            if let Some(snap) = self.slot_snaps[slot].as_mut() {
+                snap.position = pending.pos + consumed;
+            }
+            #[cfg(feature = "cuda")]
+            if paged {
+                self.model.set_kv_len_batched(slot, pending.pos + consumed);
+            }
+            return Ok(());
+        }
+
         if consumed < k {
             // Снимки пишет только графовая проверка (`forward_verify_paged`,
             // shadow=true при b>1). Построчный `verify_eager` их не пишет, и
