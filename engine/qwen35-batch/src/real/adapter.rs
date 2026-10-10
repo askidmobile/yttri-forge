@@ -572,6 +572,10 @@ pub struct Qwen35BatchAdapter {
     /// Trie-маска последнего tree-verify: пары [start,end] по строкам дерева.
     verify_trie: Option<Tensor>,
     verify_tree_rows: Option<Vec<usize>>,
+    /// Глубина родителя для каждой строки tree-verify (RoPE-позиция строки
+    /// относительно `pos`). Нужна, потому что линейный индекс строки не равен
+    /// глубине узла в ветвящемся дереве.
+    verify_tree_depths: Option<Vec<u32>>,
     /// Per-slot MTP state matches the target state. Prefix-cache snapshots
     /// currently contain only the target model; after injecting one, the MTP
     /// head has neither its attention KV nor the previous target hidden row.
@@ -812,6 +816,7 @@ impl Qwen35BatchAdapter {
             mtp: None,
             verify_trie: None,
             verify_tree_rows: None,
+            verify_tree_depths: None,
             mtp_slot_aligned: vec![true; num_slots],
             debug_alloc: None,
             target_transactions: (0..num_slots).map(|_| None).collect(),
@@ -1115,6 +1120,7 @@ impl Qwen35BatchAdapter {
         }
         self.verify_trie = None;
         self.verify_tree_rows = None;
+        self.verify_tree_depths = None;
         for position in &mut self.transaction_snapshot_positions {
             *position = None;
         }
@@ -2205,6 +2211,14 @@ impl BatchModel for Qwen35BatchAdapter {
             tree.len().saturating_sub(1)
         );
         let staging = tree.staging();
+        // Для строки узла n target кормится токеном родителя, т.е. позиция
+        // RoPE = pos + depth(parent) = pos + (depth(n) - 1).
+        let row_depths = staging
+            .depths
+            .iter()
+            .skip(1)
+            .map(|&depth| depth.saturating_sub(1))
+            .collect::<Vec<u32>>();
         // Rows дерева начинаются с узла 1: root-sentinel не подаётся как input.
         // Поэтому диапазоны ключей переводятся из индексов дерева в индексы строк.
         let trie_ranges = staging
@@ -2218,6 +2232,7 @@ impl BatchModel for Qwen35BatchAdapter {
             "[mtp-tree] adapter trie staged slot={slot} nodes={} ranges={trie_ranges:?}",
             trie_ranges.len() / 2
         );
+        self.verify_tree_depths = Some(row_depths);
         self.set_speculative_tree(Some(trie_ranges), Some((1..tree.len()).collect()))?;
         eprintln!("[mtp-tree] adapter trie loaded slot={slot}");
         Ok(tree)
@@ -2294,7 +2309,15 @@ impl BatchModel for Qwen35BatchAdapter {
             self.verify_trie.is_some()
         );
         let cache_positions: Vec<usize> = (pos..pos + k).collect();
-        let rope_positions = self.rope_positions_for(slot, pos, k)?;
+        let tree_depths = self.verify_tree_depths.take();
+        let mut rope_positions = self.rope_positions_for(slot, pos, k)?;
+        if let Some(depths) = tree_depths.as_ref() {
+            if depths.len() == k {
+                for (i, &depth) in depths.iter().enumerate() {
+                    rope_positions[i] = pos + depth as usize;
+                }
+            }
+        }
         let slots = vec![slot as u32; k];
         #[cfg(feature = "cuda")]
         let (flat, hidden, shadow_written) = if self.paged_authority(slot) {
@@ -2486,6 +2509,7 @@ impl BatchModel for Qwen35BatchAdapter {
         self.transaction_snapshot_positions[slot] = None;
         self.verify_trie = None;
         self.verify_tree_rows = None;
+        self.verify_tree_depths = None;
         Ok(())
     }
 
@@ -2522,6 +2546,7 @@ impl BatchModel for Qwen35BatchAdapter {
         self.transaction_snapshot_positions[slot] = None;
         self.verify_trie = None;
         self.verify_tree_rows = None;
+        self.verify_tree_depths = None;
         Ok(())
     }
 

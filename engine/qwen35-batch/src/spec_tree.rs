@@ -153,33 +153,64 @@ impl FlatTrie {
     }
 
     pub fn from_edges(edges: &[(usize, u32, f32)]) -> Self {
-        let mut nodes = Vec::with_capacity(edges.len() + 1);
-        nodes.push(FlatTrieNode {
-            node: TrieNode {
-                token: 0,
-                parent: None,
-                logprob: 0.0,
-            },
-            start: 0,
-            end: 0,
-            depth: 0,
-        });
-
-        for &(parent, token, logprob) in edges {
-            let idx = nodes.len();
-            nodes.push(FlatTrieNode {
-                node: TrieNode {
-                    token,
-                    parent: Some(parent),
-                    logprob,
-                },
-                start: idx,
-                end: idx,
-                depth: nodes[parent].depth + 1,
-            });
+        // Строим детей в исходном порядке. Узел i+1 соответствует edges[i];
+        // родитель всегда идёт раньше ребёнка (инвариант build_tree/draft_tree).
+        let mut children: Vec<Vec<(usize, u32, f32)>> = vec![Vec::new(); edges.len() + 1];
+        for (i, &(parent, token, logprob)) in edges.iter().enumerate() {
+            let child = i + 1;
+            assert!(
+                parent < child,
+                "tree edges must be in parent-before-child order"
+            );
+            children[parent].push((child, token, logprob));
         }
 
-        // Пересчитать диапазоны поддеревьев после добавления всех узлов.
+        // Trie-маска в CUDA считает поддерево непрерывным [start,end].
+        // Это верно только в DFS-порядке: BFS-порядок перемешивает ветки.
+        let mut old_of_new = Vec::with_capacity(edges.len() + 1);
+        let mut new_of_old = vec![usize::MAX; edges.len() + 1];
+        let mut stack = vec![0usize];
+        while let Some(old) = stack.pop() {
+            new_of_old[old] = old_of_new.len();
+            old_of_new.push(old);
+            for &(child, _, _) in children[old].iter().rev() {
+                stack.push(child);
+            }
+        }
+        assert_eq!(old_of_new.len(), edges.len() + 1, "tree must be connected");
+
+        let mut nodes = Vec::with_capacity(old_of_new.len());
+        for &old in &old_of_new {
+            if old == 0 {
+                nodes.push(FlatTrieNode {
+                    node: TrieNode {
+                        token: 0,
+                        parent: None,
+                        logprob: 0.0,
+                    },
+                    start: 0,
+                    end: 0,
+                    depth: 0,
+                });
+            } else {
+                let (parent_old, token, logprob) = edges[old - 1];
+                let parent = new_of_old[parent_old];
+                let depth = nodes[parent].depth + 1;
+                nodes.push(FlatTrieNode {
+                    node: TrieNode {
+                        token,
+                        parent: Some(parent),
+                        logprob,
+                    },
+                    start: 0,
+                    end: 0,
+                    depth,
+                });
+            }
+        }
+
+        // Диапазоны поддеревьев. В DFS-порядке поддерево каждого узла
+        // непрерывно, поэтому [start,end] — корректная trie-маска.
         let mut ranges = vec![(0usize, 0usize); nodes.len()];
         for i in (0..nodes.len()).rev() {
             let mut start = i;
@@ -359,8 +390,10 @@ mod tests {
     #[test]
     fn accept_follows_branch() {
         let trie = FlatTrie::from_edges(&[(0, 1, -1.0), (1, 2, -2.0), (1, 3, -3.0), (2, 4, -4.0)]);
+        // DFS-порядок: 0, 1, 2, 4, 3. Нас интересует ветка 1->2->4,
+        // поэтому индексы узлов теперь [1, 2, 3], а не [1, 2, 4].
         let accepted = trie.accept(&[1, 2, 4]);
-        assert_eq!(accepted, vec![1, 2, 4]);
+        assert_eq!(accepted, vec![1, 2, 3]);
         assert_eq!(trie.path_tokens(&accepted), vec![1, 2, 4]);
     }
 
@@ -479,14 +512,16 @@ mod tests {
         let trie = FlatTrie::from_edges(&[(0, 1, -1.0), (0, 2, -2.0), (1, 3, -3.0), (2, 4, -4.0)]);
         assert_eq!(trie.len(), 5);
         let nodes = trie.nodes();
+        // DFS-порядок: 0, 1, 3, 2, 4. Диапазоны поддеревьев теперь
+        // непрерывны, а не BFS-интервалы, захватывающие чужие ветки.
         assert_eq!(nodes[0].start, 0);
         assert_eq!(nodes[0].end, 4);
         assert_eq!(nodes[1].start, 1);
-        assert_eq!(nodes[1].end, 3);
+        assert_eq!(nodes[1].end, 2);
         assert_eq!(nodes[2].start, 2);
-        assert_eq!(nodes[2].end, 4);
+        assert_eq!(nodes[2].end, 2);
         assert_eq!(nodes[3].start, 3);
-        assert_eq!(nodes[3].end, 3);
+        assert_eq!(nodes[3].end, 4);
         assert_eq!(nodes[4].start, 4);
         assert_eq!(nodes[4].end, 4);
     }

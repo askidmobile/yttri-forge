@@ -784,16 +784,49 @@ impl<M: BatchModel> BatchScheduler<M> {
         // строку: раньше `generated_tokens().to_vec()` стоял внутри цикла и
         // делал K полных копий истории (и K аллокаций) на раунд.
         let mut history = self.slots[slot].generated_tokens().to_vec();
-        for (logits, &draft_id) in rows.iter().zip(&draft) {
-            let target = self.sampler.sample_indexed(slot, &history, logits);
-            verified.push(target);
-            if target != draft_id {
-                break;
+        if let Some(tree) = tree.as_ref() {
+            // Идём по дереву, а не по линейному порядку строк: siblings стоят
+            // рядом, и zip(draft) обрывал приём на первом же соседе. Строка
+            // первого ребёнка даёт распределение target для следующего токена;
+            // среди детей ищем выпавший токен и продолжаем только его ветку.
+            let mut current = 0usize;
+            loop {
+                let children: Vec<usize> = tree.children(current).collect();
+                if children.is_empty() {
+                    break;
+                }
+                let probe = children[0];
+                let row = probe - 1;
+                if row >= rows.len() {
+                    break;
+                }
+                let target = self.sampler.sample_indexed(slot, &history, &rows[row]);
+                verified.push(target);
+                if target == self.eos {
+                    break;
+                }
+                let Some(&next) = children
+                    .iter()
+                    .find(|&&child| tree.nodes()[child].node.token == target)
+                else {
+                    break;
+                };
+                accepted += 1;
+                history.push(target);
+                current = next;
             }
-            accepted += 1;
-            history.push(target);
-            if target == self.eos {
-                break;
+        } else {
+            for (logits, &draft_id) in rows.iter().zip(&draft) {
+                let target = self.sampler.sample_indexed(slot, &history, logits);
+                verified.push(target);
+                if target != draft_id {
+                    break;
+                }
+                accepted += 1;
+                history.push(target);
+                if target == self.eos {
+                    break;
+                }
             }
         }
         let t_accept = Instant::now();
