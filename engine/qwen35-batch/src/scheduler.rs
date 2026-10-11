@@ -130,6 +130,25 @@ pub fn speculative_width() -> usize {
 /// ширина драфта следует за фактической принимаемостью — см. спекулятивный
 /// раунд. Убирает плату draft+rollback ~65 мс за раунды, где модель не
 /// угадывает (m<=1), сохраняя длинные всплески при полном принятии.
+/// Порог длины контекста для MTP (env MTP_MAX_CTX, default 0 = без порога).
+///
+/// Verify-раунд спекулятивного декода читает attention по ВСЕМУ накопленному KV,
+/// поэтому его цена растёт с длиной контекста, а выигрыш от принятого драфта — нет.
+/// Замер Qwen3.5-9B QAMQ-A5 на RTX 3060 (128 новых токенов): на 21-токенном
+/// промпте W3+ADAPTIVE даёт 62-74 t/s против 59 у baseline, а на 9k/19k/39k —
+/// уже 53/40/31 против 56/54/50, то есть чистую регрессию. Порог отключает MTP,
+/// когда `next_pos` превысил значение.
+#[inline]
+fn mtp_max_ctx() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("MTP_MAX_CTX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 fn mtp_adaptive_on() -> bool {
     static ADAPTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ADAPTIVE.get_or_init(|| {
@@ -553,8 +572,11 @@ impl<M: BatchModel> BatchScheduler<M> {
                 self.speculative[slot].fallback = Some(SpeculativeFallback::Cancelled);
                 continue;
             }
+            let max_ctx = mtp_max_ctx();
+            let ctx_too_long = max_ctx > 0 && self.slots[slot].next_pos() > max_ctx;
             if !self.model.speculative_available(slot)
                 || self.slots[slot].remaining_new_tokens() < 2
+                || ctx_too_long
             {
                 fallback.push(slot);
                 continue;
