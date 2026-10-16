@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "model": {"file": "model.gguf", "sha256": "71c184ccc00ff07bb57319612cb3da9ad55196d29c37bb989f5dce1328a601e2", "recipe": "q8_0", "layout": 1, "vocab_size": 256, "pad_id": 1, "max_tokens": 256},
+  "model": {"file": "model.gguf", "sha256": "75883bbea1cbcd6fb8525610ac0ae1f57ac396fe3101198d03bc67d64a534968", "recipe": "q8_0", "layout": 1, "vocab_size": 256, "pad_id": 1, "max_tokens": 256},
   "reference": "torch f32 on the dequantized bytes of model.gguf (export_gguf.load_reference), batch 1",
   "semantics": {"positions": "cumsum(ids != pad_id) * (ids != pad_id) + pad_id", "attention": "all ones, batch 1, no padding", "pooling": "cls", "head": "out_proj(tanh(dense(cls)))", "activations": "f32, only the weights are quantized"},
   "outputs": [["logits_mail_category", 9], ["logits_mail_needs_attention", 1], ["logits_payment_problem", 1], ["logits_finance_category", 53]],

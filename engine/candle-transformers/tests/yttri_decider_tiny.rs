@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-const MODEL_SHA256: &str = "71c184ccc00ff07bb57319612cb3da9ad55196d29c37bb989f5dce1328a601e2";
-const GOLDEN_SHA256: &str = "a5f50db4e5439023ead2a9b494ed4ee1a537bc1f5cbe4c63a226ab54052e4e15";
+const MODEL_SHA256: &str = "75883bbea1cbcd6fb8525610ac0ae1f57ac396fe3101198d03bc67d64a534968";
+const GOLDEN_SHA256: &str = "6374c84ec34ae36d9c9d20a0194d0a216f51945902f8754de6f8dc7eacd5ccfb";
 
 fn dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/decider-tiny")
@@ -153,7 +153,7 @@ fn config_and_outputs_follow_the_file() {
             c.registry_rev,
             c.state_version
         ),
-        ("0.0.1-tiny", "q8_0", 1, 1)
+        ("0.0.1-tiny", "q8_0", 1, 2)
     );
     let heads: Vec<_> = c.heads.iter().map(|(q, n)| (q.as_str(), *n)).collect();
     assert_eq!(
