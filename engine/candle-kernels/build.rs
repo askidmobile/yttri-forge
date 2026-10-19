@@ -61,7 +61,9 @@ fn main() -> Result<()> {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "ptx") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    if content.contains(".version 9.") {
+                    // sm_121 requires PTX ISA 9.x; downgrading the header to 8.6
+                    // while retaining .target sm_121f makes the driver reject it.
+                    if content.contains(".version 9.") && !content.contains(".target sm_121") {
                         let normalized = content
                             .replace(".version 9.2", ".version 8.6")
                             .replace(".version 9.1", ".version 8.6")
