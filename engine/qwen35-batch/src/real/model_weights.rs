@@ -3814,35 +3814,49 @@ impl GatedAttentionLayer {
                 let y = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
                 y.to_dtype(DType::F32)?
             } else {
-                // CUDA path: manual matmul attention для seq_len=1 в F32 precision.
-                // F16 дал заметный numerical drift vs SDPA (output divergence через
-                // 32 layers × 1024 decode steps). F32 совпадает с CPU SDPA путём.
-                // Performance hit minor: attention occupies ~10% от total decode time.
-                // CUDA matmul требует contiguous; q после rope/transpose может быть
-                // non-contiguous (stride [1, 1, 1, 16]).
-                let q_f32 = q.to_dtype(DType::F32)?.contiguous()?;
-                let k_f32 = k.to_dtype(DType::F32)?.contiguous()?;
-                let v_f32 = v.to_dtype(DType::F32)?.contiguous()?;
-                let kv_seq = k_f32.dim(2)?;
-                let (k_exp, v_exp) = if self.n_kv_head != self.n_head {
-                    let repeats = self.n_head / self.n_kv_head;
-                    let k = k_f32
-                        .unsqueeze(2)?
-                        .broadcast_as((b_sz, self.n_kv_head, repeats, kv_seq, self.head_dim))?
-                        .contiguous()?
-                        .reshape((b_sz, self.n_head, kv_seq, self.head_dim))?;
-                    let v = v_f32
-                        .unsqueeze(2)?
-                        .broadcast_as((b_sz, self.n_kv_head, repeats, kv_seq, self.head_dim))?
-                        .contiguous()?
-                        .reshape((b_sz, self.n_head, kv_seq, self.head_dim))?;
-                    (k, v)
-                } else {
-                    (k_f32, v_f32)
-                };
-                let scores = (q_f32.matmul(&k_exp.transpose(2, 3)?.contiguous()?)? * scale)?;
-                let attn = candle_nn::ops::softmax_last_dim(&scores)?;
-                attn.matmul(&v_exp)?
+                #[cfg(feature = "turing")]
+                {
+                    let q_f = q.to_dtype(DType::F16)?.contiguous()?;
+                    let k_f = k.transpose(1, 2)?.to_dtype(DType::F16)?.contiguous()?;
+                    let v_f = v.transpose(1, 2)?.to_dtype(DType::F16)?.contiguous()?;
+                    super::flash_decode_cuda::dispatch_flash_decode(
+                        q.device().as_cuda_device()?,
+                        &q_f,
+                        &k_f,
+                        &v_f,
+                        scale as f32,
+                    )?
+                    .to_dtype(DType::F32)?
+                }
+                #[cfg(not(feature = "turing"))]
+                {
+                    // CUDA path: manual matmul attention для seq_len=1 в F32 precision.
+                    // F16 дал заметный numerical drift vs SDPA (output divergence через
+                    // 32 layers × 1024 decode steps). F32 совпадает с CPU SDPA путём.
+                    let q_f32 = q.to_dtype(DType::F32)?.contiguous()?;
+                    let k_f32 = k.to_dtype(DType::F32)?.contiguous()?;
+                    let v_f32 = v.to_dtype(DType::F32)?.contiguous()?;
+                    let kv_seq = k_f32.dim(2)?;
+                    let (k_exp, v_exp) = if self.n_kv_head != self.n_head {
+                        let repeats = self.n_head / self.n_kv_head;
+                        let k = k_f32
+                            .unsqueeze(2)?
+                            .broadcast_as((b_sz, self.n_kv_head, repeats, kv_seq, self.head_dim))?
+                            .contiguous()?
+                            .reshape((b_sz, self.n_head, kv_seq, self.head_dim))?;
+                        let v = v_f32
+                            .unsqueeze(2)?
+                            .broadcast_as((b_sz, self.n_kv_head, repeats, kv_seq, self.head_dim))?
+                            .contiguous()?
+                            .reshape((b_sz, self.n_head, kv_seq, self.head_dim))?;
+                        (k, v)
+                    } else {
+                        (k_f32, v_f32)
+                    };
+                    let scores = (q_f32.matmul(&k_exp.transpose(2, 3)?.contiguous()?)? * scale)?;
+                    let attn = candle_nn::ops::softmax_last_dim(&scores)?;
+                    attn.matmul(&v_exp)?
+                }
             }
         } else {
             // Prefill. CUDA: flash-attn v2 (causal, GQA нативно, F16 входы /
@@ -3850,7 +3864,7 @@ impl GatedAttentionLayer {
             // численно близко к F32). Откат: DISABLE_FLASH_PREFILL=1.
             // Маска на CPU (Vec<f32> seq×kv на чанк на блок) и F32 matmul
             // уходят — это была основная цена prefill attention.
-            #[cfg(feature = "cuda")]
+            #[cfg(all(feature = "cuda", not(feature = "turing")))]
             if q.device().is_cuda() && std::env::var("DISABLE_FLASH_PREFILL").is_err() {
                 let at_gpf3 = std::env::var("GPROF").as_deref() == Ok("3");
                 if at_gpf3 {

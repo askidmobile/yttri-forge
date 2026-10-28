@@ -176,6 +176,11 @@ fn header_hash() -> Result<u64> {
 
 fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-env-changed=CARGO_FEATURE_TURING_STUB");
+    if std::env::var_os("CARGO_FEATURE_TURING_STUB").is_some() {
+        return Ok(());
+    }
+
     // Смена режима (минимальная/полная сборка) обязана перезапускать скрипт:
     // без этой строки cargo оставлял старый libflashattention.a.
     println!("cargo::rerun-if-env-changed=CANDLE_FLASH_ATTN_MINIMAL");
