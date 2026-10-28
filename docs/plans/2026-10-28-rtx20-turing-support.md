@@ -1,8 +1,8 @@
 # Plan: быстрый режим RTX 20 (Turing)
 
-**Date:** 2026-10-28  
-**Status:** 📝 Planning  
-**Priority:** P1  
+**Date:** 2026-10-28
+**Status:** 🟡 Implemented; real Turing benchmark pending
+**Priority:** P1
 **Specification:** [docs/specs/2026-10-28-rtx20-turing-support.md](../specs/2026-10-28-rtx20-turing-support.md)
 
 ## Goal
@@ -39,14 +39,14 @@ graph TD
 ### Build and feature gating
 
 #### Files:
-- [ ] `engine/candle-flash-attn/Cargo.toml` — feature `turing-stub`.
-- [ ] `engine/candle-flash-attn/build.rs` — no-op build under stub; preserve FA2 guard for accidental `sm_75` non-stub builds.
-- [ ] `engine/candle-flash-attn/src/ffi.rs` — host stub for FFI symbol under `turing-stub`; production extern remains unchanged.
-- [ ] `engine/candle-kernels/build.rs` — add `NO_BF16_KERNEL` when compute capability is below 80.
-- [ ] `engine/qwen35-batch/Cargo.toml` — feature `turing`, which enables `cuda` and `candle-flash-attn/turing-stub`.
-- [ ] `Cargo.toml` — server feature `cuda-turing = ["cuda", "qwen35-batch/turing"]`.
-- [ ] `scripts/build_linux.sh` — explicit `cuda-turing` path and static-cudart-free check.
-- [ ] `scripts/windows/build_windows.bat` — optional Turing build mode controlled by `YTTRI_TURING=1`.
+- [x] `engine/candle-flash-attn/Cargo.toml` — feature `turing-stub`.
+- [x] `engine/candle-flash-attn/build.rs` — no-op build under stub; preserve FA2 guard for accidental `sm_75` non-stub builds.
+- [x] `engine/candle-flash-attn/src/ffi.rs` — host stub for FFI symbol under `turing-stub`; production extern remains unchanged.
+- [x] `engine/candle-kernels/build.rs` — add `NO_BF16_KERNEL` when compute capability is below 80.
+- [x] `engine/qwen35-batch/Cargo.toml` — feature `turing`, which enables `cuda` and `candle-flash-attn/turing-stub`.
+- [x] `Cargo.toml` — server feature `cuda-turing = ["cuda", "qwen35-batch/turing"]`.
+- [x] `scripts/build_linux.sh` — explicit `cuda-turing` path and static-cudart-free check.
+- [x] `scripts/windows/build_windows.bat` — optional Turing build mode controlled by `YTTRI_TURING=1`.
 
 #### Contracts:
 
@@ -58,11 +58,11 @@ graph TD
 ### Attention runtime
 
 #### Files:
-- [ ] `engine/qwen35-batch/src/real/model_weights.rs` — under `feature="turing"` route prefill to reference path and single-token decode to existing `dispatch_flash_decode`.
-- [ ] `engine/qwen35-batch/src/real/flash_decode_cuda.rs` — validate shapes/dtypes and expose a reusable decode wrapper for turing.
-- [ ] `engine/qwen35-batch/src/real/paged_attn.rs` — compile, but reject turing use before launch; Turing profile never initializes paged pool.
-- [ ] `engine/qwen35-batch/src/real/mtp.rs` — gate registration/use on non-turing builds; server rejects `MTP=1`.
-- [ ] `engine/qwen35-batch/src/real/vision.rs` — server rejects GPU-vision for turing in first release.
+- [x] `engine/qwen35-batch/src/real/model_weights.rs` — under `feature="turing"` route prefill to reference path and single-token decode to existing `dispatch_flash_decode`.
+- [x] `engine/qwen35-batch/src/real/flash_decode_cuda.rs` — validate shapes/dtypes and expose a reusable decode wrapper for turing.
+- [x] `engine/qwen35-batch/src/real/paged_attn.rs` — compile, but reject turing use before launch; Turing profile never initializes paged pool.
+- [x] `engine/qwen35-batch/src/real/mtp.rs` — gate registration/use on non-turing builds; server rejects `MTP=1`.
+- [x] `engine/qwen35-batch/src/real/vision.rs` — server rejects GPU-vision for turing in first release.
 
 #### Runtime selection:
 
@@ -84,10 +84,10 @@ P0 uses `CandleEngine`, so duplicate slots serialize. True batching is P1 and fo
 ### Server and diagnostics
 
 #### Files:
-- [ ] `src/main.rs` — select `CandleEngine` under `cuda-turing`; log backend, compute capability and disabled features.
-- [ ] `src/config.rs` — reject incompatible `MTP=1`, `FLASH_ATTN=1`, `PGRAPH=on`, `KV_POOL_Q8=1` under turing with explicit messages or forced documented values.
-- [ ] `src/engine.rs` — expose backend capability/status fields for `/v1/models` and future terminal monitor.
-- [ ] `README.md` — Turing build/run commands and hardware/model limits.
+- [x] `src/main.rs` — select `CandleEngine` under `cuda-turing`; log backend, compute capability and disabled features.
+- [x] `src/config.rs` — reject incompatible `MTP=1`, `FLASH_ATTN=1`, `PGRAPH=on`, `KV_POOL_Q8=1` under turing with explicit messages or forced documented values.
+- [x] `src/engine.rs` — expose backend capability/status fields for `/v1/models` and future terminal monitor.
+- [x] `README.md` — Turing build/run commands and hardware/model limits.
 
 #### Status shape:
 
@@ -106,17 +106,17 @@ TuringRuntimeStatus {
 ## Implementation phases
 
 ### Phase 1: Build and feature split (estimate: 4 h)
-- [ ] Add `turing-stub` to `candle-flash-attn` and prove its build emits no FA2 kernels or static cudart link.
-- [ ] Add `NO_BF16_KERNEL` selection to `candle-kernels` based on compute capability.
-- [ ] Add `qwen35-batch/turing` and server `cuda-turing` features.
-- [ ] Add build-script switches for Windows and Linux.
+- [x] Add `turing-stub` to `candle-flash-attn` and prove its build emits no FA2 kernels or static cudart link.
+- [x] Add `NO_BF16_KERNEL` selection to `candle-kernels` based on compute capability.
+- [x] Add `qwen35-batch/turing` and server `cuda-turing` features.
+- [x] Add build-script switches for Windows and Linux.
 - **Independent check:** on `yttri-win`, build `candle-kernels` and the server with `CUDA_COMPUTE_CAP=75`; verify no FA2 library is compiled and no `cudart_static` is required for the Turing profile.
 
 ### Phase 2: Single-slot correctness path (estimate: 8 h)
-- [ ] Gate FA2 prefill behind non-turing and route Turing to chunked reference prefill.
-- [ ] Route Turing single-token decode to `flash_decode_partial/combine`.
-- [ ] Reject paged/graph/MTP/GPU-vision entry points before any invalid launch.
-- [ ] Force `CandleEngine` in server startup under `cuda-turing`.
+- [x] Gate FA2 prefill behind non-turing and route Turing to chunked reference prefill.
+- [x] Route Turing single-token decode to `flash_decode_partial/combine`.
+- [x] Reject paged/graph/MTP/GPU-vision entry points before any invalid launch.
+- [x] Force `CandleEngine` in server startup under `cuda-turing`.
 - **Independent check:** run `yforge --features cuda-turing` on `yttri-win` RTX 3060 with a Turing emulation branch; complete 4 generations at 8K and 32K without NaN or state loss.
 
 ### Phase 3: Numeric gates (estimate: 6 h)
@@ -127,16 +127,16 @@ TuringRuntimeStatus {
 - **Independent check:** `cargo test --release --features cuda-turing --package qwen35-batch turing_attn_parity` on `yttri-win`; tests are deterministic and parallel-safe.
 
 ### Phase 4: Performance and real hardware (estimate: 8 h)
-- [ ] Benchmark `sm_75` compile path on `yttri-win` as a functional proxy.
+- [x] Benchmark `sm_75` compile path on `yttri-win` as a functional proxy.
 - [ ] Send the build artifact/run book to the RTX 2080 Ti reporter for one-slot tests.
 - [ ] Measure 8K/32K decode and prefill against llama.cpp with three repeats.
 - [ ] Decide whether a rented 2080 Ti run is required to close the release gate.
 - **Independent check:** benchmark report with raw logs, model hash, driver/CUDA versions, VRAM and accepted numerical results.
 
 ### Phase 5: Polish and release decision (estimate: 3 h)
-- [ ] Update README and build examples.
-- [ ] Add `TURING=1` to logs and model capabilities.
-- [ ] Document that MTP, paged prefill and GPU vision are unavailable in v1.
+- [x] Update README and build examples.
+- [x] Add `TURING=1` to logs and model capabilities.
+- [x] Document that MTP, paged prefill and GPU vision are unavailable in v1.
 - [ ] Decide separate binary vs universal build for packaging.
 - **Independent check:** clean install from README on both RTX 3060 and at least one RTX 2080 Ti report.
 
