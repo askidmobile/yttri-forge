@@ -98,36 +98,63 @@ const HEADER_FILES: [&str; 18] = [
     "kernels/utils.h",
 ];
 
-/// Каталог библиотек CUDA Toolkit для СТАТИЧЕСКОЙ линковки cudart.
+/// Каталоги библиотек CUDA Toolkit для СТАТИЧЕСКОЙ линковки cudart.
 ///
 /// Динамический `-lcudart` резолвил линкер через `LIBRARY_PATH` (Linux) или
 /// `LIB` (MSVC), поэтому build.rs про CUDA ничего знать не требовалось. Для
 /// `rustc-link-lib=static=` файл ищет САМ rustc по своим `link-search`-путям
 /// и падает раньше линкера — значит путь нужно сообщить явно.
 ///
-/// Корень берём из окружения: его выставляют и `build_linux.sh`, и
-/// `with_msvc.ps1` (там же пинится нужная версия тулкита).
-fn cuda_lib_dir(is_target_msvc: bool) -> Option<PathBuf> {
-    let root = ["CUDA_PATH", "CUDA_ROOT", "CUDA_HOME", "CUDA_TOOLKIT_ROOT_DIR"]
-        .iter()
-        .find_map(std::env::var_os)
-        .map(PathBuf::from)?;
+/// Если CUDA_PATH и родственные переменные не заданы, корень берём из nvcc.
+/// Это важно для Debian/Ubuntu: там `nvidia-cuda-toolkit` кладёт
+/// `libcudart_static.a` в multiarch-каталог `/usr/lib/<target>/`, а не в
+/// `/usr/lib64`, который ожидает стандартный layout NVIDIA.
+fn cuda_lib_candidates(is_target_msvc: bool) -> Vec<PathBuf> {
+    let mut roots = [
+        "CUDA_PATH",
+        "CUDA_ROOT",
+        "CUDA_HOME",
+        "CUDA_TOOLKIT_ROOT_DIR",
+    ]
+    .iter()
+    .filter_map(std::env::var_os)
+    .map(PathBuf::from)
+    .collect::<Vec<_>>();
 
-    let candidates: Vec<PathBuf> = if is_target_msvc {
-        vec![root.join("lib").join("x64")]
-    } else {
-        vec![
-            root.join("lib64"),
-            root.join("targets").join("x86_64-linux").join("lib"),
-            root.join("lib"),
-        ]
-    };
+    if let Ok(toolkit) = cudaforge::CudaToolkit::detect() {
+        if let Some(root) = toolkit.nvcc_path.parent().and_then(|path| path.parent()) {
+            roots.push(root.to_path_buf());
+        }
+    }
+
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let target_arch = target.split('-').next().unwrap_or_default();
+    let target_cuda = format!("{target_arch}-linux");
+    let target_multiarch = format!("{target_arch}-linux-gnu");
+
+    let mut candidates = Vec::new();
+    for root in roots {
+        if is_target_msvc {
+            candidates.push(root.join("lib").join("x64"));
+        } else {
+            candidates.extend([
+                root.join("lib64"),
+                root.join("targets").join(&target_cuda).join("lib"),
+                root.join("lib").join(&target_multiarch),
+                root.join("lib"),
+            ]);
+        }
+    }
+    candidates
+}
+
+fn cudart_static_name(is_target_msvc: bool) -> &'static str {
     let stem = if is_target_msvc {
         "cudart_static.lib"
     } else {
         "libcudart_static.a"
     };
-    candidates.into_iter().find(|dir| dir.join(stem).is_file())
+    stem
 }
 
 fn update_hash(hash: &mut u64, bytes: &[u8]) {
@@ -153,13 +180,60 @@ fn main() -> Result<()> {
     // без этой строки cargo оставлял старый libflashattention.a.
     println!("cargo::rerun-if-env-changed=CANDLE_FLASH_ATTN_MINIMAL");
     let minimal = std::env::var("CANDLE_FLASH_ATTN_MINIMAL").is_ok();
-    let kernel_files: &[&str] = if minimal { &KERNEL_FILES_MIN } else { &KERNEL_FILES };
+    let kernel_files: &[&str] = if minimal {
+        &KERNEL_FILES_MIN
+    } else {
+        &KERNEL_FILES
+    };
     for kernel_file in kernel_files.iter() {
         println!("cargo::rerun-if-changed={kernel_file}");
     }
     for header_file in HEADER_FILES.iter() {
         println!("cargo::rerun-if-changed={header_file}");
     }
+
+    let arch = cudaforge::detect_compute_cap()?;
+    if arch.base < 80 {
+        return Err(cudaforge::Error::InvalidConfig(format!(
+            "candle-flash-attn требует Ampere (sm_80) или новее, получено {}. \
+             FA2-ядра этого крейта на Turing (например, RTX 2080 Ti / sm_75) не работают.",
+            arch.to_nvcc_arch()
+        )));
+    }
+
+    let is_target_msvc = std::env::var("TARGET").is_ok_and(|target| target.contains("msvc"));
+    for var in [
+        "CUDA_PATH",
+        "CUDA_ROOT",
+        "CUDA_HOME",
+        "CUDA_TOOLKIT_ROOT_DIR",
+    ] {
+        println!("cargo::rerun-if-env-changed={var}");
+    }
+    println!("cargo::rerun-if-env-changed=NVCC");
+
+    // Проверяем статический runtime до компиляции 53 CUDA-файлов: иначе
+    // отсутствующий dev-компонент выясняется только через десятки минут.
+    let cuda_candidates = cuda_lib_candidates(is_target_msvc);
+    let cudart_static = cudart_static_name(is_target_msvc);
+    let Some(cuda_lib) = cuda_candidates
+        .iter()
+        .find(|dir| dir.join(cudart_static).is_file())
+        .cloned()
+    else {
+        let searched = cuda_candidates
+            .iter()
+            .map(|dir| dir.join(cudart_static).display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        return Err(cudaforge::Error::InvalidConfig(format!(
+            "{cudart_static} не найден. Нужен полный CUDA Toolkit с dev-компонентом \
+             cudart; одного libcudart.so/cudart64_*.dll недостаточно. \
+             Задайте CUDA_PATH (или CUDA_ROOT/CUDA_HOME) на корень Toolkit.\n\
+             Проверенные пути:\n  {searched}"
+        )));
+    };
+
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     let build_dir = match std::env::var("CANDLE_FLASH_ATTN_BUILD_DIR") {
         Err(_) =>
@@ -199,12 +273,8 @@ fn main() -> Result<()> {
         builder = builder.arg("-DCANDLE_FA_MINIMAL");
     }
 
-    let mut is_target_msvc = false;
-    if let Ok(target) = std::env::var("TARGET") {
-        if target.contains("msvc") {
-            is_target_msvc = true;
-            builder = builder.arg("-D_USE_MATH_DEFINES");
-        }
+    if is_target_msvc {
+        builder = builder.arg("-D_USE_MATH_DEFINES");
     }
 
     if !is_target_msvc {
@@ -234,16 +304,6 @@ fn main() -> Result<()> {
     // линкуют `cudarc` с `features = ["driver"]`, то есть используют
     // driver API, а не runtime API. Семантика выполнения не меняется —
     // меняется только момент и способ загрузки.
-    for var in ["CUDA_PATH", "CUDA_ROOT", "CUDA_HOME", "CUDA_TOOLKIT_ROOT_DIR"] {
-        println!("cargo::rerun-if-env-changed={var}");
-    }
-    let Some(cuda_lib) = cuda_lib_dir(is_target_msvc) else {
-        panic!(
-            "cudart_static не найден: задай CUDA_PATH (или CUDA_ROOT/CUDA_HOME) \
-             на корень CUDA Toolkit. Динамический cudart намеренно НЕ используется — \
-             он делает бинарь незапускаемым на машине без CUDA-рантайма."
-        );
-    };
     println!("cargo::rustc-link-search=native={}", cuda_lib.display());
     println!("cargo::rustc-link-lib=static=cudart_static");
     if !is_target_msvc {
