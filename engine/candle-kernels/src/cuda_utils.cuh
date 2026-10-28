@@ -165,14 +165,14 @@ __device__ __forceinline__ __half sqrtg(__half a) { return hsqrt(a); }
 __device__ __forceinline__ __half cosg(__half a) { return hcos(a); }
 __device__ __forceinline__ __half sing(__half a) { return hsin(a); }
 __device__ __forceinline__ __half recipg(__half a) { __half one = 1.0; return one / a; }
-__device__ __forceinline__ __half maxg(__half a, __half b) { return __hmax_nan(a, b); }
+__device__ __forceinline__ __half maxg(__half a, __half b) { return candle_hmax_nan(a, b); }
 __device__ __forceinline__ __half tanhg(__half a) { return __float2half(tanhf(__half2float(a))); }
 __device__ __forceinline__ __half erfg(__half a) { return __float2half(erff(__half2float(a))); }
 __device__ __forceinline__ __half ceilg(__half a) { return __float2half(ceilf(__half2float(a))); }
 __device__ __forceinline__ __half floorg(__half a) { return __float2half(floorf(__half2float(a))); }
 __device__ __forceinline__ __half roundg(__half a) { return __float2half(roundf(__half2float(a))); }
 __device__ __forceinline__ __half normcdfg(__half a) { return __float2half(normcdff(__half2float(a))); }
-__device__ __forceinline__ __half ming(__half a, __half b) { return __hmin_nan(a, b); }
+__device__ __forceinline__ __half ming(__half a, __half b) { return candle_hmin_nan(a, b); }
 __device__ __forceinline__ __half logg(__half a) { return hlog(a); }
 __device__ __forceinline__ __half expg(__half a) { return hexp(a); }
 __device__ __forceinline__ __half absg(__half a) { return __habs(a); }
