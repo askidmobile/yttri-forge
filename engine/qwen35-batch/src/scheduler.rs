@@ -26,8 +26,8 @@ use std::time::Instant;
 use anyhow::Result;
 
 use crate::model::{
-    BatchModel, DecodeBatch, DecodeItem, GreedySampler, PrefillChunk, Sampler, SpeculativeFallback,
-    SpeculativeMetrics,
+    BatchModel, DecodeBatch, DecodeItem, DecodeRow, GreedySampler, PrefillChunk, Sampler,
+    SpeculativeFallback, SpeculativeMetrics,
 };
 use crate::slot::{Slot, SlotRequest, SlotStatus};
 
@@ -1013,19 +1013,28 @@ impl<M: BatchModel> BatchScheduler<M> {
             let poss: Vec<usize> = batch.items.iter().map(|item| item.pos).collect();
             eprintln!("[step] decode begin B={} pos={poss:?}", batch.len());
         }
-        let logits = self.model.decode_batch(&batch)?;
-        if logits.len() != batch.len() {
+        let greedy: Vec<bool> = batch
+            .items
+            .iter()
+            .map(|item| self.sampler.greedy_for_slot(item.slot_idx))
+            .collect();
+        let rows = self.model.decode_batch_mixed(&batch, &greedy)?;
+        if rows.len() != batch.len() {
             anyhow::bail!(
                 "decode returned {} rows for batch {}",
-                logits.len(),
+                rows.len(),
                 batch.len()
             );
         }
-        for (item, logits) in batch.items.iter().zip(&logits) {
-            let generated = self.slots[item.slot_idx].generated_tokens().to_vec();
-            let token = self
-                .sampler
-                .sample_indexed(item.slot_idx, &generated, logits);
+        for (item, row) in batch.items.iter().zip(&rows) {
+            let token = match row {
+                DecodeRow::Token(token) => *token,
+                DecodeRow::Logits(logits) => {
+                    let generated = self.slots[item.slot_idx].generated_tokens().to_vec();
+                    self.sampler
+                        .sample_indexed(item.slot_idx, &generated, logits)
+                }
+            };
             self.stats.total_decode_tokens += 1;
             self.slots[item.slot_idx].push_token(token);
             if should_stop(item.slot_idx, self.slots[item.slot_idx].generated_tokens()) {

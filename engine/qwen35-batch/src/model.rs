@@ -43,6 +43,14 @@ pub struct DecodeBatch {
     pub items: Vec<DecodeItem>,
 }
 
+/// Один результат decode. Greedy-строки могут остаться на устройстве до
+/// получения одного token ID; строкам с temperature/top-k нужны полные logits.
+#[derive(Debug, Clone)]
+pub enum DecodeRow {
+    Logits(Vec<f32>),
+    Token(u32),
+}
+
 impl DecodeBatch {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
@@ -107,6 +115,12 @@ pub trait Sampler: Send {
     fn sample_indexed(&mut self, _slot_idx: usize, _generated: &[u32], logits: &[f32]) -> u32 {
         self.sample(logits)
     }
+
+    /// Истинно, только когда argmax по сырым logits эквивалентен политике слота
+    /// (temperature 0, без suppression и штрафов).
+    fn greedy_for_slot(&self, _slot_idx: usize) -> bool {
+        false
+    }
 }
 
 /// Greedy argmax. Достаточен для parity (batched vs single-stream):
@@ -115,6 +129,10 @@ pub trait Sampler: Send {
 pub struct GreedySampler;
 
 impl Sampler for GreedySampler {
+    fn greedy_for_slot(&self, _slot_idx: usize) -> bool {
+        true
+    }
+
     fn sample(&mut self, logits: &[f32]) -> u32 {
         let mut best = 0u32;
         let mut best_v = f32::NEG_INFINITY;
@@ -183,6 +201,23 @@ pub trait BatchModel {
     /// Batched decode step: один токен на каждый активный слот, одним батчем.
     /// Возвращает логиты per-item (в порядке `batch.items`).
     fn decode_batch(&mut self, batch: &DecodeBatch) -> Result<Vec<Vec<f32>>>;
+
+    /// Batched decode с greedy-подсказкой на строку. Реализация по умолчанию
+    /// сохраняет контракт полных logits для моделей без argmax на устройстве.
+    fn decode_batch_mixed(
+        &mut self,
+        batch: &DecodeBatch,
+        greedy: &[bool],
+    ) -> Result<Vec<DecodeRow>> {
+        if greedy.len() != batch.items.len() {
+            anyhow::bail!("decode greedy mask length mismatch");
+        }
+        Ok(self
+            .decode_batch(batch)?
+            .into_iter()
+            .map(DecodeRow::Logits)
+            .collect())
+    }
 
     /// Whether validated speculative state exists for this slot. Default keeps
     /// all existing model implementations on ordinary decode.
@@ -306,6 +341,13 @@ impl<T: BatchModel + ?Sized> BatchModel for &mut T {
     }
     fn decode_batch(&mut self, batch: &DecodeBatch) -> Result<Vec<Vec<f32>>> {
         (**self).decode_batch(batch)
+    }
+    fn decode_batch_mixed(
+        &mut self,
+        batch: &DecodeBatch,
+        greedy: &[bool],
+    ) -> Result<Vec<DecodeRow>> {
+        (**self).decode_batch_mixed(batch, greedy)
     }
     fn reset_slot(&mut self, idx: usize) -> Result<()> {
         (**self).reset_slot(idx)

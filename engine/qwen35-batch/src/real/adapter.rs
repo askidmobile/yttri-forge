@@ -20,7 +20,7 @@ use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use std::path::Path;
 
-use crate::model::{BatchModel, DecodeBatch, MultimodalPrefill, PrefillChunk};
+use crate::model::{BatchModel, DecodeBatch, DecodeRow, MultimodalPrefill, PrefillChunk};
 use crate::real::model_profile::ModelProfile;
 #[cfg(feature = "cuda")]
 use crate::real::model_weights::GRAPH_MIN_FREE_BYTES;
@@ -1237,7 +1237,223 @@ mod pinned_logits {
             }
             Ok(())
         })?;
-        let _ = device;
+        Ok(out)
+    }
+}
+
+fn rows_from_flat(flat: &[f32], vocab: usize, greedy: &[bool]) -> Vec<DecodeRow> {
+    flat.chunks_exact(vocab)
+        .enumerate()
+        .map(|(row_idx, row)| {
+            if greedy.get(row_idx).copied().unwrap_or(false) {
+                let mut best = f32::NEG_INFINITY;
+                let mut best_i = 0u32;
+                for (i, &v) in row.iter().enumerate() {
+                    if v > best {
+                        best = v;
+                        best_i = i as u32;
+                    }
+                }
+                DecodeRow::Token(best_i)
+            } else {
+                DecodeRow::Logits(row.to_vec())
+            }
+        })
+        .collect()
+}
+
+impl Qwen35BatchAdapter {
+    fn decode_batch_impl(
+        &mut self,
+        batch: &DecodeBatch,
+        greedy: &[bool],
+    ) -> Result<Vec<DecodeRow>> {
+        let b = batch.items.len();
+        if greedy.len() != b {
+            return Err(anyhow!("decode greedy mask length mismatch"));
+        }
+        if batch
+            .items
+            .iter()
+            .any(|item| item.slot_idx >= self.slot_snaps.len())
+        {
+            return Err(anyhow!("decode slot is out of range"));
+        }
+        if b == 0 {
+            return Ok(vec![]);
+        }
+
+        // Сначала seed всех слотов в batched buffers (если ещё не засеяны).
+        for it in &batch.items {
+            let sidx = it.slot_idx;
+            if !self.slot_seeded[sidx] {
+                let snap = self.slot_snaps[sidx]
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("decode_batch: slot {sidx} без snapshot"))?;
+                self.model
+                    .seed_slot_batched(&self.device, sidx, snap)
+                    .map_err(|e| anyhow!("decode seed slot {sidx}: {e}"))?;
+                self.slot_seeded[sidx] = true;
+                #[cfg(feature = "cuda")]
+                {
+                    // Seed из pool-снимка (from_pool) НЕ меняет содержимое пула:
+                    // attention не материализуется в batched-кэш, пул остаётся
+                    // авторитетным. Seed из single-slot-снимка кладёт строки в
+                    // batched-кэш, а в пуле их нет → пул устарел (dirty).
+                    let pool_authoritative = self.model.paged_ctx.is_some()
+                        && snap.blocks.iter().all(|b| match b {
+                            BlockStateSnap::Attention(Some(s)) => s.from_pool,
+                            _ => true,
+                        });
+                    self.paged_dirty[sidx] = !pool_authoritative;
+                    // Seed меняет состав state — graph состав-зависим, инвалидируем.
+                    if !self.decode_graphs.is_empty() {
+                        self.decode_graphs.clear();
+                    }
+                    // Prefill оставил в пуле пиковые страницы интермедиатов
+                    // (512-token chunk buffers). Trim при первом decode после
+                    // prefill — иначе retained slack добивает VRAM на 27B.
+                    trim_pool_cuda(&self.device);
+                }
+            }
+        }
+
+        // Собираем batched входы: tokens [B,1] + positions [B] + slots [B].
+        // `slots` — отображение batch_idx → slot_idx: persistent state (ssm_state,
+        // conv_state, kv_cache) адресуется по slot_idx, а не по batch_idx.
+        // После сжатия батча (ранний EOS) это сохраняет привязку слота к его state.
+        let mut tokens = Vec::with_capacity(b);
+        let mut positions = Vec::with_capacity(b);
+        let mut rope_positions = Vec::with_capacity(b);
+        let mut slot_order = Vec::with_capacity(b); // (batch_idx, slot_idx)
+        let mut slots = Vec::with_capacity(b);
+        for it in &batch.items {
+            tokens.push(it.token);
+            positions.push(it.pos);
+            let rope_position = i64::try_from(it.pos)?
+                .checked_add(self.rope_deltas[it.slot_idx])
+                .ok_or_else(|| anyhow!("decode RoPE position overflow"))?;
+            rope_positions.push(
+                usize::try_from(rope_position)
+                    .map_err(|_| anyhow!("negative decode RoPE position"))?,
+            );
+            slot_order.push(it.slot_idx);
+            slots.push(it.slot_idx as u32);
+        }
+        // Первая CUDA-операция шага (выделение + htod) — с контекстом: после
+        // захвата и вытеснения графа сюда приходил голый INVALID_VALUE.
+        let ids = Tensor::from_vec(tokens.clone(), (b, 1usize), &self.device)
+            .map_err(|e| anyhow!("decode ids from_vec b={b}: {e}"))?;
+
+        // FR-006/PD-004: кэш горячих экспертов — D2H следа прошлого шага,
+        // LRU, подъёмы промахов на боковом потоке (перед графом шага).
+        #[cfg(feature = "cuda")]
+        let dec_t0 = std::time::Instant::now();
+        #[cfg(feature = "cuda")]
+        self.model
+            .before_moe_step(&self.device)
+            .map_err(|e| anyhow!("moe before_step: {e}"))?;
+        #[cfg(feature = "cuda")]
+        let dec_t1 = std::time::Instant::now();
+        // CUDA-graph decode: один cuGraphLaunch на весь forward. None → eager.
+        #[cfg(feature = "cuda")]
+        {
+            let graphed =
+                self.decode_batch_graphed(
+                    b,
+                    &tokens,
+                    &rope_positions,
+                    &slots,
+                    &positions,
+                    greedy,
+                );
+            if crate::scheduler::trace_on() {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 32 == 0 {
+                    eprintln!(
+                        "[dec] #{n} before_step={:.2}ms graphed={:.2}ms",
+                        (dec_t1 - dec_t0).as_secs_f64() * 1e3,
+                        dec_t1.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+            }
+            match graphed {
+                Ok(Some((out, _hidden))) => {
+                    for i in 0..b {
+                        let sidx = slot_order[i];
+                        if let Some(snap) = self.slot_snaps[sidx].as_mut() {
+                            snap.position = positions[i] + 1;
+                        }
+                        // Хостовое зеркало длины batched-кеша: по нему
+                        // rehydrate_kv_from_paged собирает кеш из пула при
+                        // eager-откате и checkpoint_slot_batched снимает длину.
+                        // Без этого после графовых шагов оба видели бы длину
+                        // на момент миграции.
+                        self.model.set_kv_len_batched(sidx, positions[i] + 1);
+                    }
+                    return Ok(out);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.decode_graphs.clear();
+                    self.graphs_failed("graphed decode failed, eager fallback", &e);
+                }
+            }
+        }
+        // Hidden decode_batch'а больше не нужен MTP: verify идёт через
+        // speculative_verify (multi-token), hidden собирает speculative_accept.
+        // Авторитетная копия KV может жить только в пуле: после миграции
+        // batched-кэш освобождён, а после graph-префилла его и не было.
+        // Eager-путь без кэша не работает — собираем его из пула. Ничего не
+        // делает, если кэш на месте.
+        #[cfg(feature = "cuda")]
+        for it in batch.items.iter() {
+            self.model
+                .rehydrate_kv_from_paged(it.slot_idx)
+                .map_err(|e| anyhow!("rehydrate KV slot {}: {e}", it.slot_idx))?;
+            self.prefill_path[it.slot_idx] = PrefillPath::Eager;
+        }
+        let logits = self
+            .model
+            .forward_decode_batch(&ids, &positions, &rope_positions, &slots)
+            .map_err(|e| anyhow!("decode_batch forward: {e}"))?;
+        // One D2H transfer for [B, vocab], then split on host. Per-row to_vec1()
+        // serialized four CUDA synchronizations/copies for B=4.
+        let flat = logits
+            .to_dtype(DType::F32)
+            .map_err(|e| anyhow!("decode_batch logits to_dtype: {e}"))?
+            .flatten_all()
+            .map_err(|e| anyhow!("decode_batch logits flatten: {e}"))?
+            .to_vec1()
+            .map_err(|e| anyhow!("decode_batch logits to_vec1: {e}"))?;
+        let vocab = self.vocab_size();
+        if flat.len() != b * vocab {
+            return Err(anyhow!(
+                "decode_batch logits length {} != batch {b} * vocab {vocab}",
+                flat.len()
+            ));
+        }
+        let out = rows_from_flat(&flat, vocab, greedy);
+
+        // Обновить per-slot snapshot из batched state после decode (для последующего
+        // prefill-продолжения и для повторного seed, если слот покинет batch и вернётся).
+        // Дешевле: позиция продвинулась на 1; state живёт в batched buffers, но snapshot
+        // нужен для prefill-restore (который использует single-slot path).
+        // Полный re-snapshot из batched buffers не реализован (требует dtoh slot-region);
+        // вместо этого помечаем slot как требующий re-seed перед следующим decode —
+        // batched state уже актуален в буферах, snapshot устарел только по позиции.
+        for i in 0..b {
+            let sidx = slot_order[i];
+            // Позиция в snapshot продвинулась; сам state валиден в batched buffers.
+            // Обновляем только position (для future prefill-restore корректен только
+            // если последующий prefill стартует с it.pos+1 и reset — обычный паттерн).
+            if let Some(snap) = self.slot_snaps[sidx].as_mut() {
+                snap.position = positions[i] + 1;
+            }
+            // slot остаётся seeded — batched buffers уже содержат обновлённый state.
+        }
+
         Ok(out)
     }
 }
@@ -2001,183 +2217,22 @@ impl BatchModel for Qwen35BatchAdapter {
     /// CUDA-graph decode: один cuGraphLaunch вместо ~1700 драйверных вызовов.
     /// Возвращает Ok(None) — если шаг не графable (окно, состав, MTP) → eager fallback.
     fn decode_batch(&mut self, batch: &DecodeBatch) -> Result<Vec<Vec<f32>>> {
-        let b = batch.items.len();
-        if batch
-            .items
-            .iter()
-            .any(|item| item.slot_idx >= self.slot_snaps.len())
-        {
-            return Err(anyhow!("decode slot is out of range"));
-        }
-        if b == 0 {
-            return Ok(vec![]);
-        }
+        let greedy = vec![false; batch.items.len()];
+        self.decode_batch_impl(batch, &greedy)?
+            .into_iter()
+            .map(|row| match row {
+                DecodeRow::Logits(logits) => Ok(logits),
+                DecodeRow::Token(_) => Err(anyhow!("non-greedy decode returned a token")),
+            })
+            .collect()
+    }
 
-        // Сначала seed всех слотов в batched buffers (если ещё не засеяны).
-        for it in &batch.items {
-            let sidx = it.slot_idx;
-            if !self.slot_seeded[sidx] {
-                let snap = self.slot_snaps[sidx]
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("decode_batch: slot {sidx} без snapshot"))?;
-                self.model
-                    .seed_slot_batched(&self.device, sidx, snap)
-                    .map_err(|e| anyhow!("decode seed slot {sidx}: {e}"))?;
-                self.slot_seeded[sidx] = true;
-                #[cfg(feature = "cuda")]
-                {
-                    // Seed из pool-снимка (from_pool) НЕ меняет содержимое пула:
-                    // attention не материализуется в batched-кэш, пул остаётся
-                    // авторитетным. Seed из single-slot-снимка кладёт строки в
-                    // batched-кэш, а в пуле их нет → пул устарел (dirty).
-                    let pool_authoritative = self.model.paged_ctx.is_some()
-                        && snap.blocks.iter().all(|b| match b {
-                            BlockStateSnap::Attention(Some(s)) => s.from_pool,
-                            _ => true,
-                        });
-                    self.paged_dirty[sidx] = !pool_authoritative;
-                    // Seed меняет состав state — graph состав-зависим, инвалидируем.
-                    if !self.decode_graphs.is_empty() {
-                        self.decode_graphs.clear();
-                    }
-                    // Prefill оставил в пуле пиковые страницы интермедиатов
-                    // (512-token chunk buffers). Trim при первом decode после
-                    // prefill — иначе retained slack добивает VRAM на 27B.
-                    trim_pool_cuda(&self.device);
-                }
-            }
-        }
-
-        // Собираем batched входы: tokens [B,1] + positions [B] + slots [B].
-        // `slots` — отображение batch_idx → slot_idx: persistent state (ssm_state,
-        // conv_state, kv_cache) адресуется по slot_idx, а не по batch_idx.
-        // После сжатия батча (ранний EOS) это сохраняет привязку слота к его state.
-        let mut tokens = Vec::with_capacity(b);
-        let mut positions = Vec::with_capacity(b);
-        let mut rope_positions = Vec::with_capacity(b);
-        let mut slot_order = Vec::with_capacity(b); // (batch_idx, slot_idx)
-        let mut slots = Vec::with_capacity(b);
-        for it in &batch.items {
-            tokens.push(it.token);
-            positions.push(it.pos);
-            let rope_position = i64::try_from(it.pos)?
-                .checked_add(self.rope_deltas[it.slot_idx])
-                .ok_or_else(|| anyhow!("decode RoPE position overflow"))?;
-            rope_positions.push(
-                usize::try_from(rope_position)
-                    .map_err(|_| anyhow!("negative decode RoPE position"))?,
-            );
-            slot_order.push(it.slot_idx);
-            slots.push(it.slot_idx as u32);
-        }
-        // Первая CUDA-операция шага (выделение + htod) — с контекстом: после
-        // захвата и вытеснения графа сюда приходил голый INVALID_VALUE.
-        let ids = Tensor::from_vec(tokens.clone(), (b, 1usize), &self.device)
-            .map_err(|e| anyhow!("decode ids from_vec b={b}: {e}"))?;
-
-        // FR-006/PD-004: кэш горячих экспертов — D2H следа прошлого шага,
-        // LRU, подъёмы промахов на боковом потоке (перед графом шага).
-        #[cfg(feature = "cuda")]
-        let dec_t0 = std::time::Instant::now();
-        #[cfg(feature = "cuda")]
-        self.model
-            .before_moe_step(&self.device)
-            .map_err(|e| anyhow!("moe before_step: {e}"))?;
-        #[cfg(feature = "cuda")]
-        let dec_t1 = std::time::Instant::now();
-        // CUDA-graph decode: один cuGraphLaunch на весь forward. None → eager.
-        #[cfg(feature = "cuda")]
-        {
-            let graphed =
-                self.decode_batch_graphed(b, &tokens, &rope_positions, &slots, &positions);
-            if crate::scheduler::trace_on() {
-                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n % 32 == 0 {
-                    eprintln!(
-                        "[dec] #{n} before_step={:.2}ms graphed={:.2}ms",
-                        (dec_t1 - dec_t0).as_secs_f64() * 1e3,
-                        dec_t1.elapsed().as_secs_f64() * 1e3
-                    );
-                }
-            }
-            match graphed {
-                Ok(Some((out, _hidden))) => {
-                    for i in 0..b {
-                        let sidx = slot_order[i];
-                        if let Some(snap) = self.slot_snaps[sidx].as_mut() {
-                            snap.position = positions[i] + 1;
-                        }
-                        // Хостовое зеркало длины batched-кеша: по нему
-                        // rehydrate_kv_from_paged собирает кеш из пула при
-                        // eager-откате и checkpoint_slot_batched снимает длину.
-                        // Без этого после графовых шагов оба видели бы длину
-                        // на момент миграции.
-                        self.model.set_kv_len_batched(sidx, positions[i] + 1);
-                    }
-                    return Ok(out);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    self.decode_graphs.clear();
-                    self.graphs_failed("graphed decode failed, eager fallback", &e);
-                }
-            }
-        }
-        // Hidden decode_batch'а больше не нужен MTP: verify идёт через
-        // speculative_verify (multi-token), hidden собирает speculative_accept.
-        // Авторитетная копия KV может жить только в пуле: после миграции
-        // batched-кэш освобождён, а после graph-префилла его и не было.
-        // Eager-путь без кэша не работает — собираем его из пула. Ничего не
-        // делает, если кэш на месте.
-        #[cfg(feature = "cuda")]
-        for it in batch.items.iter() {
-            self.model
-                .rehydrate_kv_from_paged(it.slot_idx)
-                .map_err(|e| anyhow!("rehydrate KV slot {}: {e}", it.slot_idx))?;
-            self.prefill_path[it.slot_idx] = PrefillPath::Eager;
-        }
-        let logits = self
-            .model
-            .forward_decode_batch(&ids, &positions, &rope_positions, &slots)
-            .map_err(|e| anyhow!("decode_batch forward: {e}"))?;
-        // One D2H transfer for [B, vocab], then split on host. Per-row to_vec1()
-        // serialized four CUDA synchronizations/copies for B=4.
-        let flat = logits
-            .to_dtype(DType::F32)
-            .map_err(|e| anyhow!("decode_batch logits to_dtype: {e}"))?
-            .flatten_all()
-            .map_err(|e| anyhow!("decode_batch logits flatten: {e}"))?
-            .to_vec1()
-            .map_err(|e| anyhow!("decode_batch logits to_vec1: {e}"))?;
-        let vocab = self.vocab_size();
-        if flat.len() != b * vocab {
-            return Err(anyhow!(
-                "decode_batch logits length {} != batch {b} * vocab {vocab}",
-                flat.len()
-            ));
-        }
-        let out = flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect();
-
-        // Обновить per-slot snapshot из batched state после decode (для последующего
-        // prefill-продолжения и для повторного seed, если слот покинет batch и вернётся).
-        // Дешевле: позиция продвинулась на 1; state живёт в batched buffers, но snapshot
-        // нужен для prefill-restore (который использует single-slot path).
-        // Полный re-snapshot из batched buffers не реализован (требует dtoh slot-region);
-        // вместо этого помечаем slot как требующий re-seed перед следующим decode —
-        // batched state уже актуален в буферах, snapshot устарел только по позиции.
-        for i in 0..b {
-            let sidx = slot_order[i];
-            // Позиция в snapshot продвинулась; сам state валиден в batched buffers.
-            // Обновляем только position (для future prefill-restore корректен только
-            // если последующий prefill стартует с it.pos+1 и reset — обычный паттерн).
-            if let Some(snap) = self.slot_snaps[sidx].as_mut() {
-                snap.position = positions[i] + 1;
-            }
-            // slot остаётся seeded — batched buffers уже содержат обновлённый state.
-        }
-
-        Ok(out)
+    fn decode_batch_mixed(
+        &mut self,
+        batch: &DecodeBatch,
+        greedy: &[bool],
+    ) -> Result<Vec<DecodeRow>> {
+        self.decode_batch_impl(batch, greedy)
     }
 
     fn speculative_available(&self, slot: usize) -> bool {
@@ -3276,7 +3331,8 @@ impl Qwen35BatchAdapter {
         rope_positions: &[usize],
         slots: &[u32],
         positions: &[usize],
-    ) -> Result<Option<(Vec<Vec<f32>>, Tensor)>> {
+        greedy: &[bool],
+    ) -> Result<Option<(Vec<DecodeRow>, Tensor)>> {
         if !self.graphs_enabled {
             return Ok(None);
         }
@@ -3386,7 +3442,10 @@ impl Qwen35BatchAdapter {
         };
         let _ = max_blocks;
 
-        let hit = self.decode_graphs.iter().position(|g| g.b == b);
+        let hit = self
+            .decode_graphs
+            .iter()
+            .position(|g| g.b == b);
         let need_capture = match hit {
             Some(_) => {
                 let why = String::new();
@@ -3524,7 +3583,7 @@ impl Qwen35BatchAdapter {
             if flat.len() != b * vocab {
                 return Err(anyhow!("graphed logits length mismatch"));
             }
-            let out: Vec<Vec<f32>> = flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect();
+            let out = rows_from_flat(&flat, vocab, greedy);
             // Пул полон — не захватываем (вытеснение роняло следующий шаг).
             if self.decode_graphs.len() >= dgraph_lru() {
                 return Ok(Some((out, hidden)));
@@ -3641,7 +3700,6 @@ impl Qwen35BatchAdapter {
             .position(|g| g.b == b)
             .expect("декодный граф только что захвачен или найден");
         let state = &self.decode_graphs[idx];
-        let stream = cuda_dev.cuda_stream();
         // Контекст на каждой операции: редкий CUDA_ERROR_INVALID_VALUE на
         // многослотовом сервере (2026-08-28) приходил голым DriverError, и
         // операцию было не назвать.
@@ -3696,11 +3754,53 @@ impl Qwen35BatchAdapter {
                 ctx.kv_len_host[s as usize] += 1;
             }
         }
-        let _ = stream;
-        let flat = pinned_logits::to_vec_f32(&self.device, &state.logits_t)
-            .map_err(|e| anyhow!("graph logits read (pinned): {e}"))?;
         let vocab = self.vocab_size();
-        if flat.len() != b * vocab {
+        let mut tokens = vec![None; b];
+        if greedy.iter().any(|x| *x) {
+            use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+            let (storage, layout) = state.logits_t.storage_and_layout();
+            let cuda = match &*storage {
+                candle_core::Storage::Cuda(c) => c,
+                _ => return Err(anyhow!("graph logits are not CUDA")),
+            };
+            let logits = cuda.as_cuda_slice::<f32>()?;
+            let logits = logits.slice(layout.start_offset()..);
+            let mut token_dev = unsafe { cuda_dev.alloc::<u32>(b)? };
+            let func = cuda_dev.get_or_load_func("yforge_argmax_f32", &candle_kernels::REDUCE)?;
+            let vocab_u32 = vocab as u32;
+            for (row_idx, is_greedy) in greedy.iter().enumerate() {
+                if !*is_greedy {
+                    continue;
+                }
+                let row = logits.slice(row_idx * vocab..(row_idx + 1) * vocab);
+                let mut token_row = token_dev.slice_mut(row_idx..row_idx + 1);
+                let mut builder = func.builder();
+                builder.arg(&row);
+                builder.arg(&mut token_row);
+                builder.arg(&vocab_u32);
+                unsafe {
+                    builder.launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(candle_core::Error::wrap)?;
+            }
+            let got = cuda_dev.clone_dtoh(&token_dev)?;
+            for (i, token) in got.into_iter().enumerate() {
+                if greedy[i] {
+                    tokens[i] = Some(token);
+                }
+            }
+        }
+        let flat = if tokens.iter().all(Option::is_some) {
+            Vec::new()
+        } else {
+            pinned_logits::to_vec_f32(&self.device, &state.logits_t)
+                .map_err(|e| anyhow!("graph logits read (pinned): {e}"))?
+        };
+        if !flat.is_empty() && flat.len() != b * vocab {
             return Err(anyhow!("graph logits length mismatch"));
         }
         // Глубокая копия, а не clone: clone разделяет хранилище, а внешний буфер
@@ -3715,10 +3815,21 @@ impl Qwen35BatchAdapter {
                 .map_err(|e| anyhow!("graph hidden copy: {e}"))?;
             dst
         };
-        Ok(Some((
-            flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect(),
-            hidden_copy,
-        )))
+        let rows = if flat.is_empty() {
+            tokens
+                .into_iter()
+                .map(|t| DecodeRow::Token(t.expect("greedy token missing")))
+                .collect()
+        } else {
+            let mut rows = rows_from_flat(&flat, vocab, greedy);
+            for (row, token) in rows.iter_mut().zip(tokens) {
+                if let Some(token) = token {
+                    *row = DecodeRow::Token(token);
+                }
+            }
+            rows
+        };
+        Ok(Some((rows, hidden_copy)))
     }
 
     /// EOS token id модели.
@@ -3739,6 +3850,15 @@ impl Qwen35BatchAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn greedy_rows_use_first_max_and_keep_other_logits() {
+        let flat = [0.1, 0.8, 0.8, -1.0, 2.0, 3.0];
+        let rows = rows_from_flat(&flat, 3, &[true, false]);
+
+        assert!(matches!(rows[0], DecodeRow::Token(1)));
+        assert!(matches!(rows[1], DecodeRow::Logits(ref logits) if logits == &flat[3..]));
+    }
 
     /// Смешивание paged- и eager-чанков внутри одного промпта теряет префикс:
     /// после первого чанка в пуле откат на eager обязан быть ошибкой, а не

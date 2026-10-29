@@ -690,3 +690,38 @@ FAST_OP(double, fast_min_f64, fast_max_f64, fast_argmin_f64, fast_argmax_f64, fa
 FAST_OP(uint32_t, fast_min_u32, fast_max_u32, fast_argmin_u32, fast_argmax_u32, fast_sum_u32)
 FAST_OP(int64_t, fast_min_i64, fast_max_i64, fast_argmin_i64, fast_argmax_i64, fast_sum_i64)
 FAST_OP(uint8_t, fast_min_u8, fast_max_u8, fast_argmin_u8, fast_argmax_u8, fast_sum_u8)
+
+// Устойчивый greedy argmax для одной строки словаря. При равных максимумах
+// возвращается меньший индекс — так же, как в CPU-сэмплере.
+extern "C" __global__ void yforge_argmax_f32(
+    const float * __restrict__ logits,
+    unsigned int * __restrict__ out,
+    const unsigned int n) {
+    __shared__ float values[256];
+    __shared__ unsigned int indices[256];
+    float best = -INFINITY;
+    unsigned int best_i = 0;
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = logits[i];
+        if (v > best || (v == best && i < best_i)) {
+            best = v;
+            best_i = i;
+        }
+    }
+    values[threadIdx.x] = best;
+    indices[threadIdx.x] = best_i;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const float other = values[threadIdx.x + stride];
+            const unsigned int oi = indices[threadIdx.x + stride];
+            if (other > values[threadIdx.x] ||
+                (other == values[threadIdx.x] && oi < indices[threadIdx.x])) {
+                values[threadIdx.x] = other;
+                indices[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[0] = indices[0];
+}
