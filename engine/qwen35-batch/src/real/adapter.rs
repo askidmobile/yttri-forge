@@ -3188,38 +3188,6 @@ impl Qwen35BatchAdapter {
                         .map_err(|e| anyhow!("pgraph {kind} rope slice_set: {e}"))?;
                     g.launch()
                         .map_err(|e| anyhow!("pgraph {kind} launch T={t} slot={slot}: {e}"))?;
-                    if let Some(bevs) = self.model.gprof_block_events.as_ref() {
-                        cuda_dev
-                            .cuda_stream()
-                            .synchronize()
-                            .map_err(|e| anyhow!("pgraph {kind} gprof sync: {e}"))?;
-                        use cudarc::driver::result as cres;
-                        let mut delta_ms = 0f32;
-                        let mut attn_ms = 0f32;
-                        let mut rows = Vec::new();
-                        for i in 0..bevs.len().saturating_sub(1) {
-                            if let Ok(ms) = unsafe { cres::event::elapsed(bevs[i], bevs[i + 1]) } {
-                                if self.model.blocks[i].is_deltanet() {
-                                    delta_ms += ms;
-                                } else {
-                                    attn_ms += ms;
-                                }
-                                rows.push((i, ms));
-                            }
-                        }
-                        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                        let top = rows
-                            .iter()
-                            .take(8)
-                            .map(|(i, ms)| format!("b{i}={ms:.2}"))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        eprintln!(
-                            "[pgprof] delta={delta_ms:.1}ms attn={attn_ms:.1}ms total={:.1}ms top={top}",
-                            delta_ms + attn_ms
-                        );
-                    }
-                }
                 // LRU: свежий — в хвост.
                 let mut g = pool.remove(i);
                 if let Some((_, version)) = cached_emb.as_ref() {
@@ -3572,81 +3540,6 @@ impl Qwen35BatchAdapter {
                 .map_err(|e| anyhow!("graphed forward (eager prime): {e}"))?;
             let hid_shape = hidden.shape().clone();
             let hid_dtype = hidden.dtype();
-            // Второй eager прогон (замер тёплого пути): ТОЛЬКО диагностика.
-            // ВАЖНО: двигает device KV на +1 — рассинхронизирует scheduler
-            // позиции после capture. Поэтому gprof+graphs даёт корректные
-            // замеры только первого шага; последующие уходят в eager.
-            // Не инкрементируем kv_len_host за этот прогон намеренно? Нет —
-            // инкремент ниже (1206) покрывает оба прогона; расхождение
-            // остаётся и это известное ограничение диагностики.
-            if self.model.gprof_events.is_some() {
-                {
-                    let ctx = self.model.paged_ctx.as_mut().unwrap();
-                    for &s in slots {
-                        ctx.kv_len_host[s as usize] += 1;
-                    }
-                }
-                let _ = self
-                    .model
-                    .forward_decode_batch_graphed(&emb_eager, slots)
-                    .map_err(|e| anyhow!("graphed forward (eager prime 2): {e}"))?;
-                // Компенсация: вернуть host mirror к состоянию ПОСЛЕ одного
-                // реального шага, чтобы scheduler-позиции совпали с device
-                // только на реальный инкремент (строка ниже).
-                {
-                    let ctx = self.model.paged_ctx.as_mut().unwrap();
-                    for &s in slots {
-                        ctx.kv_len_host[s as usize] -= 1;
-                    }
-                }
-            }
-            // GPU-сегменты eager-prime: та же последовательность ядер, что в графе.
-            if let Some(ev) = self.model.gprof_events.as_ref() {
-                cuda_dev.cuda_stream().synchronize()?;
-                use cudarc::driver::result as cres;
-                if let (Ok(e0), Ok(e1), Ok(e2), Ok(e3)) = (
-                    unsafe { cres::event::elapsed(ev[0], ev[1]) },
-                    unsafe { cres::event::elapsed(ev[1], ev[2]) },
-                    unsafe { cres::event::elapsed(ev[2], ev[3]) },
-                    unsafe { cres::event::elapsed(ev[0], ev[3]) },
-                ) {
-                    eprintln!(
-                        "[gGPU-prime] emb={e0:.2}ms blocks={e1:.2}ms head={e2:.2}ms total={e3:.2}ms"
-                    );
-                } else {
-                    eprintln!("[gGPU-prime] elapsed failed");
-                }
-            }
-            if let Some(bevs) = self.model.gprof_block_events.as_ref() {
-                cuda_dev.cuda_stream().synchronize()?;
-                use cudarc::driver::result as cres;
-                let n = bevs.len();
-                let mut times: Vec<(usize, f32)> = Vec::with_capacity(n.saturating_sub(1));
-                let mut dsum = 0f32;
-                let mut dcount = 0usize;
-                let mut asum = 0f32;
-                let mut acount = 0usize;
-                for i in 0..n.saturating_sub(1) {
-                    if let Ok(t) = unsafe { cres::event::elapsed(bevs[i], bevs[i + 1]) } {
-                        times.push((i, t));
-                        let is_delta = self.model.blocks[i].is_deltanet();
-                        if is_delta {
-                            dsum += t;
-                            dcount += 1;
-                        } else {
-                            asum += t;
-                            acount += 1;
-                        }
-                    }
-                }
-                times.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                let top: Vec<String> = times
-                    .iter()
-                    .take(8)
-                    .map(|(i, t)| format!("b{i}={t:.2}"))
-                    .collect();
-                eprintln!("[gGPU-blocks] delta_sum={dsum:.1}ms/{dcount} attn_sum={asum:.1}ms/{acount} top: {}", top.join(" "));
-            }
             // host mirror kv_len после инкремента
             {
                 let ctx = self.model.paged_ctx.as_mut().unwrap();
@@ -3809,29 +3702,11 @@ impl Qwen35BatchAdapter {
             .map_err(|e| anyhow!("graph launch b={b} slots={slots:?}: {e}"))?;
         // Диагностика: sync сразу после launch, чтобы async-ошибка графа
         // привязывалась к этому шагу, а не всплывала sticky на следующем.
-        if crate::scheduler::trace_on() || self.model.gprof_events.is_some() {
+        if crate::scheduler::trace_on() {
             cuda_dev
                 .cuda_stream()
                 .synchronize()
                 .map_err(|e| anyhow!("graph post-launch sync: {e}"))?;
-        }
-        if let Some(ev) = self.model.gprof_events.as_ref() {
-            use cudarc::driver::result as cres;
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 3 || n % 32 == 0 {
-                let e0 = unsafe { cres::event::elapsed(ev[0], ev[1]) };
-                let e1 = unsafe { cres::event::elapsed(ev[1], ev[2]) };
-                let e2 = unsafe { cres::event::elapsed(ev[2], ev[3]) };
-                let e3 = unsafe { cres::event::elapsed(ev[0], ev[3]) };
-                if let (Ok(e0), Ok(e1), Ok(e2), Ok(e3)) = (e0, e1, e2, e3) {
-                    eprintln!(
-                        "[gGPU] #{n} emb={e0:.2}ms blocks={e1:.2}ms head={e2:.2}ms total={e3:.2}ms"
-                    );
-                } else {
-                    eprintln!("[gGPU] #{n} elapsed err: {e0:?} {e1:?} {e2:?} {e3:?}");
-                }
-            }
         }
         {
             let ctx = self.model.paged_ctx.as_mut().unwrap();
