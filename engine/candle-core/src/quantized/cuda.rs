@@ -2237,8 +2237,20 @@ impl QCudaStorage {
         );
         // Кэшированная полная деквантизация (A100 80GB): один matmul по кэшу
         // вместо tiled dequant каждый вызов.
-        if is_iq
-            && dequant_cache_enabled()
+        //
+        // Мелкие матрицы (n <= 64) кэшируем всегда, если включён DEQUANT_CACHE
+        // либо это предзаполнение (YTTRI_SMALL_DEQUANT_CACHE=1): на Ornith-9B
+        // w_beta/w_alpha имеют n=32, их f32-копии занимают ~25 МБ на всю
+        // модель. Без кэша каждый чанк заново деквантизирует их 48 раз —
+        // замер на sm75: 47 мс из 255 м (18% forward).
+        // Включено по умолчанию для мелких матриц: на Ornith-9B w_beta/w_alpha
+        // (n=32) без кэша деквантизируются 48 раз на чанк, что стоило 47ms из
+        // 255ms fwd (замер на sm75). Кэш занимает ~25 MiB на всю модель.
+        // Откат: YTTRI_SMALL_DEQUANT_CACHE=0.
+        let small_dequant_cache = n <= 64
+            && (dequant_cache_enabled()
+                || std::env::var("YTTRI_SMALL_DEQUANT_CACHE").as_deref() != Ok("0"));
+        if (is_iq && dequant_cache_enabled() || small_dequant_cache)
             && !force_dmmv()
         {
             let w = self.cached_dequant_f32(n * k)?;
