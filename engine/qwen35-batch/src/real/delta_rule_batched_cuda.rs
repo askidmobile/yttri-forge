@@ -507,7 +507,7 @@ pub fn dispatch_delta_rule_batched(
             let (name, cols, warps) = if env_str_cached("DELTA_TILE64") == Some("1") {
                 ("delta_rule_kernel_batched_tile", 64, 32)
             } else {
-                ("delta_rule_kernel_batched_tile32w32", 32, 32)
+                ("delta_rule_kernel_batched_tile32w32r1", 32, 32)
             };
             (
                 name,

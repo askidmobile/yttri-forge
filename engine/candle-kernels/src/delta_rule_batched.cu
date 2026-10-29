@@ -896,22 +896,13 @@ extern "C" __global__ void __launch_bounds__(1024, 2) delta_rule_kernel_batched_
     delta_rule_tile_impl<64, 32>(q, k, v, beta, gate, ssm_state, output, params, slots);
 }
 
-extern "C" __global__ void __launch_bounds__(1024, 2) delta_rule_kernel_batched_tile32w32(
+extern "C" __global__ void __launch_bounds__(1024, 1) delta_rule_kernel_batched_tile32w32r1(
     const float* __restrict__ q, const float* __restrict__ k,
     const float* __restrict__ v, const float* __restrict__ beta,
     const float* __restrict__ gate, float* __restrict__ ssm_state,
     float* __restrict__ output, const DeltaParams params,
     const unsigned int* __restrict__ slots) {
     delta_rule_tile_impl<32, 32>(q, k, v, beta, gate, ssm_state, output, params, slots);
-}
-
-extern "C" __global__ void __launch_bounds__(512, 2) delta_rule_kernel_batched_tile32(
-    const float* __restrict__ q, const float* __restrict__ k,
-    const float* __restrict__ v, const float* __restrict__ beta,
-    const float* __restrict__ gate, float* __restrict__ ssm_state,
-    float* __restrict__ output, const DeltaParams params,
-    const unsigned int* __restrict__ slots) {
-    delta_rule_tile_impl<32, 16>(q, k, v, beta, gate, ssm_state, output, params, slots);
 }
 
 // ═══════════════════════════════════════════════════════════════
