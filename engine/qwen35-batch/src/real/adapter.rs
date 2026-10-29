@@ -3188,6 +3188,7 @@ impl Qwen35BatchAdapter {
                         .map_err(|e| anyhow!("pgraph {kind} rope slice_set: {e}"))?;
                     g.launch()
                         .map_err(|e| anyhow!("pgraph {kind} launch T={t} slot={slot}: {e}"))?;
+                }
                 // LRU: свежий — в хвост.
                 let mut g = pool.remove(i);
                 if let Some((_, version)) = cached_emb.as_ref() {
