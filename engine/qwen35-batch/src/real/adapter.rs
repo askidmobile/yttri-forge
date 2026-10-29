@@ -98,9 +98,56 @@ struct DecodeGraphState {
     /// Внешний буфер логитов: выделен ДО захвата, граф пишет в него D2D-узлом
     /// (память graph-pool снаружи launch невалидна для D2H).
     logits_t: Tensor,
-    /// Второй внешний буфер: hidden декодируемых позиций, тем же способом.
-    /// Читается глубокой копией — буфер перезаписывается следующим launch.
+    #[allow(dead_code)]
     hidden_t: Tensor,
+    tokens_t: candle_core::cuda_backend::cudarc::driver::CudaSlice<u32>,
+}
+
+#[cfg(feature = "cuda")]
+fn launch_decode_argmax(
+    logits: &Tensor,
+    tokens: &mut candle_core::cuda_backend::cudarc::driver::CudaSlice<u32>,
+    b: usize,
+    vocab: usize,
+) -> Result<()> {
+    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    let Device::Cuda(cuda_dev) = logits.device() else {
+        return Err(anyhow!("decode graph logits are not CUDA"));
+    };
+    let func = cuda_dev.get_or_load_func("yforge_argmax_f32", &candle_kernels::REDUCE)?;
+    let (logit_storage, logit_layout) = logits.storage_and_layout();
+    let logit_cuda = match &*logit_storage {
+        candle_core::Storage::Cuda(c) => c,
+        _ => return Err(anyhow!("decode graph logits storage is not CUDA")),
+    };
+    let logit_slice = logit_cuda
+        .as_cuda_slice::<f32>()?
+        .slice(logit_layout.start_offset()..);
+    let vocab_u32 = vocab as u32;
+    for row_idx in 0..b {
+        let row = logit_slice.slice(row_idx * vocab..(row_idx + 1) * vocab);
+        let mut token_row = tokens.slice_mut(row_idx..row_idx + 1);
+        let mut builder = func.builder();
+        builder.arg(&row);
+        builder.arg(&mut token_row);
+        builder.arg(&vocab_u32);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(candle_core::Error::wrap)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn decode_tokens_to_vec(
+    tokens: &candle_core::cuda_backend::cudarc::driver::CudaSlice<u32>,
+) -> Result<Vec<u32>> {
+    Ok(tokens.stream().clone_dtoh(tokens)?)
 }
 
 #[cfg(feature = "cuda")]
@@ -1340,11 +1387,6 @@ impl Qwen35BatchAdapter {
             slot_order.push(it.slot_idx);
             slots.push(it.slot_idx as u32);
         }
-        // Первая CUDA-операция шага (выделение + htod) — с контекстом: после
-        // захвата и вытеснения графа сюда приходил голый INVALID_VALUE.
-        let ids = Tensor::from_vec(tokens.clone(), (b, 1usize), &self.device)
-            .map_err(|e| anyhow!("decode ids from_vec b={b}: {e}"))?;
-
         // FR-006/PD-004: кэш горячих экспертов — D2H следа прошлого шага,
         // LRU, подъёмы промахов на боковом потоке (перед графом шага).
         #[cfg(feature = "cuda")]
@@ -1358,15 +1400,14 @@ impl Qwen35BatchAdapter {
         // CUDA-graph decode: один cuGraphLaunch на весь forward. None → eager.
         #[cfg(feature = "cuda")]
         {
-            let graphed =
-                self.decode_batch_graphed(
-                    b,
-                    &tokens,
-                    &rope_positions,
-                    &slots,
-                    &positions,
-                    greedy,
-                );
+            let graphed = self.decode_batch_graphed(
+                b,
+                &tokens,
+                &rope_positions,
+                &slots,
+                &positions,
+                greedy,
+            );
             if crate::scheduler::trace_on() {
                 static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1379,7 +1420,7 @@ impl Qwen35BatchAdapter {
                 }
             }
             match graphed {
-                Ok(Some((out, _hidden))) => {
+                Ok(Some(out)) => {
                     for i in 0..b {
                         let sidx = slot_order[i];
                         if let Some(snap) = self.slot_snaps[sidx].as_mut() {
@@ -1414,6 +1455,9 @@ impl Qwen35BatchAdapter {
                 .map_err(|e| anyhow!("rehydrate KV slot {}: {e}", it.slot_idx))?;
             self.prefill_path[it.slot_idx] = PrefillPath::Eager;
         }
+        // Eager-only input: the graph path consumes host tokens directly.
+        let ids = Tensor::from_vec(tokens.clone(), (b, 1usize), &self.device)
+            .map_err(|e| anyhow!("decode ids from_vec b={b}: {e}"))?;
         let logits = self
             .model
             .forward_decode_batch(&ids, &positions, &rope_positions, &slots)
@@ -2909,7 +2953,7 @@ impl Qwen35BatchAdapter {
         // hidden отдаём наружу, а не вызываем catch_up здесь: пусть графовая
         // ветка prefill_chunk заполнит mtp_inputs тем же способом, что и eager,
         // и оба пути сойдутся в одну точку вызова.
-        self.pg_last_hidden = Some(hidden);
+        self.pg_last_hidden = self.mtp.is_some().then_some(hidden);
 
         // Device kv_len продвинут ядром на +T — синхронизируем хостовое зеркало.
         self.model.paged_ctx.as_mut().unwrap().kv_len_host[slot] = (chunk.start_pos + t) as u32;
@@ -3189,12 +3233,16 @@ impl Qwen35BatchAdapter {
                     .map_err(|e| anyhow!("pgraph {kind} logits flatten: {e}"))?
                     .to_vec1::<f32>()
                     .map_err(|e| anyhow!("pgraph {kind} logits read: {e}"))?;
-                let hidden =
-                    Tensor::zeros(g.hidden_t.shape().clone(), g.hidden_t.dtype(), &self.device)
+                let hidden = if self.mtp.is_some() {
+                    let hidden = Tensor::zeros(g.hidden_t.shape().clone(), g.hidden_t.dtype(), &self.device)
                         .map_err(|e| anyhow!("pgraph {kind} hidden zeros: {e}"))?;
-                hidden
-                    .slice_set(&g.hidden_t, 0, 0)
-                    .map_err(|e| anyhow!("pgraph {kind} hidden copy: {e}"))?;
+                    hidden
+                        .slice_set(&g.hidden_t, 0, 0)
+                        .map_err(|e| anyhow!("pgraph {kind} hidden copy: {e}"))?;
+                    hidden
+                } else {
+                    Tensor::zeros((0usize,), DType::F32, &self.device)?
+                };
                 pool.push(g);
                 Ok((flat, hidden, true))
             }
@@ -3364,7 +3412,7 @@ impl Qwen35BatchAdapter {
         slots: &[u32],
         positions: &[usize],
         greedy: &[bool],
-    ) -> Result<Option<(Vec<DecodeRow>, Tensor)>> {
+    ) -> Result<Option<Vec<DecodeRow>>> {
         if !self.graphs_enabled {
             return Ok(None);
         }
@@ -3522,9 +3570,6 @@ impl Qwen35BatchAdapter {
                 .model
                 .forward_decode_batch_graphed(&emb_eager, slots)
                 .map_err(|e| anyhow!("graphed forward (eager prime): {e}"))?;
-            // Форма hidden для внешнего буфера захвата: берём с прогрева, он и так
-            // выполняется перед захватом. Раньше hidden прогрева использовался
-            // только как результат шага и в граф не выводился.
             let hid_shape = hidden.shape().clone();
             let hid_dtype = hidden.dtype();
             // Второй eager прогон (замер тёплого пути): ТОЛЬКО диагностика.
@@ -3616,9 +3661,11 @@ impl Qwen35BatchAdapter {
                 return Err(anyhow!("graphed logits length mismatch"));
             }
             let out = rows_from_flat(&flat, vocab, greedy);
+            let mut tokens_out = unsafe { cuda_dev.alloc::<u32>(b)? };
+            launch_decode_argmax(&logits, &mut tokens_out, b, self.vocab)?;
             // Пул полон — не захватываем (вытеснение роняло следующий шаг).
             if self.decode_graphs.len() >= dgraph_lru() {
-                return Ok(Some((out, hidden)));
+                return Ok(Some(out));
             }
             // Capture для следующих шагов (захват не исполняет ядра).
             let stream = cuda_dev.cuda_stream();
@@ -3633,6 +3680,7 @@ impl Qwen35BatchAdapter {
                 // выделен ДО захвата) буфер D2D-нодой внутри графа.
                 let logits_out = Tensor::zeros((b, self.vocab), DType::F32, &self.device)?;
                 let hidden_out = Tensor::zeros(hid_shape.clone(), hid_dtype, &self.device)?;
+                let _ = &tokens_out;
                 unsafe {
                     cres::stream::begin_capture(
                         stream.cu_stream(),
@@ -3656,6 +3704,10 @@ impl Qwen35BatchAdapter {
                 if let Err(e) = hidden_out.slice_set(&hidden_t, 0, 0) {
                     let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
                     return Err(anyhow!("hidden_out copy: {e}"));
+                }
+                if let Err(e) = launch_decode_argmax(&logits_out, &mut tokens_out, b, self.vocab) {
+                    let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
+                    return Err(anyhow!("argmax graph node: {e}"));
                 }
                 drop(logits_t);
                 drop(hidden_t);
@@ -3693,6 +3745,7 @@ impl Qwen35BatchAdapter {
                     emb_t: emb_eager.clone(),
                     logits_t: logits_out,
                     hidden_t: hidden_out,
+                    tokens_t: tokens_out,
                 })
             })();
             match capture_result {
@@ -3722,7 +3775,7 @@ impl Qwen35BatchAdapter {
             }
             // Путь захвата: hidden получен прогревочным проходом, это обычный
             // тензор вне графового буфера — копировать не нужно.
-            return Ok(Some((out, hidden)));
+            return Ok(Some(out));
         }
 
         // Replay path.
@@ -3787,44 +3840,10 @@ impl Qwen35BatchAdapter {
             }
         }
         let vocab = self.vocab_size();
+        let got = decode_tokens_to_vec(&state.tokens_t)?;
         let mut tokens = vec![None; b];
-        if greedy.iter().any(|x| *x) {
-            use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
-            let (storage, layout) = state.logits_t.storage_and_layout();
-            let cuda = match &*storage {
-                candle_core::Storage::Cuda(c) => c,
-                _ => return Err(anyhow!("graph logits are not CUDA")),
-            };
-            let logits = cuda.as_cuda_slice::<f32>()?;
-            let logits = logits.slice(layout.start_offset()..);
-            let mut token_dev = unsafe { cuda_dev.alloc::<u32>(b)? };
-            let func = cuda_dev.get_or_load_func("yforge_argmax_f32", &candle_kernels::REDUCE)?;
-            let vocab_u32 = vocab as u32;
-            for (row_idx, is_greedy) in greedy.iter().enumerate() {
-                if !*is_greedy {
-                    continue;
-                }
-                let row = logits.slice(row_idx * vocab..(row_idx + 1) * vocab);
-                let mut token_row = token_dev.slice_mut(row_idx..row_idx + 1);
-                let mut builder = func.builder();
-                builder.arg(&row);
-                builder.arg(&mut token_row);
-                builder.arg(&vocab_u32);
-                unsafe {
-                    builder.launch(LaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                }
-                .map_err(candle_core::Error::wrap)?;
-            }
-            let got = cuda_dev.clone_dtoh(&token_dev)?;
-            for (i, token) in got.into_iter().enumerate() {
-                if greedy[i] {
-                    tokens[i] = Some(token);
-                }
-            }
+        for (row, token) in tokens.iter_mut().zip(got) {
+            *row = Some(token);
         }
         let flat = if tokens.iter().all(Option::is_some) {
             Vec::new()
@@ -3835,18 +3854,6 @@ impl Qwen35BatchAdapter {
         if !flat.is_empty() && flat.len() != b * vocab {
             return Err(anyhow!("graph logits length mismatch"));
         }
-        // Глубокая копия, а не clone: clone разделяет хранилище, а внешний буфер
-        // перезаписывается следующим launch, тогда как проверка спекуляции держит
-        // hidden между вызовами (PendingVerify). Для [K, hidden] это десятки
-        // килобайт — цена пренебрежимая.
-        let hidden_copy = {
-            let src = &self.decode_graphs[idx].hidden_t;
-            let dst = Tensor::zeros(src.shape().clone(), src.dtype(), &self.device)
-                .map_err(|e| anyhow!("graph hidden zeros: {e}"))?;
-            dst.slice_set(src, 0, 0)
-                .map_err(|e| anyhow!("graph hidden copy: {e}"))?;
-            dst
-        };
         let rows = if flat.is_empty() {
             tokens
                 .into_iter()
@@ -3861,7 +3868,7 @@ impl Qwen35BatchAdapter {
             }
             rows
         };
-        Ok(Some((rows, hidden_copy)))
+        Ok(Some(rows))
     }
 
     /// EOS token id модели.
@@ -3890,6 +3897,43 @@ mod tests {
 
         assert!(matches!(rows[0], DecodeRow::Token(1)));
         assert!(matches!(rows[1], DecodeRow::Logits(ref logits) if logits == &flat[3..]));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_argmax_matches_cpu_tie_break() -> Result<()> {
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = Device::new_cuda(0)?;
+        let mut values = vec![0f32; 1024];
+        values[513] = 5.0;
+        values[777] = 5.0;
+        values[999] = 4.0;
+        let logits = Tensor::from_vec(values.clone(), values.len(), &dev)?;
+        let cuda = dev.as_cuda_device()?;
+        let (storage, layout) = logits.storage_and_layout();
+        let candle_core::Storage::Cuda(storage) = &*storage else {
+            return Err(anyhow!("argmax test logits are not CUDA"));
+        };
+        let logits = storage.as_cuda_slice::<f32>()?.slice(layout.start_offset()..);
+        let mut out = unsafe { cuda.alloc::<u32>(1)? };
+        let func = cuda.get_or_load_func("yforge_argmax_f32", &candle_kernels::REDUCE)?;
+        let n = values.len() as u32;
+        let mut builder = func.builder();
+        builder.arg(&logits);
+        builder.arg(&mut out);
+        builder.arg(&n);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(candle_core::Error::wrap)?;
+
+        assert_eq!(cuda.clone_dtoh(&out)?, vec![513]);
+        Ok(())
     }
 
     /// Смешивание paged- и eager-чанков внутри одного промпта теряет префикс:
