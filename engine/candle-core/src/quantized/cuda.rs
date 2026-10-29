@@ -1,4 +1,4 @@
-use super::{GgmlDType, QStorage};
+use super::{GgmlDType, MmqQ8Activation, MmqQ8Layout, QStorage};
 use crate::quantized::k_quants::GgmlType;
 use crate::{backend::BackendDevice, cuda_backend::WrapErr};
 use crate::{builder_arg as barg, CudaDevice, CudaStorage, Result};
@@ -630,6 +630,58 @@ fn dequantize_mul_mat_vec(
 }
 
 impl QCudaStorage {
+    pub fn mmq_layout(dtype: GgmlDType) -> Option<MmqQ8Layout> {
+        match dtype {
+            GgmlDType::Q2K => Some(MmqQ8Layout::D2s6),
+            GgmlDType::Q3K
+            | GgmlDType::Q6K
+            | GgmlDType::Q4_0
+            | GgmlDType::Q8_0
+            | GgmlDType::IQ2XXS
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ4XS => Some(MmqQ8Layout::D4),
+            GgmlDType::Q4K | GgmlDType::Q5K => Some(MmqQ8Layout::Ds4),
+            _ => None,
+        }
+    }
+
+    pub fn prequantize_mmq_q8_1(
+        dev: &CudaDevice,
+        rhs: &CudaView<f32>,
+        k: usize,
+        m_total: usize,
+        layout: MmqQ8Layout,
+    ) -> Result<CudaSlice<u8>> {
+        let k_padded = pad(k, MATRIX_ROW_PADDING);
+        let blocks_per_row = k_padded / 128;
+        let bytes = m_total * blocks_per_row * 144;
+        let dst = unsafe { dev.alloc::<u8>(bytes)? };
+        let kernel = match layout {
+            MmqQ8Layout::D4 => "candle_mmq_quant_d4",
+            MmqQ8Layout::Ds4 => "candle_mmq_quant_ds4",
+            MmqQ8Layout::D2s6 => "candle_mmq_quant_d2s6",
+        };
+        let func = dev.get_or_load_func(kernel, &candle_kernels::CANDLE_MMQ_DENSE)?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (m_total as u32, ceil_div(k_padded, 512) as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(rhs);
+        builder.arg(&dst);
+        barg!(
+            builder,
+            /* ne00 */ k as i64,
+            /* s01 */ k as i64,
+            /* ne0 */ k_padded as i64,
+            /* ne1 */ m_total as i32
+        );
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(dst)
+    }
+
     /// Batch-vector matmul using pre-quantized Q8_1 activations.
     /// `y_q8_1` is the pre-quantized [b_size, k_padded] buffer.
     pub fn mul_mat_vec_with_prequant_q8_1(
@@ -1752,9 +1804,10 @@ impl QCudaStorage {
         self_shape: &crate::Shape,
         storage: &CudaStorage,
         layout: &crate::Layout,
+        prequant: Option<&MmqQ8Activation>,
     ) -> Result<Option<(CudaStorage, crate::Shape)>> {
         // dtype → (тэг ядра, mma tile_x_k, quant-обёртка)
-        let (tag, tile_x_k, quant_kernel): (&str, usize, &str) = match self.dtype {
+        let (tag, tile_x_k, _): (&str, usize, &str) = match self.dtype {
             GgmlDType::Q2K => ("q2_k", 100, "candle_mmq_quant_d2s6"),
             GgmlDType::Q3K => ("q3_k", 84, "candle_mmq_quant_d4"),
             GgmlDType::Q4K => ("q4_k", 76, "candle_mmq_quant_ds4"),
@@ -1798,6 +1851,12 @@ impl QCudaStorage {
             Some((o1, o2)) => rhs.slice(o1..o2),
             None => return Ok(None),
         };
+        let expected_layout = Self::mmq_layout(self.dtype);
+        let prequant = prequant.filter(|p| {
+            Some(p.layout) == expected_layout
+                && p.ncols == k
+                && p.b_size == m_total
+        });
 
         // dp4a-ветка (см. candle_mmq_dp4a.cu): инстансы собраны только для
         // типов ниже — ровно те, что есть в таблице dtype выше.
@@ -1866,30 +1925,23 @@ impl QCudaStorage {
             });
         let nbs = nbs_for(mmq_x);
 
-        // 1) Квантизация активаций в q8_1_mmq.
-        let k_padded = pad(k, MATRIX_ROW_PADDING);
-        let blocks_per_row = k_padded / 128; // block_q8_1_mmq держит 4*QK8_1 = 128 значений
-        let y_bytes = m_total * blocks_per_row * BLOCK_Q8_1_MMQ;
-        let y_mmq = unsafe { dev.alloc::<u8>(y_bytes)? };
-        let qfunc = dev.get_or_load_func(quant_kernel, &candle_kernels::CANDLE_MMQ_DENSE)?;
-        let qcfg = cudarc::driver::LaunchConfig {
-            grid_dim: (m_total as u32, ceil_div(k_padded, 512) as u32, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
+        // 1) Квантизация активаций в q8_1_mmq. Несколько проекций одного
+        // слоя читают один и тот же prequant-буфер.
+        let owned_y_mmq;
+        let y_mmq: &CudaSlice<u8> = match prequant {
+            Some(p) => &p.slice,
+            None => {
+                let dst = Self::prequantize_mmq_q8_1(
+                    dev,
+                    &rhs,
+                    k,
+                    m_total,
+                    expected_layout.expect("MMQ dtype has a layout"),
+                )?;
+                owned_y_mmq = dst;
+                &owned_y_mmq
+            }
         };
-        {
-            let mut qb = qfunc.builder();
-            qb.arg(&rhs);
-            qb.arg(&y_mmq);
-            barg!(
-                qb,
-                /* ne00 */ k as i64,
-                /* s01  */ k as i64,
-                /* ne0  */ k_padded as i64,
-                /* ne1  */ m_total as i32
-            );
-            unsafe { qb.launch(qcfg) }.w()?;
-        }
 
         // 2) MMQ Tensor-Core GEMM: dst = weight[n,k] @ act[k,m] → [m,n].
         // stride_row_x в блоках кванта (block_size = qk: 256 для K-quants, 32 для legacy).
@@ -1975,7 +2027,7 @@ impl QCudaStorage {
         {
             let mut mb = func.builder();
             mb.arg(&self.data.inner);
-            mb.arg(&y_mmq);
+            mb.arg(y_mmq);
             mb.arg(&dst);
             if let Some(tf) = tmp_fixup.as_ref() {
                 mb.arg(tf);

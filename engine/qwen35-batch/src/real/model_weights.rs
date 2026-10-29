@@ -1228,6 +1228,11 @@ impl Module for DenseMlp {
             let prequant = candle_core::quantized::QTensor::prequantize_q8_1(xs)
                 .ok()
                 .flatten();
+            let mmq_prequant = self
+                .feed_forward_w1
+                .prequantize_mmq_q8_1(xs)
+                .ok()
+                .flatten();
             let g2 = matches!(std::env::var("GPROF").as_deref(), Ok("2") | Ok("3"))
                 && xs.device().is_cuda();
             let sync = || {
@@ -1243,12 +1248,20 @@ impl Module for DenseMlp {
                 std::time::Instant::now()
             };
             let t0 = sync();
-            let w1 = self
-                .feed_forward_w1
-                .forward_with_prequant(xs, prequant.as_ref())?;
-            let w3 = self
-                .feed_forward_w3
-                .forward_with_prequant(xs, prequant.as_ref())?;
+            let w1 = if mmq_prequant.is_some() {
+                self.feed_forward_w1
+                    .forward_with_mmq_prequant(xs, mmq_prequant.as_ref())?
+            } else {
+                self.feed_forward_w1
+                    .forward_with_prequant(xs, prequant.as_ref())?
+            };
+            let w3 = if mmq_prequant.is_some() {
+                self.feed_forward_w3
+                    .forward_with_mmq_prequant(xs, mmq_prequant.as_ref())?
+            } else {
+                self.feed_forward_w3
+                    .forward_with_prequant(xs, prequant.as_ref())?
+            };
             let t13 = sync();
             let silu_mul = w1.silu_mul_direct(&w3)?;
             let ts = sync();
@@ -1889,6 +1902,19 @@ impl DeltaNetLayer {
             let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x)
                 .ok()
                 .flatten();
+            let mmq_prequant = self.wqkv.prequantize_mmq_q8_1(x).ok().flatten();
+            if mmq_prequant.is_some() {
+                return Ok((
+                    self.wqkv
+                        .forward_with_mmq_prequant(x, mmq_prequant.as_ref())?,
+                    self.wgate
+                        .forward_with_mmq_prequant(x, mmq_prequant.as_ref())?,
+                    self.w_beta
+                        .forward_with_mmq_prequant(x, mmq_prequant.as_ref())?,
+                    self.w_alpha
+                        .forward_with_mmq_prequant(x, mmq_prequant.as_ref())?,
+                ));
+            }
             return Ok((
                 self.wqkv.forward_with_prequant(x, prequant.as_ref())?,
                 self.wgate.forward_with_prequant(x, prequant.as_ref())?,
@@ -4439,11 +4465,17 @@ impl GatedAttentionLayer {
         // 1. Проекции (F16-сайдкар если подключён — dual-read prefill)
         let (qg, k, v) = match (&self.f16_q, &self.f16_k, &self.f16_v) {
             (Some(fq), Some(fk), Some(fv)) => (fq.forward(x)?, fk.forward(x)?, fv.forward(x)?),
-            _ => (
-                self.attention_wq.forward(x)?,
-                self.attention_wk.forward(x)?,
-                self.attention_wv.forward(x)?,
-            ),
+            _ => {
+                let prequant = self.attention_wq.prequantize_mmq_q8_1(x).ok().flatten();
+                (
+                    self.attention_wq
+                        .forward_with_mmq_prequant(x, prequant.as_ref())?,
+                    self.attention_wk
+                        .forward_with_mmq_prequant(x, prequant.as_ref())?,
+                    self.attention_wv
+                        .forward_with_mmq_prequant(x, prequant.as_ref())?,
+                )
+            }
         };
 
         // 2. Reshape + norms
@@ -5812,21 +5844,19 @@ impl HybridBlock {
                 // Fused GDN: проекции (F16 dual-read) → dispatch → ssm_out
                 let (b_sz, seq_len, _n_embd) = normed.dims3()?;
                 let _ = b_sz;
-                let qkv_t = match &delta.f16_wqkv {
-                    Some(f) => f.forward(&normed)?,
-                    None => delta.wqkv.forward(&normed)?,
-                };
-                let z_t = match &delta.f16_wgate {
-                    Some(f) => f.forward(&normed)?,
-                    None => delta.wgate.forward(&normed)?,
-                };
-                let beta_t = match &delta.f16_w_beta {
-                    Some(f) => f.forward(&normed)?,
-                    None => delta.w_beta.forward(&normed)?,
-                };
-                let alpha_t = match &delta.f16_w_alpha {
-                    Some(f) => f.forward(&normed)?,
-                    None => delta.w_alpha.forward(&normed)?,
+                let (qkv_t, z_t, beta_t, alpha_t) = match (
+                    &delta.f16_wqkv,
+                    &delta.f16_wgate,
+                    &delta.f16_w_beta,
+                    &delta.f16_w_alpha,
+                ) {
+                    (Some(fq), Some(fg), Some(fb), Some(fa)) => (
+                        fq.forward(&normed)?,
+                        fg.forward(&normed)?,
+                        fb.forward(&normed)?,
+                        fa.forward(&normed)?,
+                    ),
+                    _ => delta.project_in(&normed)?,
                 };
 
                 let ctx_cuda = delta.cuda_ctx.as_mut().ok_or_else(|| {

@@ -10,5 +10,5 @@ pub fn try_fwd(
     rhs: &CudaStorage,
     rhs_l: &crate::Layout,
 ) -> Result<Option<(CudaStorage, Shape)>> {
-    qstorage.mul_mat_q_mma(self_shape, rhs, rhs_l)
+    qstorage.mul_mat_q_mma(self_shape, rhs, rhs_l, None)
 }

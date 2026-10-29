@@ -1283,6 +1283,32 @@ fn mmq_mma_matches_reference() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn mmq_prequant_matches_regular_forward() -> Result<()> {
+    use candle_core::quantized::{QMatMul, QTensor};
+
+    let device = Device::new_cuda(0)?;
+    let (n, k, m) = (512usize, 768usize, 9usize);
+    let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.037).sin()).collect();
+    let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.013).cos()).collect();
+    let qmm = QMatMul::from_qtensor(QTensor::quantize(
+        &Tensor::from_vec(w, (n, k), &device)?,
+        GgmlDType::Q4K,
+    )?)?;
+    let x = Tensor::from_vec(x, (1, m, k), &device)?;
+
+    let regular = qmm.forward(&x)?;
+    let prequant = qmm.prequantize_mmq_q8_1(&x)?.expect("MMQ prequant");
+    let reused = qmm.forward_with_mmq_prequant(&x, Some(&prequant))?;
+    let max = (&regular - &reused)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+
+    assert_eq!(max, 0.0);
+    Ok(())
+}
+
 /// MMQ при m > mmq_x (несколько тайлов по X): юнит-тесты выше гоняли m=64
 /// (один тайл) и пропустили бы поломку tile-раскладки stream-k. A/B на модели
 /// (512-префилл 27B) дал nRMSE 0.53 против dequant-референса — этот тест
