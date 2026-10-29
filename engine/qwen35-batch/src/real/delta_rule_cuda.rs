@@ -318,10 +318,9 @@ pub fn restore_cuda_state(
 
 /// Сброс state (новая беседа): зануляем оба persistent-буфера через htod нулей.
 pub fn clear_cuda_state(dev: &CudaDevice, state: &mut DeltaNetCudaState) -> Result<()> {
-    let ssm_len = state.ssm_state.len();
-    let conv_len = state.conv_state.len();
-    dev.memcpy_htod(&vec![0.0f32; ssm_len], &mut state.ssm_state)?;
-    dev.memcpy_htod(&vec![0.0f32; conv_len], &mut state.conv_state)?;
+    // Device memset avoids two ~24 MB pageable H2D copies on every new prompt.
+    dev.cuda_stream().memset_zeros(&mut state.ssm_state).map_err(candle_core::Error::wrap)?;
+    dev.cuda_stream().memset_zeros(&mut state.conv_state).map_err(candle_core::Error::wrap)?;
     Ok(())
 }
 
@@ -346,6 +345,7 @@ pub fn dispatch_delta_rule_prefill(
     z_t: &Tensor,     // [1, T, value_dim]
     beta_t: &Tensor,  // [1, T, n_v_heads]
     alpha_t: &Tensor, // [1, T, n_v_heads]
+    reset_state: bool,
 ) -> Result<Tensor> {
     let channels = params.channels as usize;
     let n_v = params.n_v_heads as usize;
@@ -412,6 +412,8 @@ pub fn dispatch_delta_rule_prefill(
         b.arg(&qkv_conv);
         b.arg(&beta_a);
         b.arg(&gate_a);
+        let reset_i32: i32 = i32::from(reset_state);
+        b.arg(&reset_i32);
         b.arg(&p);
         b.arg(&t_u32);
         unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
@@ -457,9 +459,36 @@ pub fn dispatch_delta_rule_prefill(
         const CHUNK_C: usize = 8;
         const CHUNK_COLS: usize = 64;
         const CHUNK_ROWGRP: usize = 4;
-        let want_v1 = std::env::var("DELTA_KERNEL").as_deref() == Ok("v1");
-        let chunked_ok = hkd == 128 && hvd % CHUNK_COLS == 0 && !want_v1;
-        if chunked_ok {
+        let kernel_choice = std::env::var("DELTA_KERNEL").unwrap_or_default();
+        let want_v1 = kernel_choice == "v1";
+        let want_chunked = kernel_choice == "chunked";
+        let gdn4_ok = hkd == 128 && hvd == 128 && !want_v1 && !want_chunked;
+        let chunked_ok = hkd == 128 && hvd % CHUNK_COLS == 0 && !want_v1 && !gdn4_ok;
+        if reset_state && !gdn4_ok {
+            clear_cuda_state(dev, state)?;
+        }
+        if gdn4_ok {
+            let func = dev
+                .get_or_load_func("delta_rule_prefill_gdn4", &candle_kernels::DELTA_RULE)?;
+            let cfg = LaunchConfig {
+                grid_dim: (n_v as u32, (hvd / 16) as u32, 1),
+                block_dim: (32, 4, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = func.builder();
+            b.arg(&q_a);
+            b.arg(&k_a);
+            b.arg(&v_a);
+            b.arg(&beta_a);
+            b.arg(&gate_a);
+            b.arg(&state.ssm_state);
+            b.arg(&raw_out);
+            let reset_i32: i32 = i32::from(reset_state);
+            b.arg(&reset_i32);
+            b.arg(&p);
+            b.arg(&t_u32);
+            unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        } else if chunked_ok {
             let smem = (2 * CHUNK_C * hkd
                 + 3 * CHUNK_C * CHUNK_COLS
                 + 2 * CHUNK_C * CHUNK_C

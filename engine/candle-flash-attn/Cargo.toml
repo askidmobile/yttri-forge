@@ -26,3 +26,4 @@ candle-nn = { path = "../candle-nn", features = ["cuda"] }
 default = []
 cudnn = ["candle/cudnn"]
 turing-stub = []
+turing = []

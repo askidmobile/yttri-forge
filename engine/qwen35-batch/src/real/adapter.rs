@@ -122,6 +122,8 @@ struct PrefillGraphState {
     cu_graph: cudarc::driver::sys::CUgraph,
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
     t: usize,
+    reset_state: bool,
+    embed_version: u64,
     /// Persistent входы (стейджатся ВНЕ графа): эмбеддинги [1,T,H] F32
     /// (для проверки — [T,1,H]), позиции [T] U32.
     emb_t: Tensor,
@@ -529,6 +531,12 @@ pub struct Qwen35BatchAdapter {
     /// графовой функции приводил к тому, что MTP переставал приниматься.
     #[cfg(feature = "cuda")]
     pg_last_hidden: Option<Tensor>,
+    /// Last prefill token sequence and its device embeddings. Reusing this
+    /// avoids a second 8 MiB gather when the same prompt hits the graph.
+    #[cfg(feature = "cuda")]
+    last_embeds: Option<(Vec<u32>, u64, Tensor)>,
+    #[cfg(feature = "cuda")]
+    embed_version: u64,
     /// LRU графов префилла (PGRAPH), ключ — (T, slot); хвост = свежий.
     #[cfg(feature = "cuda")]
     prefill_graphs: Vec<PrefillGraphState>,
@@ -795,6 +803,10 @@ impl Qwen35BatchAdapter {
             decode_graphs: Vec::new(),
             #[cfg(feature = "cuda")]
             pg_last_hidden: None,
+            #[cfg(feature = "cuda")]
+            last_embeds: None,
+            #[cfg(feature = "cuda")]
+            embed_version: 0,
             #[cfg(feature = "cuda")]
             paged_dirty: vec![true; num_slots],
             #[cfg(feature = "cuda")]
@@ -1426,6 +1438,16 @@ impl BatchModel for Qwen35BatchAdapter {
             self.graphs_reenable_on_admit();
             // Keep installed media for first chunk; reset only model state.
             self.state_owner = None;
+            #[cfg(feature = "cuda")]
+            let graph_reset = pgraph_mode_effective(self.model.experts_ram()) != PgraphMode::Off
+                && self.model.supports_in_kernel_prefill_reset();
+            #[cfg(feature = "cuda")]
+            if graph_reset {
+                self.model.clear_state_for_prefill();
+            } else {
+                self.model.clear_state();
+            }
+            #[cfg(not(feature = "cuda"))]
             self.model.clear_state();
             self.slot_snaps[sidx] = None;
             self.slot_prefill_logits[sidx] = None;
@@ -1564,7 +1586,11 @@ impl BatchModel for Qwen35BatchAdapter {
             // адаптивная ширина молча выключает спекуляцию (drafted=2 accepted=0).
             #[cfg(feature = "cuda")]
             let mi = match self.pg_last_hidden.take() {
-                Some(hidden) if self.multimodal[sidx].is_none() && self.mtp_slot_aligned[sidx] => {
+                Some(hidden)
+                    if self.mtp.is_some()
+                        && self.multimodal[sidx].is_none()
+                        && self.mtp_slot_aligned[sidx] =>
+                {
                     // Именно embed_for_graph, а не embed_tokens: при GPU_ONLY=1
                     // хостовая таблица намеренно опустошается ради освобождения
                     // mmap на весь GGUF, и её forward обязан не вызываться. Этот
@@ -1796,17 +1822,24 @@ impl BatchModel for Qwen35BatchAdapter {
             // Полный снимок создавал ещё одну копию, линейную по контексту,
             // хотя seed использовал из неё только recurrent-state и длину.
             let t_fin = std::time::Instant::now();
-            let snap = if pg_used {
-                self.model
-                    .snapshot_slot_recurrent_state(&self.device, new_pos)
-                    .map_err(|e| anyhow!("prefill recurrent snapshot: {e}"))?
+            let direct_seed = pg_used && self.mtp.is_none() && !self.capture_prefix;
+            let snap = if direct_seed {
+                None
+            } else if pg_used {
+                Some(
+                    self.model
+                        .snapshot_slot_recurrent_state(&self.device, new_pos)
+                        .map_err(|e| anyhow!("prefill recurrent snapshot: {e}"))?,
+                )
             } else {
-                self.model
-                    .snapshot_slot_state(&self.device, sidx, new_pos)
-                    .map_err(|e| anyhow!("prefill snapshot: {e}"))?
+                Some(
+                    self.model
+                        .snapshot_slot_state(&self.device, sidx, new_pos)
+                        .map_err(|e| anyhow!("prefill snapshot: {e}"))?,
+                )
             };
             let t_snap_done = t_fin.elapsed();
-            self.slot_snaps[sidx] = Some(snap);
+            self.slot_snaps[sidx] = snap;
             // Полный промпт — отдельная запись кеша (см. prefix_cache_full_hit_enabled):
             // KV едет как Arc-вид на single-slot кэш, воркер копирует его в host
             // асинхронно, поэтому на критическом пути остаётся только клон Arc.
@@ -1831,14 +1864,19 @@ impl BatchModel for Qwen35BatchAdapter {
                 }
             }
             let t_seed0 = std::time::Instant::now();
-            let snap_ref = self.slot_snaps[sidx]
-                .as_ref()
-                .ok_or_else(|| anyhow!("prefill snapshot disappeared"))?;
             // Рекуррентное состояние уже на устройстве (single-slot ctx
             // префилла), поэтому seed идёт D2D: полный путь через host стоил
             // 162 мс на 30k ([pfin], 2026-09-17).
             #[cfg(feature = "cuda")]
-            let seeded_device = {
+            let seeded_device = if direct_seed {
+                self.model
+                    .seed_slot_batched_from_single(sidx, new_pos)
+                    .map_err(|error| anyhow!("prefill seed(from single) slot {sidx}: {error}"))?;
+                true
+            } else {
+                let snap_ref = self.slot_snaps[sidx]
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("prefill snapshot disappeared"))?;
                 // Откат для A/B: QWEN36_D2D_SEED=0 возвращает host-путь seed'а.
                 if std::env::var("QWEN36_D2D_SEED")
                     .map(|v| v != "0")
@@ -1851,16 +1889,24 @@ impl BatchModel for Qwen35BatchAdapter {
                         })?;
                     true
                 } else {
+                    self.model
+                        .seed_slot_batched(&self.device, sidx, snap_ref)
+                        .map_err(|error| anyhow!("prefill seed slot {sidx}: {error}"))?;
                     false
                 }
             };
             #[cfg(not(feature = "cuda"))]
-            let seeded_device = false;
-            if !seeded_device {
+            let seeded_device = if direct_seed {
+                true
+            } else {
+                let snap_ref = self.slot_snaps[sidx]
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("prefill snapshot disappeared"))?;
                 self.model
                     .seed_slot_batched(&self.device, sidx, snap_ref)
                     .map_err(|error| anyhow!("prefill seed slot {sidx}: {error}"))?;
-            }
+                false
+            };
             let t_seed = t_seed0.elapsed();
             #[cfg(feature = "cuda")]
             if pg_used {
@@ -2682,6 +2728,9 @@ impl Qwen35BatchAdapter {
             Err(e) if self.prefill_path[chunk.slot_idx] != PrefillPath::Paged => {
                 eprintln!("[pg] ошибка, чанк уходит в eager: {e}");
                 self.prefill_path[chunk.slot_idx] = PrefillPath::Eager;
+                if chunk.reset_first {
+                    self.model.clear_state();
+                }
                 None
             }
             Err(e) => {
@@ -2903,6 +2952,19 @@ impl Qwen35BatchAdapter {
     /// (замер: 0 из 798 драфтов, 1368 срывов проверки). Чинить надо сам
     /// графовый путь — построчным режимом либо порядком редукции в ядре.
     #[cfg(feature = "cuda")]
+    fn embed_for_graph_cached(&mut self, tokens: &[u32]) -> Result<(Tensor, u64)> {
+        if let Some((cached_tokens, version, embeds)) = &self.last_embeds {
+            if cached_tokens == tokens {
+                return Ok((embeds.clone(), *version));
+            }
+        }
+        self.embed_version = self.embed_version.wrapping_add(1);
+        let embeds = self.model.embed_for_graph(tokens, &self.device)?;
+        self.last_embeds = Some((tokens.to_vec(), self.embed_version, embeds.clone()));
+        Ok((embeds, self.embed_version))
+    }
+
+    #[cfg(feature = "cuda")]
     fn paged_authority(&self, slot: usize) -> bool {
         self.graphs_enabled && self.model.paged_ctx.is_some() && !self.paged_dirty[slot]
     }
@@ -2929,7 +2991,7 @@ impl Qwen35BatchAdapter {
         rope_host: Vec<u32>,
         trie_ranges: Option<&Tensor>,
     ) -> Result<(Vec<f32>, Tensor, bool)> {
-        let Device::Cuda(cuda_dev) = &self.device else {
+        let Device::Cuda(cuda_dev) = self.device.clone() else {
             return Err(anyhow!("paged graph: не CUDA-устройство"));
         };
         let t = tokens.len();
@@ -2969,11 +3031,18 @@ impl Qwen35BatchAdapter {
         } else {
             (1usize, t, self.model.hidden_size())
         };
+        let reset_state = !verify && start_pos == 0;
+        let cached_emb = if verify {
+            None
+        } else {
+            let (emb, version) = self.embed_for_graph_cached(tokens)?;
+            Some((emb.reshape(emb_shape)?, version))
+        };
         let fwd = |m: &mut ModelWeights, emb: &Tensor, rope: &Tensor| -> Result<(Tensor, Tensor)> {
             let r = if verify {
                 m.forward_verify_tree_graphed(emb, rope, t, slot_u, trie_ranges)
             } else {
-                m.forward_prefill_graphed(emb, rope, t)
+                m.forward_prefill_graphed(emb, rope, t, reset_state)
             };
             r.map_err(|e| anyhow!("pgraph {kind} forward: {e}"))
         };
@@ -2982,21 +3051,28 @@ impl Qwen35BatchAdapter {
         } else {
             &mut self.prefill_graphs
         };
-        let hit = pool.iter().position(|g| g.t == t);
+        let hit = pool
+            .iter()
+            .position(|g| g.t == t && g.reset_state == reset_state);
         let pool_full = pool.len() >= pgraph_lru();
         match hit {
             Some(i) => {
                 {
                     let g = &pool[i];
-                    let emb_staging = self
-                        .model
-                        .embed_for_graph(tokens, &self.device)
-                        .map_err(|e| anyhow!("pgraph {kind} embed: {e}"))?
-                        .reshape(emb_shape)
-                        .map_err(|e| anyhow!("pgraph {kind} embed reshape: {e}"))?;
-                    g.emb_t
-                        .slice_set(&emb_staging, 0, 0)
-                        .map_err(|e| anyhow!("pgraph {kind} emb slice_set: {e}"))?;
+                    let cached_version = cached_emb.as_ref().map(|(_, v)| *v);
+                    if cached_version != Some(g.embed_version) {
+                        let emb_staging = match cached_emb.as_ref() {
+                            Some((emb, _)) => emb.clone(),
+                            None => self
+                                .model
+                                .embed_for_graph(tokens, &self.device)
+                                .map_err(|e| anyhow!("pgraph {kind} embed: {e}"))?
+                                .reshape(emb_shape)?,
+                        };
+                        g.emb_t
+                            .slice_set(&emb_staging, 0, 0)
+                            .map_err(|e| anyhow!("pgraph {kind} emb slice_set: {e}"))?;
+                    }
                     let rope_staging = Tensor::from_vec(rope_host, t, &Device::Cpu)
                         .map_err(|e| anyhow!("pgraph {kind} rope from_vec: {e}"))?
                         .to_device(&self.device)
@@ -3008,7 +3084,10 @@ impl Qwen35BatchAdapter {
                         .map_err(|e| anyhow!("pgraph {kind} launch T={t} slot={slot}: {e}"))?;
                 }
                 // LRU: свежий — в хвост.
-                let g = pool.remove(i);
+                let mut g = pool.remove(i);
+                if let Some((_, version)) = cached_emb.as_ref() {
+                    g.embed_version = *version;
+                }
                 let flat = g
                     .logits_t
                     .to_dtype(DType::F32)
@@ -3030,10 +3109,17 @@ impl Qwen35BatchAdapter {
                 // htod-кэш: промах параметров при захвате → явная ошибка вместо
                 // pageable memcpy внутри графа.
                 // Эмбеддинги — до guard: буфер больше порога кэша htod.
-                let emb_t = self
-                    .model
-                    .embed_for_graph(tokens, &self.device)?
-                    .reshape(emb_shape)?;
+                let emb_t = match cached_emb.as_ref() {
+                    Some((emb, _)) => emb.clone(),
+                    None => self
+                        .model
+                        .embed_for_graph(tokens, &self.device)?
+                        .reshape(emb_shape)?,
+                };
+                let captured_embed_version = cached_emb
+                    .as_ref()
+                    .map(|(_, version)| *version)
+                    .unwrap_or(0);
                 let _htod_guard = cuda_dev.enable_cuda_graph_htod_cache();
                 let rope_pos_t = Tensor::from_vec(rope_host, t, &self.device)?;
                 // 1) Eager-прогон: это и есть результат (захват ядра не
@@ -3116,6 +3202,8 @@ impl Qwen35BatchAdapter {
                         cu_graph,
                         stream: stream.clone(),
                         t,
+                        reset_state,
+                        embed_version: captured_embed_version,
                         emb_t: emb_t.clone(),
                         rope_pos_t: rope_pos_t.clone(),
                         logits_t: logits_out,

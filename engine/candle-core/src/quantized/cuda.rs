@@ -61,6 +61,16 @@ pub fn force_dmmv() -> bool {
     FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || force_dmmv_env()
 }
 
+fn use_turing_q4k_mmvq(dev: &CudaDevice, dtype: GgmlDType, b_size: usize) -> bool {
+    b_size == 1
+        && dtype == GgmlDType::Q4K
+        && std::env::var("YTTRI_MMVQ_TURING").as_deref() != Ok("0")
+        && dev
+            .context
+            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .is_ok_and(|cc| cc < 8)
+}
+
 // Per-device Q8_1 scratch cache: 2 слота на размер, чтобы избежать self-deadlock
 // когда вход слоя и выход attention_wo имеют одинаковую размерность (например 9B: 4096 == 4096).
 static Q81_SCRATCH: std::sync::OnceLock<
@@ -662,14 +672,23 @@ impl QCudaStorage {
             GgmlDType::IQ4XS => "mul_mat_vec_iq4_xs_q8_1_cuda",
             _ => crate::bail!("unsupported dtype for quantized matmul {:?}", self.dtype),
         };
-        let kernel_name = format!("{kernel_name}{b_size}");
+        let turing = use_turing_q4k_mmvq(dev, self.dtype, b_size);
+        let kernel_name = if turing {
+            format!("{kernel_name}{b_size}_t2")
+        } else {
+            format!("{kernel_name}{b_size}")
+        };
         let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
         let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
-        let (nblocks, nwarps) = match b_size {
-            1 => (nrows as u32, 4),
-            2..=4 => ((nrows as u32).div_ceil(2), 4),
-            5..=8 => ((nrows as u32).div_ceil(2), 2),
-            _ => crate::bail!("unexpected bsize {b_size}"),
+        let (nblocks, nwarps) = if turing {
+            (nrows as u32, 2)
+        } else {
+            match b_size {
+                1 => (nrows as u32, 4),
+                2..=4 => ((nrows as u32).div_ceil(2), 4),
+                5..=8 => ((nrows as u32).div_ceil(2), 2),
+                _ => crate::bail!("unexpected bsize {b_size}"),
+            }
         };
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: (nblocks, 1, 1),
@@ -774,7 +793,10 @@ fn mul_mat_vec_via_q8_1(
             GgmlDType::Q6K => hoisted_mode.as_deref() == Ok("all"),
             _ => false,
         };
-    let kernel_name = if use_hoisted {
+    let turing = use_turing_q4k_mmvq(dev, dtype, b_size);
+    let kernel_name = if turing {
+        format!("{kernel_name}{b_size}_t2")
+    } else if use_hoisted {
         format!("{kernel_name}{b_size}_hoisted")
     } else {
         format!("{kernel_name}{b_size}")
@@ -782,11 +804,15 @@ fn mul_mat_vec_via_q8_1(
     let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
     let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
     // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98
-    let (nblocks, nwarps) = match b_size {
-        1 => (nrows as u32, 4),
-        2..=4 => ((nrows as u32).div_ceil(2), 4),
-        5..=8 => ((nrows as u32).div_ceil(2), 2),
-        _ => crate::bail!("unexpected bsize {b_size}"),
+    let (nblocks, nwarps) = if turing {
+        (nrows as u32, 2)
+    } else {
+        match b_size {
+            1 => (nrows as u32, 4),
+            2..=4 => ((nrows as u32).div_ceil(2), 4),
+            5..=8 => ((nrows as u32).div_ceil(2), 2),
+            _ => crate::bail!("unexpected bsize {b_size}"),
+        }
     };
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (nblocks, 1, 1),

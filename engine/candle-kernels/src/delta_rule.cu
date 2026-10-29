@@ -409,6 +409,7 @@ extern "C" __global__ void delta_conv1d_prefill(
     float* __restrict__ qkv_conv_out,       // [T * channels]
     float* __restrict__ beta_out,           // [T * n_v_heads]
     float* __restrict__ gate_out,           // [T * n_v_heads]
+    const int reset_state,
     const DeltaParams params,
     const unsigned int T
 ) {
@@ -426,6 +427,8 @@ extern "C" __global__ void delta_conv1d_prefill(
             float x;
             if (src >= 0) {
                 x = qkv_raw[(unsigned int)src * channels + ch];
+            } else if (reset_state) {
+                x = 0.0f;
             } else {
                 // tail of persistent conv_state: indices [0, conv_k-1)
                 x = conv_state[(unsigned int)((int)(conv_k - 1) + src) * channels + ch];
@@ -564,6 +567,81 @@ extern "C" __global__ void delta_rule_prefill(
     #pragma unroll
     for (unsigned int r = 0; r < ROWS; r++) {
         const unsigned int row = r * 32 + lane;
+        ssm_state[state_base + row * hd + col] = s[r];
+    }
+}
+
+// Four state columns per warp. llama.cpp's GDN layout: an 8-lane segment owns
+// one column, so a 128x128 state is held by 8 CTAs per head instead of 32.
+extern "C" __global__ void __launch_bounds__(128, 2)
+delta_rule_prefill_gdn4(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ beta,
+    const float* __restrict__ gate, float* __restrict__ ssm_state,
+    float* __restrict__ output, const int reset_state,
+    const DeltaParams params, const unsigned int T) {
+    constexpr unsigned int COLS_PER_WARP = 4;
+    constexpr unsigned int LANES_PER_COL = 8;
+    constexpr unsigned int ROWS = 16;
+
+    const unsigned int head = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int col_in_warp = lane / LANES_PER_COL;
+    const unsigned int lane_in_col = lane % LANES_PER_COL;
+    const unsigned int col = (blockIdx.y * blockDim.y + threadIdx.y)
+                           * COLS_PER_WARP + col_in_warp;
+    const unsigned int hd = params.head_v_dim;
+    const unsigned int hkd = params.head_k_dim;
+    const unsigned int n_v = params.n_v_heads;
+    if (col >= hd) return;
+
+    const unsigned int state_base = head * hd * hd;
+    float s[ROWS];
+#pragma unroll
+    for (unsigned int r = 0; r < ROWS; ++r) {
+        const unsigned int row = r * LANES_PER_COL + lane_in_col;
+        s[r] = reset_state ? 0.0f : ssm_state[state_base + row * hd + col];
+    }
+
+    for (unsigned int t = 0; t < T; ++t) {
+        const unsigned int kv_base = (t * n_v + head) * hkd;
+        const unsigned int out_base = (t * n_v + head) * hd;
+        const float g = __expf(gate[t * n_v + head]);
+        const float beta_h = beta[t * n_v + head];
+
+        float kr[ROWS], qr[ROWS];
+#pragma unroll
+        for (unsigned int r = 0; r < ROWS; ++r) {
+            const unsigned int row = r * LANES_PER_COL + lane_in_col;
+            kr[r] = k[kv_base + row];
+            qr[r] = q[kv_base + row];
+        }
+
+        float kv = 0.0f;
+#pragma unroll
+        for (unsigned int r = 0; r < ROWS; ++r) kv += s[r] * kr[r];
+        for (int o = LANES_PER_COL / 2; o > 0; o >>= 1) {
+            kv += __shfl_down_sync(0xffffffff, kv, o, LANES_PER_COL);
+        }
+        kv = __shfl_sync(0xffffffff, kv, (lane / LANES_PER_COL) * LANES_PER_COL,
+                         LANES_PER_COL);
+
+        const float delta = (v[out_base + col] - g * kv) * beta_h;
+        float attn = 0.0f;
+#pragma unroll
+        for (unsigned int r = 0; r < ROWS; ++r) {
+            s[r] = g * s[r] + kr[r] * delta;
+            attn += s[r] * qr[r];
+        }
+        for (int o = LANES_PER_COL / 2; o > 0; o >>= 1) {
+            attn += __shfl_down_sync(0xffffffff, attn, o, LANES_PER_COL);
+        }
+        if (lane_in_col == 0) output[out_base + col] = attn;
+    }
+
+#pragma unroll
+    for (unsigned int r = 0; r < ROWS; ++r) {
+        const unsigned int row = r * LANES_PER_COL + lane_in_col;
         ssm_state[state_base + row * hd + col] = s[r];
     }
 }

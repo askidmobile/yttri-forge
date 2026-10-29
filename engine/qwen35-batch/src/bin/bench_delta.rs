@@ -116,9 +116,10 @@ fn run(
     // блок — `warps` колонок. У v2 k/q грузятся в shared один раз на блок,
     // поэтому чем больше warps, тем меньше повторных чтений — но тем хуже
     // занятость SM. Развёртка ищет баланс.
+    let gdn4 = kernel == "delta_rule_prefill_gdn4";
     let cfg = LaunchConfig {
-        grid_dim: (n_v as u32, (hvd / warps as usize) as u32, 1),
-        block_dim: (32, warps, 1),
+        grid_dim: (n_v as u32, (hvd / if gdn4 { 16 } else { warps as usize }) as u32, 1),
+        block_dim: (32, if gdn4 { 4 } else { warps }, 1),
         shared_mem_bytes: if kernel.ends_with("_v2") {
             (2 * hkd * 4) as u32
         } else {
@@ -411,6 +412,24 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
     let gpu_out = dev.clone_dtoh(&out)?;
     let gpu_state = dev.clone_dtoh(&state)?;
 
+    let out_g = dev.alloc_zeros::<f32>(t * n_v * hvd)?;
+    let mut state_g = dev.clone_htod(&s0)?;
+    {
+        let f = dev.get_or_load_func("delta_rule_prefill_gdn4", &candle_kernels::DELTA_RULE)?;
+        let cfg = LaunchConfig {
+            grid_dim: (N_V, (hvd / 16) as u32, 1),
+            block_dim: (32, 4, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = f.builder();
+        b.arg(&dq); b.arg(&dk); b.arg(&dv); b.arg(&db); b.arg(&dg);
+        b.arg(&state_g); b.arg(&out_g); b.arg(&p); b.arg(&t_u32);
+        unsafe { b.launch(cfg) }.map_err(|e| anyhow!("launch gdn4: {e:?}"))?;
+    }
+    dev.cuda_stream().synchronize()?;
+    let gpu_g_out = dev.clone_dtoh(&out_g)?;
+    let gpu_g_state = dev.clone_dtoh(&state_g)?;
+
     // Тот же вход — через chunked-ядро.
     let out_c = dev.alloc_zeros::<f32>(t * n_v * hvd)?;
     let mut state_c = dev.clone_htod(&s0)?;
@@ -466,6 +485,8 @@ fn check(dev: &CudaDevice, t: usize, chunk: usize) -> Result<()> {
     // Сверка по ВСЕМ головам сразу: ошибка в индексации головы иначе пройдёт мимо.
     println!("  ЯДРО chunked vs ЯДРО v1 (все головы): out {}, state {}",
         max_rel(&gpu_out, &gpu_c_out), max_rel(&gpu_state, &gpu_c_state));
+    println!("  ЯДРО gdn4 vs ЯДРО v1 (все головы): out {}, state {}",
+        max_rel(&gpu_out, &gpu_g_out), max_rel(&gpu_state, &gpu_g_state));
     println!("  масштаб: |out|max={:.3} |state|max={:.3}",
         seq_out.iter().fold(0f32, |m, x| m.max(x.abs())),
         seq_state.iter().fold(0f32, |m, x| m.max(x.abs())));
@@ -499,6 +520,7 @@ fn main() -> Result<()> {
 
     let mut base: Option<Vec<f32>> = None;
     let variants: Vec<(&str, u32)> = vec![
+        ("delta_rule_prefill_gdn4", 0),
         ("delta_rule_prefill", 2),
         ("delta_rule_prefill_v2", 8),
         // Диагностика: одна warp-редукция на токен вместо двух (математика

@@ -184,7 +184,8 @@ fn main() -> Result<()> {
     // Смена режима (минимальная/полная сборка) обязана перезапускать скрипт:
     // без этой строки cargo оставлял старый libflashattention.a.
     println!("cargo::rerun-if-env-changed=CANDLE_FLASH_ATTN_MINIMAL");
-    let minimal = std::env::var("CANDLE_FLASH_ATTN_MINIMAL").is_ok();
+    let turing = std::env::var_os("CARGO_FEATURE_TURING").is_some();
+    let minimal = turing || std::env::var("CANDLE_FLASH_ATTN_MINIMAL").is_ok();
     let kernel_files: &[&str] = if minimal {
         &KERNEL_FILES_MIN
     } else {
@@ -198,13 +199,14 @@ fn main() -> Result<()> {
     }
 
     let arch = cudaforge::detect_compute_cap()?;
-    if arch.base < 80 {
+    if arch.base < 80 && !turing {
         return Err(cudaforge::Error::InvalidConfig(format!(
             "candle-flash-attn требует Ampere (sm_80) или новее, получено {}. \
-             FA2-ядра этого крейта на Turing (например, RTX 2080 Ti / sm_75) не работают.",
+             Для RTX 20 включите feature `turing`.",
             arch.to_nvcc_arch()
         )));
     }
+    println!("cargo::rerun-if-env-changed=CARGO_FEATURE_TURING");
 
     let is_target_msvc = std::env::var("TARGET").is_ok_and(|target| target.contains("msvc"));
     for var in [
@@ -276,6 +278,9 @@ fn main() -> Result<()> {
         .thread_percentage(0.5); // Use up to 50% of available threads
     if minimal {
         builder = builder.arg("-DCANDLE_FA_MINIMAL");
+    }
+    if turing {
+        builder = builder.arg("-DCANDLE_FA_TURING");
     }
 
     if is_target_msvc {
