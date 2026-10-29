@@ -1222,9 +1222,15 @@ mod pinned_logits {
                 *cell = Some(Buf { ptr, bytes });
             }
             let buf = cell.as_ref().expect("буфер только что выделен");
-            let res = unsafe { csys::cuMemcpyDtoH_v2(buf.ptr, src, bytes) };
+            let cuda = device.as_cuda_device()?;
+            let stream = cuda.cuda_stream().cu_stream();
+            let res = unsafe { csys::cuMemcpyDtoHAsync_v2(buf.ptr, src, bytes, stream) };
             if res != csys::CUresult::CUDA_SUCCESS {
-                candle_core::bail!("cuMemcpyDtoH({bytes}) failed: {res:?}");
+                candle_core::bail!("cuMemcpyDtoHAsync({bytes}) failed: {res:?}");
+            }
+            let res = unsafe { csys::cuStreamSynchronize(stream) };
+            if res != csys::CUresult::CUDA_SUCCESS {
+                candle_core::bail!("cuStreamSynchronize after logits copy failed: {res:?}");
             }
             unsafe {
                 std::ptr::copy_nonoverlapping(buf.ptr as *const f32, out.as_mut_ptr(), n);
