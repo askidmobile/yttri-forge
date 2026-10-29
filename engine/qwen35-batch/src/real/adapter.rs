@@ -1976,7 +1976,11 @@ impl BatchModel for Qwen35BatchAdapter {
         // лишь когда промпт исчерпан). Синхронный D2H при этом держит хост
         // ~5 с на чанк и не даёт ставить следующие ядра заранее.
         let skip_mid_logits =
-            !chunk.is_final && std::env::var("PREFILL_SKIP_MID_LOGITS").as_deref() == Ok("1");
+            // По умолчанию включено: промежуточным чанкам логиты не нужны,
+            // а синхронный D2H держит хост ~9 мс на чанк (замер на sm75).
+            // Откат: PREFILL_SKIP_MID_LOGITS=0.
+            !chunk.is_final
+                && std::env::var("PREFILL_SKIP_MID_LOGITS").as_deref() != Ok("0");
         let logits_f32 = if skip_mid_logits {
             Vec::new()
         } else {
