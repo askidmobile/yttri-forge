@@ -8817,8 +8817,40 @@ impl ModelWeights {
                     }
                 }
                 HybridLayerType::Attention(a) => {
-                    a.kv_cache_batched[slot] = None;
-                    a.kv_cache_len_batched[slot] = position;
+                    // Заполняем batched-KV прямо из single-slot кэша: префил
+                    // его уже посчитал, глубокий snapshot с последующим
+                    // q8-roundtrip стоил 58 мс на чанк 491 (23% времени).
+                    match (&a.kv_cache, a.kv_cache_len) {
+                        (Some((k, v)), len) if len > 0 => {
+                            let take = len.min(position);
+                            let kt = k
+                                .narrow(2, 0, take)?
+                                .transpose(1, 2)?
+                                .contiguous()?;
+                            let vt = v
+                                .narrow(2, 0, take)?
+                                .transpose(1, 2)?
+                                .contiguous()?;
+                            if a.use_q8_f16_kv_cache {
+                                let (kq, ks) = q8_quantize_rows(&kt)?;
+                                let (vq, vs) = q8_quantize_rows(&vt)?;
+                                a.kv_cache_batched[slot] = Some(BatchedKvCache::F16(F16KvCache {
+                                    k: q8_dequantize_rows(&kq, &ks)?,
+                                    v: q8_dequantize_rows(&vq, &vs)?,
+                                }));
+                            } else {
+                                let (kq, ks) = q8_quantize_rows(&kt)?;
+                                let (vq, vs) = q8_quantize_rows(&vt)?;
+                                a.kv_cache_batched[slot] =
+                                    Some(BatchedKvCache::Q8(Q8KvCache { k_q: kq, k_s: ks, v_q: vq, v_s: vs }));
+                            }
+                            a.kv_cache_len_batched[slot] = position;
+                        }
+                        _ => {
+                            a.kv_cache_batched[slot] = None;
+                            a.kv_cache_len_batched[slot] = position;
+                        }
+                    }
                 }
             }
         }

@@ -2088,7 +2088,11 @@ impl BatchModel for Qwen35BatchAdapter {
             // Полный снимок создавал ещё одну копию, линейную по контексту,
             // хотя seed использовал из неё только recurrent-state и длину.
             let t_fin = std::time::Instant::now();
-            let direct_seed = pg_used && self.mtp.is_none() && !self.capture_prefix;
+            // Prefix cache выключен: снимок нужен только seed'у, а seed идёт
+            // из device-контекста single-slot (seed_slot_batched_from_single),
+            // поэтому полный snapshot KV не требуется ни на paged-, ни на
+            // eager-пути. Замер на sm75: snap+seed = 88 мс из 386 мс (23%).
+            let direct_seed = self.mtp.is_none() && !self.capture_prefix;
             let snap = if direct_seed {
                 None
             } else if pg_used {
