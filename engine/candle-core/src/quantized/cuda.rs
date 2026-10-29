@@ -1969,8 +1969,13 @@ impl QCudaStorage {
         // не включалась. MMQ_STREAMK=1 включает, MMQ_NBLOCKS=N задаёт число
         // блоков (по умолчанию nSM).
         const SK_TAGS: [&str; 7] = ["q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q4_0", "q8_0"];
+        // Stream-k включён по умолчанию для K-квантов: при n=4096 и
+        // MMQ_Y=128 тайлов меньше, чем SM, и обычная сетка даёт неполную
+        // волну. Замер на sm75 (RTX 2080 Ti, Ornith-9B): 512 токенов
+        // 2156 против 2144, 3613 токенов 1819 против 1778 (+2.3%).
+        // Откат: MMQ_STREAMK=0.
         let sk_want = !use_dp4a
-            && std::env::var("MMQ_STREAMK").map(|v| v == "1").unwrap_or(false)
+            && std::env::var("MMQ_STREAMK").as_deref() != Ok("0")
             && SK_TAGS.contains(&tag);
         let nsm = dev
             .context
@@ -1981,8 +1986,8 @@ impl QCudaStorage {
         let nblocks = std::env::var("MMQ_NBLOCKS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(nsm)
-            .clamp(1, ntiles);
+            .unwrap_or(if sk_want && nsm > ntiles { nsm } else { nsm })
+            .max(1);
         let use_sk = sk_want && nblocks < ntiles;
         let set_smem = |f: &cudarc::driver::CudaFunction| -> Result<()> {
             if nbs > 48 * 1024 {
