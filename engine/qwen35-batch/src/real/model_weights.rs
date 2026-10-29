@@ -9860,8 +9860,18 @@ impl ModelWeights {
         // (kv_len инкрементируется только в конце). Один launch вместо N.
         ctx.seqlens_k_for_prefill(1, t_len)?;
 
-        for block in self.blocks.iter_mut() {
+        if let Some(bevs) = self.gprof_block_events.as_ref() {
+            let stream = ctx.dev.cuda_stream().cu_stream();
+            let _ = unsafe { cudarc::driver::result::event::record(bevs[0], stream) };
+        }
+        for (block_idx, block) in self.blocks.iter_mut().enumerate() {
             layer_in = block.forward_prefill_paged(&layer_in, ctx, rope_pos_dev, reset_state)?;
+            if let Some(bevs) = self.gprof_block_events.as_ref() {
+                let stream = ctx.dev.cuda_stream().cu_stream();
+                let _ = unsafe {
+                    cudarc::driver::result::event::record(bevs[block_idx + 1], stream)
+                };
+            }
         }
 
         // kv_len[slot] += T — после ВСЕХ attention слоёв (все слои видят одну длину).

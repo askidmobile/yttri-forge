@@ -2860,8 +2860,9 @@ impl Qwen35BatchAdapter {
             self.prefill_path[slot] = PrefillPath::Eager;
             return Ok(None);
         }
-        let Device::Cuda(cuda_dev) = &self.device else {
-            return Ok(None);
+        let cuda_dev = match &self.device {
+            Device::Cuda(cuda_dev) => cuda_dev.clone(),
+            _ => return Ok(None),
         };
         let t = chunk.tokens.len();
         // Промпт уже пошёл по eager — назад дороги нет: строки посчитанных
@@ -3143,6 +3144,37 @@ impl Qwen35BatchAdapter {
                         .map_err(|e| anyhow!("pgraph {kind} rope slice_set: {e}"))?;
                     g.launch()
                         .map_err(|e| anyhow!("pgraph {kind} launch T={t} slot={slot}: {e}"))?;
+                    if let Some(bevs) = self.model.gprof_block_events.as_ref() {
+                        cuda_dev
+                            .cuda_stream()
+                            .synchronize()
+                            .map_err(|e| anyhow!("pgraph {kind} gprof sync: {e}"))?;
+                        use cudarc::driver::result as cres;
+                        let mut delta_ms = 0f32;
+                        let mut attn_ms = 0f32;
+                        let mut rows = Vec::new();
+                        for i in 0..bevs.len().saturating_sub(1) {
+                            if let Ok(ms) = unsafe { cres::event::elapsed(bevs[i], bevs[i + 1]) } {
+                                if self.model.blocks[i].is_deltanet() {
+                                    delta_ms += ms;
+                                } else {
+                                    attn_ms += ms;
+                                }
+                                rows.push((i, ms));
+                            }
+                        }
+                        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        let top = rows
+                            .iter()
+                            .take(8)
+                            .map(|(i, ms)| format!("b{i}={ms:.2}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        eprintln!(
+                            "[pgprof] delta={delta_ms:.1}ms attn={attn_ms:.1}ms total={:.1}ms top={top}",
+                            delta_ms + attn_ms
+                        );
+                    }
                 }
                 // LRU: свежий — в хвост.
                 let mut g = pool.remove(i);
