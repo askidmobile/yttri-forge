@@ -3345,6 +3345,10 @@ pub(crate) struct GatedAttentionLayer {
     /// q [cap,n_head,hd] F16, gate [cap,n_head,hd] F32, k/v [cap,n_kv,hd] F16.
     #[cfg(feature = "cuda")]
     attn_prep_scratch: Option<crate::real::attn_prepare_cuda::AttnPrepScratch>,
+    /// Отдельные большие буферы prefill: декод продолжает работать на маленьком
+    /// рабочем наборе и не наследует локальность 512-токенного чанка.
+    #[cfg(feature = "cuda")]
+    attn_prefill_scratch: Option<crate::real::attn_prepare_cuda::AttnPrepScratch>,
     kv_cache: Option<(Tensor, Tensor)>,
     /// Текущая длина заполненного KV-cache
     kv_cache_len: usize,
@@ -4477,6 +4481,116 @@ impl GatedAttentionLayer {
                 )
             }
         };
+
+        // Prefill uses the same fused Q/K/V preparation kernel as decode: each
+        // token is one row. This removes ~15 layout/norm/RoPE launches per
+        // attention layer and keeps Q, K, V, and gate in persistent buffers.
+        let fused_prep = crate::real::attn_prepare_cuda::enabled()
+            && !per_row_gqa
+            && trie_ranges.is_none()
+            && kv_exact_f16()
+            && self.head_dim == 256
+            && self.rope_dim > 0
+            && self.rope_dim < self.head_dim;
+        if fused_prep {
+            let cap = seq_len.max(decode_capacity() as usize);
+            if self.attn_prefill_scratch.as_ref().map(|s| s.cap).unwrap_or(0) < cap {
+                self.attn_prefill_scratch =
+                    Some(crate::real::attn_prepare_cuda::AttnPrepScratch::new(
+                        cap,
+                        self.n_head,
+                        self.n_kv_head,
+                        self.head_dim,
+                        x.device(),
+                    )?);
+            }
+            let scratch = self
+                .attn_prefill_scratch
+                .as_ref()
+                .expect("prefill scratch just allocated");
+            let qg3 = qg.reshape((seq_len, self.n_head, self.head_dim * 2))?;
+            let k3 = k.reshape((seq_len, self.n_kv_head, self.head_dim))?;
+            let v3 = v.reshape((seq_len, self.n_kv_head, self.head_dim))?;
+            let (q_f16, gate, k_rows, v_rows) = crate::real::attn_prepare_cuda::dispatch(
+                scratch,
+                &qg3,
+                &k3,
+                &v3,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                &self.cos,
+                &self.sin,
+                rope_pos_dev,
+                seq_len,
+                self.n_head,
+                self.n_kv_head,
+                self.head_dim,
+                self.rope_dim,
+                self.rms_norm_eps,
+            )?;
+
+            let pool = self
+                .paged_pool
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::Msg("paged pool not initialized".into()))?;
+            pool.launch_append_multi(
+                ctx,
+                &k_rows,
+                &v_rows,
+                b_sz,
+                seq_len,
+                self.n_kv_head,
+                self.head_dim,
+                self.attn_window,
+            )?;
+
+            let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
+            let window = ctx.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE;
+            let block_table = ctx.block_table(b_sz)?;
+            let out = Tensor::zeros(q_f16.shape(), DType::F16, q_f16.device())?;
+            let seqlens_q = ctx.seqlens_q_prefill();
+            let seqlens_k = ctx.seqlens_k(b_sz)?;
+            let lse = Tensor::zeros((self.n_head, seq_len), DType::F32, q_f16.device())?;
+            crate::real::paged_attn::PagedAttn {
+                q: &q_f16,
+                k_pool: &pool.k_pool,
+                v_pool: &pool.v_pool,
+                kv_scales: match (&pool.k_scale, &pool.v_scale) {
+                    (Some(ks), Some(vs)) => Some((ks, vs)),
+                    _ => None,
+                },
+                seqlens_q: &seqlens_q,
+                seqlens_k: &seqlens_k,
+                block_table: &block_table,
+                out: &out,
+                softmax_lse: &lse,
+                b: b_sz,
+                h: self.n_head,
+                h_k: self.n_kv_head,
+                d: self.head_dim,
+                max_seqlen_q: seq_len,
+                max_seqlen_k: window,
+                softmax_scale: scale,
+                window_left: -1,
+                window_right: 0,
+                page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+                shared_block_table: false,
+                rows_per_position: 0,
+                trie_ranges: None,
+            }
+            .forward()?;
+
+            let y = out
+                .to_dtype(DType::F32)?
+                .reshape((b_sz, seq_len, self.n_head, self.head_dim))?;
+            let gate = gate.reshape((b_sz, seq_len, self.n_head, self.head_dim))?;
+            let gated = (y * candle_nn::ops::sigmoid(&gate)?)?;
+            let y_all = gated.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+            return match &self.f16_o {
+                Some(fo) => fo.forward(&y_all),
+                None => self.attention_wo.forward(&y_all),
+            };
+        }
 
         // 2. Reshape + norms
         let qg = qg.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
@@ -7944,6 +8058,8 @@ impl ModelWeights {
                     rms_norm_eps: rms_norm_eps as f32,
                     #[cfg(feature = "cuda")]
                     attn_prep_scratch: None,
+                    #[cfg(feature = "cuda")]
+                    attn_prefill_scratch: None,
                     kv_cache: None,
                     kv_cache_len: 0,
                     max_cache_len: context_length,
