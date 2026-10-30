@@ -902,13 +902,28 @@ impl Qwen35BatchAdapter {
         // Префил-кэши F16 для Turing: Q4_K MMQ на sm75 упирается в 33 TFLOPS,
         // а F16-копия весов убирает деквант на каждом чанке. Бюджеты — из env,
         // потому что они конкурируют с KV-пулом за VRAM.
+        //
+        // Бюджет берётся из env, если задан, иначе считается от свободной
+        // VRAM с учётом KV-пула под CTX (см. `auto_turing_mlp_cache_mib`).
+        // Константа тут неверна: на 9B в 5.49 ГиБ помещается 15 слоёв, на 27B
+        // может не поместиться ни одного, а на 4B — почти все.
         #[cfg(feature = "cuda")]
-        if let Some(max_mib) = std::env::var("YTTRI_F16_MLP_CACHE_MIB")
+        let mlp_cache_mib = std::env::var("YTTRI_F16_MLP_CACHE_MIB")
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        {
+            .and_then(|v| {
+                let v = v.trim().to_string();
+                if v.eq_ignore_ascii_case("auto") {
+                    None
+                } else {
+                    v.parse::<u64>().ok()
+                }
+            })
+            .unwrap_or_else(|| a.model.auto_turing_mlp_cache_mib(&a.device));
+        #[cfg(feature = "cuda")]
+        if mlp_cache_mib > 0 {
+            eprintln!("[f16-cache] бюджет авто/явно: {mlp_cache_mib}МиБ");
             a.model
-                .attach_turing_f16_mlp_cache(max_mib)
+                .attach_turing_f16_mlp_cache(mlp_cache_mib)
                 .map_err(|e| anyhow!("attach_turing_f16_mlp_cache: {e}"))?;
             if let Device::Cuda(c) = &a.device {
                 let _ = c.cuda_stream().synchronize();

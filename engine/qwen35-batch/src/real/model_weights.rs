@@ -6431,6 +6431,65 @@ impl ModelWeights {
         Ok(())
     }
 
+    /// Подобрать бюджет F16-кэша FFN под конкретную модель и контекст.
+    ///
+    /// Бюджет нельзя брать константой: он конкурирует за VRAM с весами и с
+    /// KV-пулом, а обе величины зависят от модели. На Ornith-1.5-9B 5.49 ГиБ
+    /// и контексте 8192 помещается 15 слоёв (4400 МиБ), на другой модели с
+    /// меньшим числом attention-слоёв — больше, на 27B — ноль.
+    ///
+    /// Считаем от **фактически свободной** VRAM в момент после загрузки весов:
+    ///
+    /// ```text
+    /// budget = free - kv_bytes(ctx) - headroom
+    /// ```
+    ///
+    /// `kv_bytes` — K+V всех attention-слоёв на обслуживаемый контекст в F16
+    /// (или int8, если `KV_POOL_Q8=1`). `headroom` — `VRAM_HEADROOM_MIB`
+    /// (по умолчанию 1024): графы, активации префила, буферы драйвера.
+    ///
+    /// Возвращает 0, если места на кэш не остаётся — тогда кэш не включается
+    /// и движок работает как раньше.
+    #[cfg(feature = "cuda")]
+    pub fn auto_turing_mlp_cache_mib(&self, device: &candle_core::Device) -> u64 {
+        let candle_core::Device::Cuda(c) = device else {
+            return 0;
+        };
+        let Ok((free, _)) = c.cuda_stream().context().mem_get_info() else {
+            return 0;
+        };
+        // Байт на токен по всем слоям внимания, K и V, все слоты.
+        let q8 = super::paged_kv_cuda::kv_pool_is_q8();
+        let mut bytes_per_token = 0usize;
+        for block in self.blocks.iter() {
+            if let HybridLayerType::Attention(a) = &block.layer {
+                let per_head = if q8 { a.head_dim + 2 } else { a.head_dim * 2 };
+                bytes_per_token += a.kv_cache_batched.len() * 2 * a.n_kv_head * per_head;
+            }
+        }
+        // Контекст, который сервер реально обслуживает; без CTX движок
+        // ограничивает окно 32768 (см. init_paged_decode).
+        let served_ctx = std::env::var("CTX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32768);
+        let kv_bytes = bytes_per_token.saturating_mul(served_ctx.min(32768));
+        let headroom = std::env::var("VRAM_HEADROOM_MIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1024)
+            * 1024
+            * 1024;
+        let free = free as u64;
+        let spare = free.saturating_sub(kv_bytes as u64).saturating_sub(headroom);
+        // Фиксированный запас на фрагментацию и пики транзиентов первого
+        // префилла. Доли от свободного брать нельзя: на 11 ГиБ четверть
+        // запаса — это 900 МиБ, то есть три слоя кэша, выброшенных зря.
+        // Откалибровано на Ornith-1.5-9B: при CTX=32768 и резерве 1024
+        // остаётся 3648 МиБ, из них 3456 (12 слоёв) грузятся стабильно; 128 МиБ хватает.
+        spare.saturating_sub(128 * 1024 * 1024) / (1024 * 1024)
+    }
+
     /// CUDA Turing prefill-only F16 copies for dense SwiGLU layers.
     #[cfg(feature = "cuda")]
     pub fn attach_turing_f16_mlp_cache(&mut self, max_mib: u64) -> Result<()> {
