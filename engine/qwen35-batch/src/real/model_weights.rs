@@ -1225,14 +1225,21 @@ impl Module for DenseMlp {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(xs)
-                .ok()
-                .flatten();
+            // Квантуем активации один раз: если MMQ-путь доступен, Q8_1 для
+            // него и есть нужная раскладка, второй проход (prequantize_q8_1)
+            // не нужен и только тратит время на слой.
             let mmq_prequant = self
                 .feed_forward_w1
                 .prequantize_mmq_q8_1(xs)
                 .ok()
                 .flatten();
+            let prequant = if mmq_prequant.is_some() {
+                None
+            } else {
+                candle_core::quantized::QTensor::prequantize_q8_1(xs)
+                    .ok()
+                    .flatten()
+            };
             let g2 = matches!(std::env::var("GPROF").as_deref(), Ok("2") | Ok("3"))
                 && xs.device().is_cuda();
             let sync = || {
