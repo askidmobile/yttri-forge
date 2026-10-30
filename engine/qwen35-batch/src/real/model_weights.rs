@@ -5943,8 +5943,11 @@ impl HybridBlock {
 
         // PFB_SPLIT=1 — разбивка блока по стадиям через CUDA-события.
         // Instant бесполезен: очередь асинхронна, меряем реальное GPU-время.
+        #[cfg(feature = "cuda")]
         let split = std::env::var("PFB_SPLIT").as_deref() == Ok("1");
+        #[cfg(feature = "cuda")]
         let mut events: Vec<(cudarc::driver::sys::CUevent, &'static str)> = Vec::new();
+        #[cfg(feature = "cuda")]
         if split {
             if let Ok(cd) = x.device().as_cuda_device() {
                 let stream = cd.cuda_stream().cu_stream();
@@ -5962,12 +5965,15 @@ impl HybridBlock {
                 let _ = stream;
             }
         }
+        #[cfg(feature = "cuda")]
         let mark = |idx: usize| {
             if let (Some((e, _)), Ok(cd)) = (events.get(idx), x.device().as_cuda_device()) {
                 let stream = cd.cuda_stream().cu_stream();
                 let _ = unsafe { cudarc::driver::result::event::record(*e, stream) };
             }
         };
+        #[cfg(not(feature = "cuda"))]
+        let mark = |_: usize| {};
         mark(0);
 
         let residual = x;
@@ -5992,6 +5998,7 @@ impl HybridBlock {
         let ffn_out = self.ff.forward_prefill(&normed)?;
         let x = (ffn_out + residual)?;
         mark(4);
+        #[cfg(feature = "cuda")]
         if split && events.len() == 5 {
             if let Ok(cd) = x.device().as_cuda_device() {
                 let _ = cd.cuda_stream().synchronize();
@@ -8484,6 +8491,7 @@ impl ModelWeights {
 
     /// Reset everything except CUDA single-slot Delta state. The first
     /// prefill kernels zero their state internally, avoiding 48 tiny memsets.
+    #[cfg(feature = "cuda")]
     pub fn clear_state_for_prefill(&mut self) {
         for block in self.blocks.iter_mut() {
             match &mut block.layer {
@@ -8501,6 +8509,7 @@ impl ModelWeights {
     }
 
     /// The in-kernel reset path supports the model's 128x128 Delta state.
+    #[cfg(feature = "cuda")]
     pub fn supports_in_kernel_prefill_reset(&self) -> bool {
         self.blocks.iter().all(|block| match &block.layer {
             HybridLayerType::DeltaNet(d) => d
@@ -9126,6 +9135,7 @@ impl ModelWeights {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub fn seed_slot_batched_from_device(
         &mut self,
         slot: usize,

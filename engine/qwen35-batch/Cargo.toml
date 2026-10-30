@@ -139,6 +139,16 @@ path = "src/bin/bench_delta.rs"
 required-features = ["real-model", "cuda"]
 
 [[bin]]
+name = "fa_prefill_probe"
+path = "src/bin/fa_prefill_probe.rs"
+required-features = ["real-model", "cuda"]
+
+[[bin]]
+name = "fa_decode_probe"
+path = "src/bin/fa_decode_probe.rs"
+required-features = ["real-model", "cuda"]
+
+[[bin]]
 name = "bench_kvq8"
 path = "src/bin/bench_kvq8.rs"
 required-features = ["real-model", "cuda"]

@@ -1035,12 +1035,12 @@ impl Qwen35BatchAdapter {
         if len == 0 || self.slot_generation(slot) != generation {
             return false;
         }
-        let window = self.model.paged_window();
-        if window == 0 {
-            return false;
-        }
         #[cfg(feature = "cuda")]
         {
+            let window = self.model.paged_window();
+            if window == 0 {
+                return false;
+            }
             match self.model.paged_ctx.as_ref() {
                 Some(ctx) => {
                     let cur = ctx.kv_len_host.get(slot).copied().unwrap_or(0) as usize;
@@ -1051,7 +1051,6 @@ impl Qwen35BatchAdapter {
         }
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = window;
             false
         }
     }
@@ -2141,7 +2140,7 @@ impl BatchModel for Qwen35BatchAdapter {
             // из device-контекста single-slot (seed_slot_batched_from_single),
             // поэтому полный snapshot KV не требуется ни на paged-, ни на
             // eager-пути. Замер на sm75: snap+seed = 88 мс из 386 мс (23%).
-            let direct_seed = self.mtp.is_none() && !self.capture_prefix;
+            let direct_seed = self.device.is_cuda() && self.mtp.is_none() && !self.capture_prefix;
             let snap = if direct_seed {
                 None
             } else if pg_used {
@@ -2255,6 +2254,7 @@ impl BatchModel for Qwen35BatchAdapter {
             }
             let t_sync = t_sync0.elapsed();
             let t_trim0 = std::time::Instant::now();
+            #[cfg(feature = "cuda")]
             trim_pool_cuda(&self.device);
             if crate::scheduler::trace_on() {
                 eprintln!(
