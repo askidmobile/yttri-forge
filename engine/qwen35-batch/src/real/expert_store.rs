@@ -93,13 +93,31 @@ pub fn union_experts(ids: &[u32], n_experts: usize) -> Result<Vec<usize>> {
 
 // ─── Pinned host-буфер (PD-006) ───────────────────────────────────────────────
 
-/// Pinned DEVICEMAP-буфер: host-память, отображённая в адресное пространство
-/// устройства. Флаги выбраны воротами 0 (2026-09-04): DEVICEMAP без
-/// WRITECOMBINED — полоса та же, UVA dev_ptr == host ptr.
+/// Бэкенд host-хранилища экспертов.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HostBackend {
+    /// cudaHostAlloc(DEVICEMAP): требует memlock (ulimit -l), полный
+    /// zero-copy через PCIe.
+    Pinned,
+    /// cuMemAllocManaged(ATTACH_HOST): не требует memlock; страницы остаются
+    /// на хосте, ядро читает их через PCIe (zero-copy семантика).
+    Managed,
+}
+
+/// Host-память, отображённая в адресное пространство устройства. Основной
+/// путь — pinned DEVICEMAP (флаги выбраны воротами 0, 2026-09-04): DEVICEMAP
+/// без WRITECOMBINED — полоса та же, UVA dev_ptr == host ptr.
+///
+/// Fallback (2026-10-30, стенд RTX 2080 Ti с `ulimit -l` = 8 МиБ):
+/// если pinned-выделение недоступно, используется managed ATTACH_HOST —
+/// та же семантика для ядер decode и memcpy_htod при prefill, но без
+/// требования блокировать страницы. Это не меняет размещение `MOE_EXPERTS=ram`
+/// и не ослабляет FR-008: без обоих путей загрузка по-прежнему fail-closed.
 pub(crate) struct HostBuf {
     ptr: *mut u8,
     dev_ptr: cudarc::driver::sys::CUdeviceptr,
     bytes: usize,
+    backend: HostBackend,
 }
 
 // Буфер живёт в однопоточном загрузчике; device читает по dev_ptr.
@@ -108,33 +126,84 @@ unsafe impl Sync for HostBuf {}
 
 impl HostBuf {
     pub fn alloc(bytes: usize) -> Result<Self> {
+        match Self::try_pinned(bytes) {
+            Ok(buf) => Ok(buf),
+            Err(pinned_err) => match Self::try_managed(bytes) {
+                Ok(buf) => {
+                    log::warn!(
+                        "[moe] pinned-хранилище недоступно ({pinned_err}); \
+                         fallback: managed ATTACH_HOST ({bytes} байт) — \
+                         веса читаются GPU через PCIe без блокировки страниц"
+                    );
+                    Ok(buf)
+                }
+                Err(managed_err) => candle_core::bail!(
+                    "хранилище экспертов: pinned не удался ({pinned_err}); \
+                     managed не удался ({managed_err}) — не хватает ни memlock \
+                     (ulimit -l), ни свободной host-памяти (fail-closed, FR-008)"
+                ),
+            },
+        }
+    }
+
+    fn try_pinned(bytes: usize) -> Result<Self> {
         use cudarc::driver::sys;
         let raw = unsafe {
             cudarc::driver::result::malloc_host(bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP)
         }
             .map_err(|e| {
                 candle_core::Error::Msg(format!(
-                    "pinned-хранилище экспертов: malloc_host({bytes} байт, DEVICEMAP) не удался: {e:?} — \
-                     недостаточно свободной host-памяти (fail-closed, FR-008)"
+                    "malloc_host({bytes} байт, DEVICEMAP): {e:?}"
                 ))
             })?;
         if raw.is_null() {
-            candle_core::bail!("pinned-хранилище экспертов: malloc_host вернул null для {bytes} байт");
+            candle_core::bail!("malloc_host вернул null для {bytes} байт");
         }
         let ptr = raw as *mut u8;
         let mut dev_ptr: cudarc::driver::sys::CUdeviceptr = 0;
         let rc = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev_ptr, raw, 0) };
         if rc != sys::CUresult::CUDA_SUCCESS || dev_ptr == 0 {
+            unsafe { let _ = cudarc::driver::result::free_host(raw); }
             candle_core::bail!(
-                "pinned-хранилище экспертов: cuMemHostGetDevicePointer_v2 → {rc:?} — \
-                 отображение host-памяти для устройства не работает (fail-closed, FR-008)"
+                "cuMemHostGetDevicePointer_v2 → {rc:?} — отображение host-памяти \
+                 для устройства не работает"
             );
         }
         Ok(Self {
             ptr,
             dev_ptr,
             bytes,
+            backend: HostBackend::Pinned,
         })
+    }
+
+    fn try_managed(bytes: usize) -> Result<Self> {
+        use cudarc::driver::sys;
+        let dev_ptr = unsafe {
+            cudarc::driver::result::malloc_managed(
+                bytes,
+                sys::CUmemAttach_flags::CU_MEM_ATTACH_HOST,
+            )
+        }
+            .map_err(|e| {
+                candle_core::Error::Msg(format!(
+                    "malloc_managed({bytes} байт, ATTACH_HOST): {e:?}"
+                ))
+            })?;
+        if dev_ptr == 0 {
+            candle_core::bail!("malloc_managed вернул null для {bytes} байт");
+        }
+        // UVA: managed-указатель валиден и на хосте — тот же адрес.
+        Ok(Self {
+            ptr: dev_ptr as *mut u8,
+            dev_ptr,
+            bytes,
+            backend: HostBackend::Managed,
+        })
+    }
+
+    pub fn backend(&self) -> HostBackend {
+        self.backend
     }
 
     pub fn dev_ptr(&self) -> cudarc::driver::sys::CUdeviceptr {
@@ -160,9 +229,16 @@ impl HostBuf {
 impl Drop for HostBuf {
     fn drop(&mut self) {
         unsafe {
-            // FR-012: pinned-память освобождается при выгрузке модели
+            // FR-012: память освобождается при выгрузке модели
             // (Drop срабатывает до сброса CUDA-контекста в пути смены модели).
-            let _ = cudarc::driver::result::free_host(self.ptr as *mut _);
+            match self.backend {
+                HostBackend::Pinned => {
+                    let _ = cudarc::driver::result::free_host(self.ptr as *mut _);
+                }
+                HostBackend::Managed => {
+                    let _ = cudarc::driver::result::free_sync(self.dev_ptr);
+                }
+            }
         }
     }
 }
@@ -242,8 +318,12 @@ impl ExpertMatrix {
         host.as_slice_mut().copy_from_slice(&data[start..start + size]);
         let table = alloc_host_table(dev, host.dev_ptr(), n_experts, expert_bytes)?;
         log::info!(
-            "[moe] matrix: [{n_experts},{n},{k}] {dtype:?} — {:.1} МиБ pinned",
-            bytes as f64 / 1024.0 / 1024.0
+            "[moe] matrix: [{n_experts},{n},{k}] {dtype:?} — {:.1} МиБ {}",
+            bytes as f64 / 1024.0 / 1024.0,
+            match host.backend() {
+                HostBackend::Pinned => "pinned",
+                HostBackend::Managed => "managed",
+            }
         );
         Ok(Self {
             dtype,
