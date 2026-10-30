@@ -6031,12 +6031,25 @@ impl HybridBlock {
                 attn.forward_attn_prefill_paged(&normed, ctx, rope_pos_dev, false)?
             }
         };
-        let x = (layer_out + residual)?;
-
-        let residual = &x;
-        let normed = self.ffn_norm.forward(&x)?;
+        // Пара «add + rmsnorm» одним ядром: на префил-чанк это 36 запусков
+        // меньше и на один проход по активациям (2 × T × n_embd × 4 байта)
+        // меньше на слой. Тот же фьюжн уже работает в декодном forward();
+        // здесь его не было, хотя путь тот же — CUDA + F32.
+        let (x, normed) = match try_add_rmsnorm(
+            &layer_out,
+            residual,
+            self.ffn_norm.weight(),
+            self.ffn_norm.eps(),
+        ) {
+            Some(pair) => pair,
+            None => {
+                let x = (layer_out + residual)?;
+                let normed = self.ffn_norm.forward(&x)?;
+                (x, normed)
+            }
+        };
         let ffn_out = self.ff.forward_prefill(&normed)?;
-        Ok((ffn_out + residual)?)
+        Ok((ffn_out + &x)?)
     }
 
     /// Проверка спекуляции на страничном пути: k строк ОДНОГО слота, capture-safe.
