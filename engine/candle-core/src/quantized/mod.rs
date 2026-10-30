@@ -1280,6 +1280,31 @@ impl QMatMul {
         xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
     }
 
+    /// F16-вход отдаёт F16-выход: без обратной конверсии.
+    ///
+    /// `forward_via_f16` и `TensorF16::forward` всегда возвращают dtype входа.
+    /// В FFN с F16-кэшем весов вход F32, поэтому на слой уходило 6 конверсий
+    /// (`f32->f16` перед каждым из трёх GEMM и `f16->f32` после), а Silu
+    /// считалась в F32 отдельным медленным ядром. Здесь вход остаётся F16
+    /// от первого GEMM до SwiGLU; обратное приведение делает только
+    /// вызывающий, один раз на слой.
+    pub fn forward_f16_in_out(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::TensorF16(w) => {
+                let w = match *xs.dims() {
+                    [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+                    [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+                    _ => w.t()?,
+                };
+                xs.to_dtype(DType::F16)?.matmul(&w)
+            }
+            _ => {
+                let out = crate::Module::forward(self, xs)?;
+                out.to_dtype(DType::F16)
+            }
+        }
+    }
+
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match self {
             Self::QTensor(t) => t.indexed_moe_forward(x, ids),

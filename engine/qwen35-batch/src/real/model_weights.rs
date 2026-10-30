@@ -1201,10 +1201,12 @@ impl DenseMlp {
         let (Some(w1t), Some(w3t), Some(w2t)) = (&self.f16_w1, &self.f16_w3, &self.f16_w2) else {
             return self.forward(xs);
         };
-        let w1 = w1t.forward(xs)?;
-        let w3 = w3t.forward(xs)?;
+        // Весь SwiGLU в F16: три GEMM идут без обратной конверсии на каждом
+        // шаге, а наружу отдаётся dtype входа. См. `forward_f16_in_out`.
+        let w1 = w1t.forward_f16_in_out(xs)?;
+        let w3 = w3t.forward_f16_in_out(xs)?;
         let silu_mul = w1.silu_mul_direct(&w3)?;
-        w2t.forward(&silu_mul)
+        w2t.forward_f16_in_out(&silu_mul)?.to_dtype(xs.dtype())
     }
 }
 
