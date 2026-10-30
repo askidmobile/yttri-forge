@@ -112,6 +112,7 @@ pub fn dispatch_flash_decode(
     )))
 }
 
+
 /// Graph-safe split-K decode over the paged F16 KV pool.
 ///
 /// q: `[B, n_head, hd]`; pools: `[capacity_tokens, n_kv, hd]` F16;
@@ -153,7 +154,7 @@ pub fn dispatch_flash_decode_paged(
     }
 
     let capacity_tokens = pool_blocks * page_size;
-    let splits = capacity_tokens.div_ceil(1024).clamp(8, 64) as u32;
+    let splits = (capacity_tokens / 4096).clamp(8, 64) as u32;
     let params = PagedFlashDecodeParams {
         n_head: n_head as u32,
         n_kv: n_kv as u32,
@@ -173,7 +174,7 @@ pub fn dispatch_flash_decode_paged(
     let seqlens_ptr = tensor_cuda_ptr(seqlens_k)?;
     let block_table_ptr = tensor_cuda_ptr(block_table)?;
 
-    let partials_len = b_sz * n_head * splits as usize * 4 * (2 + hd);
+    let partials_len = b_sz * n_head * splits as usize * (2 + hd);
     let mut partials = unsafe { dev.alloc::<f32>(partials_len)? };
     let mut out = unsafe { dev.alloc::<half::f16>(b_sz * n_head * hd)? };
     {

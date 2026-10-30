@@ -234,13 +234,13 @@ extern "C" __global__ void flash_decode_paged_partial(
 
     const unsigned int chunk = (kv_len + params.splits - 1) / params.splits;
     const unsigned int p0 = s * chunk;
+    float *out = partials + (((size_t)b * params.n_head + h) * params.splits + s) * (2 + hd);
     if (p0 >= kv_len) {
-        float *out = partials + ((((size_t)b * params.n_head + h) * params.splits + s) * nwarp + warp) * (2 + hd);
-        if (lane == 0) {
+        if (threadIdx.x == 0) {
             out[0] = -INFINITY;
             out[1] = 0.0f;
         }
-        for (unsigned int d = lane; d < hd; d += 32) out[2 + d] = 0.0f;
+        for (unsigned int d = threadIdx.x; d < hd; d += blockDim.x) out[2 + d] = 0.0f;
         return;
     }
     const unsigned int p1 = min(p0 + chunk, kv_len);
@@ -286,15 +286,43 @@ extern "C" __global__ void flash_decode_paged_partial(
         }
     }
 
-    float *out = partials + ((((size_t)b * params.n_head + h) * params.splits + s) * nwarp + warp) * (2 + hd);
+    __shared__ float warp_partial[4][2 + 256];
     if (lane == 0) {
-        out[0] = l_l > 0.0f ? m_l : -INFINITY;
-        out[1] = l_l;
+        warp_partial[warp][0] = l_l > 0.0f ? m_l : -INFINITY;
+        warp_partial[warp][1] = l_l;
     }
     #pragma unroll
     for (int i = 0; i < 8; i++) {
         const unsigned int d = lane * 8 + i;
-        if (d < hd) out[2 + d] = acc[i];
+        if (d < hd) warp_partial[warp][2 + d] = acc[i];
+    }
+    __syncthreads();
+
+    __shared__ float block_max, block_sum;
+    if (threadIdx.x == 0) {
+        float m = -INFINITY;
+        for (unsigned int w = 0; w < nwarp; ++w) m = fmaxf(m, warp_partial[w][0]);
+        float l = 0.0f;
+        for (unsigned int w = 0; w < nwarp; ++w) {
+            if (warp_partial[w][1] > 0.0f) {
+                l += warp_partial[w][1] * __expf(warp_partial[w][0] - m);
+            }
+        }
+        block_max = m;
+        block_sum = l;
+        out[0] = l > 0.0f ? m : -INFINITY;
+        out[1] = l;
+    }
+    __syncthreads();
+    const float inv_l = block_sum > 0.0f ? 1.0f / block_sum : 0.0f;
+    for (unsigned int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float value = 0.0f;
+        for (unsigned int w = 0; w < nwarp; ++w) {
+            if (warp_partial[w][1] > 0.0f) {
+                value += warp_partial[w][2 + d] * __expf(warp_partial[w][0] - block_max);
+            }
+        }
+        out[2 + d] = value * inv_l;
     }
 }
 
@@ -306,7 +334,7 @@ extern "C" __global__ void flash_decode_paged_combine(
     const unsigned int h = blockIdx.x;
     const unsigned int b = blockIdx.y;
     const unsigned int hd = params.hd;
-    const unsigned int NS = params.splits * 4;
+    const unsigned int NS = params.splits;
     const size_t stride = 2 + hd;
     const float *base = partials + ((size_t)b * params.n_head + h) * NS * stride;
 

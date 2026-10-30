@@ -134,7 +134,7 @@ fn launch_decode_argmax(
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (1, 1, 1),
-                block_dim: (256, 1, 1),
+                block_dim: (1024, 1, 1),
                 shared_mem_bytes: 0,
             })
         }
@@ -3810,7 +3810,7 @@ mod tests {
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (1, 1, 1),
-                block_dim: (256, 1, 1),
+                block_dim: (1024, 1, 1),
                 shared_mem_bytes: 0,
             })
         }

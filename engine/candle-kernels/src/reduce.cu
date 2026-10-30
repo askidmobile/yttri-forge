@@ -697,8 +697,8 @@ extern "C" __global__ void yforge_argmax_f32(
     const float * __restrict__ logits,
     unsigned int * __restrict__ out,
     const unsigned int n) {
-    __shared__ float values[256];
-    __shared__ unsigned int indices[256];
+    __shared__ float values[1024];
+    __shared__ unsigned int indices[1024];
     float best = -INFINITY;
     unsigned int best_i = 0;
     for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) {

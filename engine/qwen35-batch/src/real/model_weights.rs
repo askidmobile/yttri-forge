@@ -3999,7 +3999,11 @@ impl GatedAttentionLayer {
             // F32 — иначе он не годится как эталон: сверка 2026-09-04 показала
             // расхождение CUDA↔CPU с первого attention-слоя (1.1% при 1654
             // токенах) при побитовом совпадении всех DeltaNet-слоёв.
-            let attn_dtype = if q.device().is_metal() {
+            // Experimental Turing mixed path: F16 tensor-core matmuls with an
+            // explicit F32 softmax. Off by default while greedy parity is gated.
+            let mixed_f16 = q.device().is_cuda()
+                && std::env::var("YTTRI_PREFILL_ATTN_F16").as_deref() == Ok("1");
+            let attn_dtype = if q.device().is_metal() || mixed_f16 {
                 DType::F16
             } else {
                 DType::F32
@@ -4050,8 +4054,12 @@ impl GatedAttentionLayer {
                 let mask = Tensor::from_vec(mask, (1, 1, seq_len, kv_len), attn_weights.device())?
                     .to_dtype(attn_dtype)?;
                 let attn_weights = attn_weights.broadcast_add(&mask)?;
-                let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-                attn_weights.matmul(&v)?
+                let probs = if mixed_f16 {
+                    candle_nn::ops::softmax_last_dim(&attn_weights.to_dtype(DType::F32)?)?
+                } else {
+                    candle_nn::ops::softmax_last_dim(&attn_weights)?
+                };
+                probs.to_dtype(attn_dtype)?.matmul(&v)?
             } else {
                 // Длинный prefill — chunked path. После каждого chunk вызываем
                 // flush_buffers() чтобы Metal освободил intermediate scores+softmax
@@ -4083,8 +4091,12 @@ impl GatedAttentionLayer {
                         .to_dtype(attn_dtype)?;
                     let scores = scores.broadcast_add(&mask)?;
 
-                    let attn_w = candle_nn::ops::softmax_last_dim(&scores)?;
-                    let out_chunk = attn_w.matmul(&v)?.contiguous()?;
+                    let attn_w = if mixed_f16 {
+                        candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?
+                    } else {
+                        candle_nn::ops::softmax_last_dim(&scores)?
+                    };
+                    let out_chunk = attn_w.to_dtype(attn_dtype)?.matmul(&v)?.contiguous()?;
                     chunk_outputs.push(out_chunk);
 
                     // scores и attn_w большие — Drop сразу через scope.
@@ -4486,6 +4498,7 @@ impl GatedAttentionLayer {
         // token is one row. This removes ~15 layout/norm/RoPE launches per
         // attention layer and keeps Q, K, V, and gate in persistent buffers.
         let fused_prep = crate::real::attn_prepare_cuda::enabled()
+            && !cfg!(feature = "turing")
             && !per_row_gqa
             && trie_ranges.is_none()
             && kv_exact_f16()
@@ -4698,12 +4711,30 @@ impl GatedAttentionLayer {
         let verify_onepass = per_row_gqa
             && seq_len > 1
             && std::env::var("VERIFY_ONEPASS").ok().as_deref() == Some("1");
+        // Turing has no FA2 build. The existing split-K kernel supports
+        // per-row causal lengths through seqlens_k, exactly like MTP verify.
+        #[cfg(feature = "turing")]
+        let turing_prefill = !per_row_gqa && trie_ranges.is_none();
         if trie_ranges.is_some() {
             eprintln!(
                 "[mtp-tree] attn branch seq_len={seq_len} per_row={per_row_gqa} fused={verify_fused} onepass={verify_onepass}"
             );
         }
-        if per_row_gqa && !verify_fused && !verify_onepass {
+        #[cfg(feature = "turing")]
+        if turing_prefill {
+            let seqlens_k = ctx.seqlens_k_for_verify(seq_len)?;
+            let block_table = block_table.broadcast_as((seq_len, ctx.max_blocks))?.contiguous()?;
+            let row_out = crate::real::flash_decode_cuda::dispatch_flash_decode_paged(
+                q_f16.device().as_cuda_device()?,
+                &q_f16,
+                &pool.k_pool,
+                &pool.v_pool,
+                &seqlens_k,
+                &block_table,
+                scale,
+            )?;
+            out.slice_set(&row_out.reshape(out.shape())?, 0, 0)?;
+        } else if per_row_gqa && !verify_fused && !verify_onepass {
             // Построчно: строка i — декодный вызов (seqlen_q = 1, маска noop),
             // ключи 0..kv0+i задаются через seqlens_k = kv0+i+1. Строки уже
             // дописаны в пул выше, kv_len_dev ещё не инкрементирован.
@@ -6264,7 +6295,110 @@ pub struct ModelWeights {
     pub(crate) gprof_block_events: Option<Vec<cudarc::driver::sys::CUevent>>,
 }
 
+#[cfg(feature = "cuda")]
+fn turing_prefill_cache_weight(q: &QMatMul) -> Result<QMatMul> {
+    q.dequantize_f16().map(QMatMul::TensorF16)
+}
+
+#[cfg(feature = "cuda")]
+fn turing_prefill_cache_bytes(q: &QMatMul) -> Option<u64> {
+    let QMatMul::QTensor(t) = q else {
+        return None;
+    };
+    Some((t.shape().elem_count() * std::mem::size_of::<half::f16>()) as u64)
+}
+
 impl ModelWeights {
+    /// CUDA Turing prefill-only F16 copies for DeltaNet input projections.
+    #[cfg(feature = "cuda")]
+    pub fn attach_turing_f16_delta_cache(&mut self, max_mib: u64, include_out: bool) -> Result<()> {
+        if max_mib == 0 {
+            return Ok(());
+        }
+        let budget = max_mib.saturating_mul(1024 * 1024);
+        let mut used = 0u64;
+        let mut cached_layers = 0usize;
+        let mut cached_out = 0usize;
+        for block in &mut self.blocks {
+            let HybridLayerType::DeltaNet(delta) = &mut block.layer else {
+                continue;
+            };
+            if delta.f16_wqkv.is_some() || delta.f16_wgate.is_some() {
+                continue;
+            }
+            let mut bytes = [&delta.wqkv, &delta.wgate, &delta.w_beta, &delta.w_alpha]
+                .into_iter()
+                .filter_map(turing_prefill_cache_bytes)
+                .sum::<u64>();
+            if include_out && delta.f16_ssm_out.is_none() {
+                bytes = bytes.saturating_add(
+                    turing_prefill_cache_bytes(&delta.ssm_out).unwrap_or(0),
+                );
+            }
+            if bytes == 0 || used.saturating_add(bytes) > budget {
+                continue;
+            }
+            delta.f16_wqkv = Some(turing_prefill_cache_weight(&delta.wqkv)?);
+            delta.f16_wgate = Some(turing_prefill_cache_weight(&delta.wgate)?);
+            delta.f16_w_beta = Some(turing_prefill_cache_weight(&delta.w_beta)?);
+            delta.f16_w_alpha = Some(turing_prefill_cache_weight(&delta.w_alpha)?);
+            if include_out && delta.f16_ssm_out.is_none() {
+                delta.f16_ssm_out = Some(turing_prefill_cache_weight(&delta.ssm_out)?);
+                cached_out += 1;
+            }
+            used = used.saturating_add(bytes);
+            cached_layers += 1;
+        }
+        eprintln!(
+            "[f16-cache] delta layers={cached_layers} ssm_out={cached_out} bytes={:.0}MiB budget={max_mib}MiB",
+            used as f64 / 1048576.0
+        );
+        Ok(())
+    }
+
+    /// CUDA Turing prefill-only F16 copies for dense SwiGLU layers.
+    #[cfg(feature = "cuda")]
+    pub fn attach_turing_f16_mlp_cache(&mut self, max_mib: u64) -> Result<()> {
+        if max_mib == 0 {
+            return Ok(());
+        }
+        let max_layers = std::env::var("YTTRI_F16_MLP_LAYERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        let budget = max_mib.saturating_mul(1024 * 1024);
+        let mut used = 0u64;
+        let mut cached_layers = 0usize;
+        for block in &mut self.blocks {
+            if cached_layers >= max_layers {
+                break;
+            }
+            let FeedForward::Dense(mlp) = &mut block.ff else {
+                continue;
+            };
+            if mlp.f16_w1.is_some() || mlp.f16_w2.is_some() || mlp.f16_w3.is_some() {
+                continue;
+            }
+            let bytes = [&mlp.feed_forward_w1, &mlp.feed_forward_w2, &mlp.feed_forward_w3]
+                .into_iter()
+                .filter_map(turing_prefill_cache_bytes)
+                .sum::<u64>();
+            if bytes == 0 || used.saturating_add(bytes) > budget {
+                continue;
+            }
+            mlp.f16_w1 = Some(turing_prefill_cache_weight(&mlp.feed_forward_w1)?);
+            mlp.f16_w2 = Some(turing_prefill_cache_weight(&mlp.feed_forward_w2)?);
+            mlp.f16_w3 = Some(turing_prefill_cache_weight(&mlp.feed_forward_w3)?);
+            used += bytes;
+            cached_layers += 1;
+        }
+        eprintln!(
+            "[f16-cache] dense MLP layers={cached_layers} bytes={:.0}MiB budget={max_mib}MiB",
+            used as f64 / 1048576.0
+        );
+        Ok(())
+    }
+
     /// Рантайм выгрузки (Some — эксперты в RAM, FR-001).
     #[cfg(feature = "cuda")]
     pub fn moe_runtime(&self) -> Option<&Arc<super::expert_store::MoeRuntime>> {

@@ -1916,7 +1916,16 @@ impl QCudaStorage {
                 // включается MMQ_SMALL_TILE=1 (замер: хвост 24 токена).
                 let small_batch = m_total <= 64
                     && std::env::var("MMQ_SMALL_TILE").map(|v| v != "0").unwrap_or(true);
-                let order: [usize; 3] = if small_batch { [32, 64, x_cap] } else { [x_cap, 64, 32] };
+                // Narrow output matrices do not fill x128: on Ornith attention
+                // V [1024,4096] x64 measures 25.8 vs 16.8 TFLOPS for x128.
+                let narrow_n = n <= 2048 && x_cap >= 64;
+                let order: [usize; 3] = if small_batch {
+                    [32, 64, x_cap]
+                } else if narrow_n {
+                    [64, x_cap, 32]
+                } else {
+                    [x_cap, 64, 32]
+                };
                 order
                     .into_iter()
                     .filter(|x| *x <= x_cap)
