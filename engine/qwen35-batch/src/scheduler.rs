@@ -65,10 +65,18 @@ impl SchedulerStats {
 /// Размер чанка prefill. usize::MAX = весь prompt одним forward (прототип).
 /// Ограничение обязательно для длинных промптов: цельный prefill на N токенов
 /// создаёт attention scores N×N×F32×heads (5.6K → ~2 GB transient → CUDA OOM
-/// на 12 GB карте). 512 → scores 512×kv_len, десятки MB.
+/// на 12 GB карте). 2048 → scores 2048×kv_len, сотни MB.
 /// Interleaving с decode других слотов безопасен: prefill копит single-slot
 /// state, decode работает по batched buffers — пересечений нет.
-pub const PREFILL_CHUNK: usize = 512;
+///
+/// Почему на Turing 2048, а не 512: рост чанка сокращает число переходов
+/// «хост ↔ GPU» на промпт, а вместе с ними и простои. Замер на RTX 2080 Ti
+/// (Ornith-1.5-9B Q4_K_M), tok/s при 512/1024/2048/4096: 2198 / 2211 /
+/// 2219 / 2208. За 2048 начинают расти транзиенты attention и время падает.
+///
+/// На остальных профилях остаётся 512: там чанк ограничен памятью под scores,
+/// а не простоями (27B на 12 ГБ — 2048×kv_len в F32 туда не влезает).
+pub const PREFILL_CHUNK: usize = if cfg!(feature = "turing") { 2048 } else { 512 };
 
 /// Размер чанка prefill с учётом env PREFILL_CHUNK (0/большое = целиком).
 #[inline]

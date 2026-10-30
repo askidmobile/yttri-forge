@@ -5951,7 +5951,10 @@ impl HybridBlock {
         if trace {
             let mix_ms = t_mix_el.as_secs_f64() * 1000.0;
             let ffn_ms = t_ffn.elapsed().as_secs_f64() * 1000.0;
-            if mix_ms + ffn_ms > 50.0 {
+            // PFB_ALL=1 — печатать каждый блок (диагностика распределения
+            // времени по стадиям, иначе выводятся только «медленные» > 50 мс).
+            let pfb_all = std::env::var("PFB_ALL").as_deref() == Ok("1");
+            if pfb_all || mix_ms + ffn_ms > 50.0 {
                 eprintln!("[pfb] mix={mix_ms:.1}ms ffn={ffn_ms:.1}ms");
             }
         }
