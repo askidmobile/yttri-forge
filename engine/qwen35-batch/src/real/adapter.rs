@@ -899,6 +899,36 @@ impl Qwen35BatchAdapter {
                 .attach_ytf16(gguf_path, &a.device)
                 .map_err(|e| anyhow!("attach_ytf16: {e}"))?;
         }
+        // Префил-кэши F16 для Turing: Q4_K MMQ на sm75 упирается в 33 TFLOPS,
+        // а F16-копия весов убирает деквант на каждом чанке. Бюджеты — из env,
+        // потому что они конкурируют с KV-пулом за VRAM.
+        #[cfg(feature = "cuda")]
+        if let Some(max_mib) = std::env::var("YTTRI_F16_MLP_CACHE_MIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            a.model
+                .attach_turing_f16_mlp_cache(max_mib)
+                .map_err(|e| anyhow!("attach_turing_f16_mlp_cache: {e}"))?;
+            if let Device::Cuda(c) = &a.device {
+                let _ = c.cuda_stream().synchronize();
+                let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+            }
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(max_mib) = std::env::var("YTTRI_F16_DELTA_CACHE_MIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            let include_out = std::env::var("YTTRI_F16_DELTA_OUT").as_deref() == Ok("1");
+            a.model
+                .attach_turing_f16_delta_cache(max_mib, include_out)
+                .map_err(|e| anyhow!("attach_turing_f16_delta_cache: {e}"))?;
+            if let Device::Cuda(c) = &a.device {
+                let _ = c.cuda_stream().synchronize();
+                let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+            }
+        }
         // Q8_0-квантование сайдкара идёт через F16-тензор на GPU: после
         // сжатия его страницы остаются в driver pool (~1.2 ГиБ на 4B).
         // Trim возвращает их ОС — иначе экономия VRAM съедается слаком.
