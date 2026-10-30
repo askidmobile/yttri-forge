@@ -4569,40 +4569,72 @@ impl GatedAttentionLayer {
             )?;
 
             let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
-            let window = ctx.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE;
             let block_table = ctx.block_table(b_sz)?;
-            let out = Tensor::zeros(q_f16.shape(), DType::F16, q_f16.device())?;
-            let seqlens_q = ctx.seqlens_q_prefill();
-            let seqlens_k = ctx.seqlens_k(b_sz)?;
-            let lse = Tensor::zeros((self.n_head, seq_len), DType::F32, q_f16.device())?;
-            crate::real::paged_attn::PagedAttn {
-                q: &q_f16,
-                k_pool: &pool.k_pool,
-                v_pool: &pool.v_pool,
-                kv_scales: match (&pool.k_scale, &pool.v_scale) {
-                    (Some(ks), Some(vs)) => Some((ks, vs)),
-                    _ => None,
-                },
-                seqlens_q: &seqlens_q,
-                seqlens_k: &seqlens_k,
-                block_table: &block_table,
-                out: &out,
-                softmax_lse: &lse,
-                b: b_sz,
-                h: self.n_head,
-                h_k: self.n_kv_head,
-                d: self.head_dim,
-                max_seqlen_q: seq_len,
-                max_seqlen_k: window,
-                softmax_scale: scale,
-                window_left: -1,
-                window_right: 0,
-                page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
-                shared_block_table: false,
-                rows_per_position: 0,
-                trie_ranges: None,
-            }
-            .forward()?;
+            #[cfg(feature = "turing")]
+            let out = {
+                // FA2 в cuda-turing сборке отсутствует (turing-stub паникует).
+                // Пер-строчный split-KV decode: строка i видит префикс
+                // kv0+i+1 — та же механика, что в turing-ветке ниже и в
+                // MTP verify. Требует seq_len <= MAX_VERIFY_ROWS, поэтому
+                // PREFILL_CHUNK на Turing не должен превышать 512.
+                if seq_len > crate::real::paged_kv_cuda::MAX_VERIFY_ROWS {
+                    candle_core::bail!(
+                        "turing prefill: seq_len {seq_len} > MAX_VERIFY_ROWS {} — \
+                         уменьшите PREFILL_CHUNK до 512",
+                        crate::real::paged_kv_cuda::MAX_VERIFY_ROWS
+                    );
+                }
+                let seqlens_k = ctx.seqlens_k_for_verify(seq_len)?;
+                let bt = block_table
+                    .broadcast_as((seq_len, ctx.max_blocks))?
+                    .contiguous()?;
+                crate::real::flash_decode_cuda::dispatch_flash_decode_paged(
+                    q_f16.device().as_cuda_device()?,
+                    &q_f16,
+                    &pool.k_pool,
+                    &pool.v_pool,
+                    &seqlens_k,
+                    &bt,
+                    scale,
+                )?
+            };
+            #[cfg(not(feature = "turing"))]
+            let out = {
+                let window = ctx.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE;
+                let out = Tensor::zeros(q_f16.shape(), DType::F16, q_f16.device())?;
+                let seqlens_q = ctx.seqlens_q_prefill();
+                let seqlens_k = ctx.seqlens_k(b_sz)?;
+                let lse = Tensor::zeros((self.n_head, seq_len), DType::F32, q_f16.device())?;
+                crate::real::paged_attn::PagedAttn {
+                    q: &q_f16,
+                    k_pool: &pool.k_pool,
+                    v_pool: &pool.v_pool,
+                    kv_scales: match (&pool.k_scale, &pool.v_scale) {
+                        (Some(ks), Some(vs)) => Some((ks, vs)),
+                        _ => None,
+                    },
+                    seqlens_q: &seqlens_q,
+                    seqlens_k: &seqlens_k,
+                    block_table: &block_table,
+                    out: &out,
+                    softmax_lse: &lse,
+                    b: b_sz,
+                    h: self.n_head,
+                    h_k: self.n_kv_head,
+                    d: self.head_dim,
+                    max_seqlen_q: seq_len,
+                    max_seqlen_k: window,
+                    softmax_scale: scale,
+                    window_left: -1,
+                    window_right: 0,
+                    page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+                    shared_block_table: false,
+                    rows_per_position: 0,
+                    trie_ranges: None,
+                }
+                .forward()?;
+                out
+            };
 
             let y = out
                 .to_dtype(DType::F32)?

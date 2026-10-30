@@ -8,7 +8,7 @@ use candle_core::{CudaDevice, DType, Device, Result, Tensor};
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 pub const PAGE_SIZE: usize = 64;
-const MAX_VERIFY_ROWS: usize = 512;
+pub(crate) const MAX_VERIFY_ROWS: usize = 512;
 
 /// Разделяемый контекст paged decode на уровне модели (общий для attention слоёв).
 ///
