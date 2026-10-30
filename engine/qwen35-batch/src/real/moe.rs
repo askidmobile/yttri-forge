@@ -942,6 +942,7 @@ fn gpu_softmax_topk(
 
 /// `force_warp`: None — по env ROUTER_WARP, Some(b) — принудительно.
 /// Разделение нужно регресс-тесту: менять env в параллельных тестах нельзя.
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn gpu_softmax_topk_sel(
     dev: &candle_core::CudaDevice,

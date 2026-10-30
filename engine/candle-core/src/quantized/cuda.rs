@@ -1,4 +1,4 @@
-use super::{GgmlDType, QStorage};
+use super::{GgmlDType, MmqQ8Activation, MmqQ8Layout, QStorage};
 use crate::quantized::k_quants::GgmlType;
 use crate::{backend::BackendDevice, cuda_backend::WrapErr};
 use crate::{builder_arg as barg, CudaDevice, CudaStorage, Result};
@@ -59,6 +59,16 @@ pub fn set_force_dmmv(f: bool) {
 /// путь и обязаны вернуть прежний, а не жёстко выключить.
 pub fn force_dmmv() -> bool {
     FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || force_dmmv_env()
+}
+
+fn use_turing_q4k_mmvq(dev: &CudaDevice, dtype: GgmlDType, b_size: usize) -> bool {
+    b_size == 1
+        && dtype == GgmlDType::Q4K
+        && std::env::var("YTTRI_MMVQ_TURING").as_deref() != Ok("0")
+        && dev
+            .context
+            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .is_ok_and(|cc| cc < 8)
 }
 
 // Per-device Q8_1 scratch cache: 2 слота на размер, чтобы избежать self-deadlock
@@ -620,6 +630,58 @@ fn dequantize_mul_mat_vec(
 }
 
 impl QCudaStorage {
+    pub fn mmq_layout(dtype: GgmlDType) -> Option<MmqQ8Layout> {
+        match dtype {
+            GgmlDType::Q2K => Some(MmqQ8Layout::D2s6),
+            GgmlDType::Q3K
+            | GgmlDType::Q6K
+            | GgmlDType::Q4_0
+            | GgmlDType::Q8_0
+            | GgmlDType::IQ2XXS
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ4XS => Some(MmqQ8Layout::D4),
+            GgmlDType::Q4K | GgmlDType::Q5K => Some(MmqQ8Layout::Ds4),
+            _ => None,
+        }
+    }
+
+    pub fn prequantize_mmq_q8_1(
+        dev: &CudaDevice,
+        rhs: &CudaView<f32>,
+        k: usize,
+        m_total: usize,
+        layout: MmqQ8Layout,
+    ) -> Result<CudaSlice<u8>> {
+        let k_padded = pad(k, MATRIX_ROW_PADDING);
+        let blocks_per_row = k_padded / 128;
+        let bytes = m_total * blocks_per_row * 144;
+        let dst = unsafe { dev.alloc::<u8>(bytes)? };
+        let kernel = match layout {
+            MmqQ8Layout::D4 => "candle_mmq_quant_d4",
+            MmqQ8Layout::Ds4 => "candle_mmq_quant_ds4",
+            MmqQ8Layout::D2s6 => "candle_mmq_quant_d2s6",
+        };
+        let func = dev.get_or_load_func(kernel, &candle_kernels::CANDLE_MMQ_DENSE)?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (m_total as u32, ceil_div(k_padded, 512) as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(rhs);
+        builder.arg(&dst);
+        barg!(
+            builder,
+            /* ne00 */ k as i64,
+            /* s01 */ k as i64,
+            /* ne0 */ k_padded as i64,
+            /* ne1 */ m_total as i32
+        );
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(dst)
+    }
+
     /// Batch-vector matmul using pre-quantized Q8_1 activations.
     /// `y_q8_1` is the pre-quantized [b_size, k_padded] buffer.
     pub fn mul_mat_vec_with_prequant_q8_1(
@@ -662,14 +724,23 @@ impl QCudaStorage {
             GgmlDType::IQ4XS => "mul_mat_vec_iq4_xs_q8_1_cuda",
             _ => crate::bail!("unsupported dtype for quantized matmul {:?}", self.dtype),
         };
-        let kernel_name = format!("{kernel_name}{b_size}");
+        let turing = use_turing_q4k_mmvq(dev, self.dtype, b_size);
+        let kernel_name = if turing {
+            format!("{kernel_name}{b_size}_t2")
+        } else {
+            format!("{kernel_name}{b_size}")
+        };
         let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
         let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
-        let (nblocks, nwarps) = match b_size {
-            1 => (nrows as u32, 4),
-            2..=4 => ((nrows as u32).div_ceil(2), 4),
-            5..=8 => ((nrows as u32).div_ceil(2), 2),
-            _ => crate::bail!("unexpected bsize {b_size}"),
+        let (nblocks, nwarps) = if turing {
+            (nrows as u32, 2)
+        } else {
+            match b_size {
+                1 => (nrows as u32, 4),
+                2..=4 => ((nrows as u32).div_ceil(2), 4),
+                5..=8 => ((nrows as u32).div_ceil(2), 2),
+                _ => crate::bail!("unexpected bsize {b_size}"),
+            }
         };
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: (nblocks, 1, 1),
@@ -774,7 +845,10 @@ fn mul_mat_vec_via_q8_1(
             GgmlDType::Q6K => hoisted_mode.as_deref() == Ok("all"),
             _ => false,
         };
-    let kernel_name = if use_hoisted {
+    let turing = use_turing_q4k_mmvq(dev, dtype, b_size);
+    let kernel_name = if turing {
+        format!("{kernel_name}{b_size}_t2")
+    } else if use_hoisted {
         format!("{kernel_name}{b_size}_hoisted")
     } else {
         format!("{kernel_name}{b_size}")
@@ -782,11 +856,15 @@ fn mul_mat_vec_via_q8_1(
     let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
     let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
     // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98
-    let (nblocks, nwarps) = match b_size {
-        1 => (nrows as u32, 4),
-        2..=4 => ((nrows as u32).div_ceil(2), 4),
-        5..=8 => ((nrows as u32).div_ceil(2), 2),
-        _ => crate::bail!("unexpected bsize {b_size}"),
+    let (nblocks, nwarps) = if turing {
+        (nrows as u32, 2)
+    } else {
+        match b_size {
+            1 => (nrows as u32, 4),
+            2..=4 => ((nrows as u32).div_ceil(2), 4),
+            5..=8 => ((nrows as u32).div_ceil(2), 2),
+            _ => crate::bail!("unexpected bsize {b_size}"),
+        }
     };
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (nblocks, 1, 1),
@@ -1726,9 +1804,10 @@ impl QCudaStorage {
         self_shape: &crate::Shape,
         storage: &CudaStorage,
         layout: &crate::Layout,
+        prequant: Option<&MmqQ8Activation>,
     ) -> Result<Option<(CudaStorage, crate::Shape)>> {
         // dtype → (тэг ядра, mma tile_x_k, quant-обёртка)
-        let (tag, tile_x_k, quant_kernel): (&str, usize, &str) = match self.dtype {
+        let (tag, tile_x_k, _): (&str, usize, &str) = match self.dtype {
             GgmlDType::Q2K => ("q2_k", 100, "candle_mmq_quant_d2s6"),
             GgmlDType::Q3K => ("q3_k", 84, "candle_mmq_quant_d4"),
             GgmlDType::Q4K => ("q4_k", 76, "candle_mmq_quant_ds4"),
@@ -1772,6 +1851,12 @@ impl QCudaStorage {
             Some((o1, o2)) => rhs.slice(o1..o2),
             None => return Ok(None),
         };
+        let expected_layout = Self::mmq_layout(self.dtype);
+        let prequant = prequant.filter(|p| {
+            Some(p.layout) == expected_layout
+                && p.ncols == k
+                && p.b_size == m_total
+        });
 
         // dp4a-ветка (см. candle_mmq_dp4a.cu): инстансы собраны только для
         // типов ниже — ровно те, что есть в таблице dtype выше.
@@ -1831,7 +1916,16 @@ impl QCudaStorage {
                 // включается MMQ_SMALL_TILE=1 (замер: хвост 24 токена).
                 let small_batch = m_total <= 64
                     && std::env::var("MMQ_SMALL_TILE").map(|v| v != "0").unwrap_or(true);
-                let order: [usize; 3] = if small_batch { [32, 64, x_cap] } else { [x_cap, 64, 32] };
+                // Narrow output matrices do not fill x128: on Ornith attention
+                // V [1024,4096] x64 measures 25.8 vs 16.8 TFLOPS for x128.
+                let narrow_n = n <= 2048 && x_cap >= 64;
+                let order: [usize; 3] = if small_batch {
+                    [32, 64, x_cap]
+                } else if narrow_n {
+                    [64, x_cap, 32]
+                } else {
+                    [x_cap, 64, 32]
+                };
                 order
                     .into_iter()
                     .filter(|x| *x <= x_cap)
@@ -1840,30 +1934,23 @@ impl QCudaStorage {
             });
         let nbs = nbs_for(mmq_x);
 
-        // 1) Квантизация активаций в q8_1_mmq.
-        let k_padded = pad(k, MATRIX_ROW_PADDING);
-        let blocks_per_row = k_padded / 128; // block_q8_1_mmq держит 4*QK8_1 = 128 значений
-        let y_bytes = m_total * blocks_per_row * BLOCK_Q8_1_MMQ;
-        let y_mmq = unsafe { dev.alloc::<u8>(y_bytes)? };
-        let qfunc = dev.get_or_load_func(quant_kernel, &candle_kernels::CANDLE_MMQ_DENSE)?;
-        let qcfg = cudarc::driver::LaunchConfig {
-            grid_dim: (m_total as u32, ceil_div(k_padded, 512) as u32, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
+        // 1) Квантизация активаций в q8_1_mmq. Несколько проекций одного
+        // слоя читают один и тот же prequant-буфер.
+        let owned_y_mmq;
+        let y_mmq: &CudaSlice<u8> = match prequant {
+            Some(p) => &p.slice,
+            None => {
+                let dst = Self::prequantize_mmq_q8_1(
+                    dev,
+                    &rhs,
+                    k,
+                    m_total,
+                    expected_layout.expect("MMQ dtype has a layout"),
+                )?;
+                owned_y_mmq = dst;
+                &owned_y_mmq
+            }
         };
-        {
-            let mut qb = qfunc.builder();
-            qb.arg(&rhs);
-            qb.arg(&y_mmq);
-            barg!(
-                qb,
-                /* ne00 */ k as i64,
-                /* s01  */ k as i64,
-                /* ne0  */ k_padded as i64,
-                /* ne1  */ m_total as i32
-            );
-            unsafe { qb.launch(qcfg) }.w()?;
-        }
 
         // 2) MMQ Tensor-Core GEMM: dst = weight[n,k] @ act[k,m] → [m,n].
         // stride_row_x в блоках кванта (block_size = qk: 256 для K-quants, 32 для legacy).
@@ -1949,7 +2036,7 @@ impl QCudaStorage {
         {
             let mut mb = func.builder();
             mb.arg(&self.data.inner);
-            mb.arg(&y_mmq);
+            mb.arg(y_mmq);
             mb.arg(&dst);
             if let Some(tf) = tmp_fixup.as_ref() {
                 mb.arg(tf);
@@ -2159,8 +2246,20 @@ impl QCudaStorage {
         );
         // Кэшированная полная деквантизация (A100 80GB): один matmul по кэшу
         // вместо tiled dequant каждый вызов.
-        if is_iq
-            && dequant_cache_enabled()
+        //
+        // Мелкие матрицы (n <= 64) кэшируем всегда, если включён DEQUANT_CACHE
+        // либо это предзаполнение (YTTRI_SMALL_DEQUANT_CACHE=1): на Ornith-9B
+        // w_beta/w_alpha имеют n=32, их f32-копии занимают ~25 МБ на всю
+        // модель. Без кэша каждый чанк заново деквантизирует их 48 раз —
+        // замер на sm75: 47 мс из 255 м (18% forward).
+        // Включено по умолчанию для мелких матриц: на Ornith-9B w_beta/w_alpha
+        // (n=32) без кэша деквантизируются 48 раз на чанк, что стоило 47ms из
+        // 255ms fwd (замер на sm75). Кэш занимает ~25 MiB на всю модель.
+        // Откат: YTTRI_SMALL_DEQUANT_CACHE=0.
+        let small_dequant_cache = n <= 64
+            && (dequant_cache_enabled()
+                || std::env::var("YTTRI_SMALL_DEQUANT_CACHE").as_deref() != Ok("0"));
+        if (is_iq && dequant_cache_enabled() || small_dequant_cache)
             && !force_dmmv()
         {
             let w = self.cached_dequant_f32(n * k)?;

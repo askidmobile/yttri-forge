@@ -1280,6 +1280,31 @@ impl QMatMul {
         xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
     }
 
+    /// F16-вход отдаёт F16-выход: без обратной конверсии.
+    ///
+    /// `forward_via_f16` и `TensorF16::forward` всегда возвращают dtype входа.
+    /// В FFN с F16-кэшем весов вход F32, поэтому на слой уходило 6 конверсий
+    /// (`f32->f16` перед каждым из трёх GEMM и `f16->f32` после), а Silu
+    /// считалась в F32 отдельным медленным ядром. Здесь вход остаётся F16
+    /// от первого GEMM до SwiGLU; обратное приведение делает только
+    /// вызывающий, один раз на слой.
+    pub fn forward_f16_in_out(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::TensorF16(w) => {
+                let w = match *xs.dims() {
+                    [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+                    [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+                    _ => w.t()?,
+                };
+                xs.to_dtype(DType::F16)?.matmul(&w)
+            }
+            _ => {
+                let out = crate::Module::forward(self, xs)?;
+                out.to_dtype(DType::F16)
+            }
+        }
+    }
+
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match self {
             Self::QTensor(t) => t.indexed_moe_forward(x, ids),
@@ -1310,6 +1335,22 @@ pub enum Q8_1Activation {
         ncols: usize,
         b_size: usize,
     },
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmqQ8Layout {
+    D4,
+    Ds4,
+    D2s6,
+}
+
+#[cfg(feature = "cuda")]
+pub struct MmqQ8Activation {
+    pub(crate) slice: crate::cuda_backend::cudarc::driver::CudaSlice<u8>,
+    pub(crate) ncols: usize,
+    pub(crate) b_size: usize,
+    pub(crate) layout: MmqQ8Layout,
 }
 
 impl QTensor {
@@ -1394,6 +1435,77 @@ impl QTensor {
                                 ));
                             }
                         }
+                    }
+                }
+            }
+        }
+        x.apply_op1_no_bwd(self)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn prequantize_mmq_q8_1(&self, x: &Tensor) -> Result<Option<MmqQ8Activation>> {
+        let QStorage::Cuda(_) = &self.storage else {
+            return Ok(None);
+        };
+        let Some(layout) = cuda::QCudaStorage::mmq_layout(self.dtype()) else {
+            return Ok(None);
+        };
+        let (b_size, k) = match x.dims() {
+            [b, m, k] => (b * m, *k),
+            [b, k] => (*b, *k),
+            _ => return Ok(None),
+        };
+        let (_, self_k) = self.shape.dims2()?;
+        if b_size < 9 || k != self_k {
+            return Ok(None);
+        }
+        let (x_storage, x_layout) = x.storage_and_layout();
+        if !x_layout.is_contiguous() {
+            return Ok(None);
+        }
+        let Storage::Cuda(c) = &*x_storage else {
+            return Ok(None);
+        };
+        let slice = c.as_cuda_slice::<f32>()?;
+        let view = slice.slice(x_layout.start_offset()..x_layout.start_offset() + b_size * k);
+        let quantized = cuda::QCudaStorage::prequantize_mmq_q8_1(
+            c.device(),
+            &view,
+            k,
+            b_size,
+            layout,
+        )?;
+        Ok(Some(MmqQ8Activation {
+            slice: quantized,
+            ncols: k,
+            b_size,
+            layout,
+        }))
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn forward_with_mmq_prequant(
+        &self,
+        x: &Tensor,
+        prequant: Option<&MmqQ8Activation>,
+    ) -> Result<Tensor> {
+        if !cuda::force_dmmv() {
+            if let QStorage::Cuda(storage) = &self.storage {
+                let (x_storage, x_layout) = x.storage_and_layout();
+                if let Storage::Cuda(rhs) = &*x_storage {
+                    if let Some((out, shape)) = storage.mul_mat_q_mma(
+                        &self.shape,
+                        rhs,
+                        x_layout,
+                        prequant,
+                    )? {
+                        let none = crate::op::BackpropOp::none();
+                        return Ok(crate::tensor::from_storage(
+                            Storage::Cuda(out),
+                            shape,
+                            none,
+                            false,
+                        ));
                     }
                 }
             }
@@ -1528,6 +1640,32 @@ impl QMatMul {
         match self {
             Self::QTensor(t) => t.device(),
             Self::Tensor(w) | Self::TensorF16(w) => w.device().clone(),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn prequantize_mmq_q8_1(&self, xs: &Tensor) -> Result<Option<MmqQ8Activation>> {
+        match self {
+            Self::QTensor(t) => t.prequantize_mmq_q8_1(xs),
+            _ => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn forward_with_mmq_prequant(
+        &self,
+        xs: &Tensor,
+        prequant: Option<&MmqQ8Activation>,
+    ) -> Result<Tensor> {
+        use crate::Module;
+        let xs = if !xs.device().same_device(&self.device()) {
+            xs.to_device(&self.device())?
+        } else {
+            xs.clone()
+        };
+        match self {
+            Self::QTensor(t) => t.forward_with_mmq_prequant(&xs, prequant),
+            _ => self.forward(&xs),
         }
     }
 

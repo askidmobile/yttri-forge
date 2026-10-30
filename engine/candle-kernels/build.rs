@@ -26,6 +26,8 @@ fn main() -> Result<()> {
         }
     }
 
+    let compute_cap = cudaforge::detect_compute_cap()?;
+
     // Build for PTX.
     // Exclude the old reference MoE kernels under src/moe/ (they use the CUDA Runtime
     // API and are not PTX-compatible). The new device-only kernels moe_router.cu and
@@ -38,6 +40,9 @@ fn main() -> Result<()> {
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
         .arg("-O3");
+    if compute_cap.base < 80 {
+        builder = builder.arg("-DNO_BF16_KERNEL");
+    }
     #[cfg(target_os = "windows")]
     {
         builder = builder.arg("-Xcompiler").arg("/Zc:preprocessor");

@@ -502,13 +502,20 @@ pub fn dispatch_delta_rule_batched(
             && decode_mode != Some("cols")
             && decode_mode != Some("split");
         let (name, cfg) = if tile_ok {
+            // 32-column tiles give two CTAs per head and materially improve
+            // occupancy on sm_75. Keep the old 64-column tile as a fallback.
+            let (name, cols, warps) = if env_str_cached("DELTA_TILE64") == Some("1") {
+                ("delta_rule_kernel_batched_tile", 64, 32)
+            } else {
+                ("delta_rule_kernel_batched_tile32w32r1", 32, 32)
+            };
             (
-                "delta_rule_kernel_batched_tile",
+                name,
                 LaunchConfig {
-                    grid_dim: (n_v, b_u32, hvd / 64),
-                    block_dim: (32, 32, 1),
+                    grid_dim: (n_v, b_u32, hvd / cols),
+                    block_dim: (32, warps, 1),
                     // строка тайла с паддингом +1 против bank conflict
-                    shared_mem_bytes: 64 * (hvd + 1) * 4,
+                    shared_mem_bytes: cols * (hvd + 1) * 4,
                 },
             )
         } else if splitr {

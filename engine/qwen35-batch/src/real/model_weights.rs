@@ -51,6 +51,16 @@ fn prefill_flush_no_wait_enabled() -> bool {
     })
 }
 
+macro_rules! profile_debug {
+    ($($arg:tt)*) => {
+        if matches!(std::env::var("GPROF").as_deref(), Ok("2") | Ok("3")) {
+            eprintln!($($arg)*);
+        } else {
+            log::debug!($($arg)*);
+        }
+    };
+}
+
 /// T-275 Phase 4 + T-278: ENV var dispatch для Q4_K_M kernel variant selection.
 ///
 /// `YTTRI_Q4K_KERNEL=v1` → legacy `kernel_mul_mm_q4_K_f32_fast` (T-269 baseline).
@@ -409,7 +419,8 @@ macro_rules! prefill_loop_multi_cb {
         // Под трассой осушаем очередь вокруг каждого блока: иначе на ленивом
         // Metal время блока — постановка в очередь, а блок с ожиданием вбирает
         // соседей (ловушка 28.08). Трасса и так меняет тайминги.
-        let _pf_sync = crate::scheduler::trace_on();
+        let _pf_sync = crate::scheduler::trace_on()
+            || std::env::var("GPROF").as_deref() == Ok("3");
         'prefill: for (i, block) in $blocks.iter_mut().enumerate() {
             if _pf_sync {
                 let _ = $layer_in.device().synchronize();
@@ -436,7 +447,7 @@ macro_rules! prefill_loop_multi_cb {
                 }
             }
             if (i + 1) % $every == 0 {
-                if crate::scheduler::trace_on() {
+                if crate::scheduler::trace_on() || std::env::var("GPROF").as_deref() == Ok("3") {
                     eprintln!(
                         "[pf] layers {}-{}: delta {:.1}ms ({}), attn {:.1}ms ({})",
                         i + 2 - $every,
@@ -481,7 +492,8 @@ macro_rules! prefill_loop_multi_cb {
         // Под трассой осушаем очередь вокруг каждого блока: иначе на ленивом
         // Metal время блока — постановка в очередь, а блок с ожиданием вбирает
         // соседей (ловушка 28.08). Трасса и так меняет тайминги.
-        let _pf_sync = crate::scheduler::trace_on();
+        let _pf_sync = crate::scheduler::trace_on()
+            || std::env::var("GPROF").as_deref() == Ok("3");
         'prefill: for (i, block) in $blocks.iter_mut().enumerate() {
             if _pf_sync {
                 let _ = $layer_in.device().synchronize();
@@ -508,7 +520,7 @@ macro_rules! prefill_loop_multi_cb {
                 }
             }
             if (i + 1) % every_n == 0 {
-                log::info!(
+                profile_debug!(
                     "[Qwen3.5/profile] Layers {}-{}: DeltaNet {:.1}ms ({}), Attn {:.1}ms ({})",
                     i + 2 - every_n,
                     i + 1,
@@ -1189,10 +1201,12 @@ impl DenseMlp {
         let (Some(w1t), Some(w3t), Some(w2t)) = (&self.f16_w1, &self.f16_w3, &self.f16_w2) else {
             return self.forward(xs);
         };
-        let w1 = w1t.forward(xs)?;
-        let w3 = w3t.forward(xs)?;
+        // Весь SwiGLU в F16: три GEMM идут без обратной конверсии на каждом
+        // шаге, а наружу отдаётся dtype входа. См. `forward_f16_in_out`.
+        let w1 = w1t.forward_f16_in_out(xs)?;
+        let w3 = w3t.forward_f16_in_out(xs)?;
         let silu_mul = w1.silu_mul_direct(&w3)?;
-        w2t.forward(&silu_mul)
+        w2t.forward_f16_in_out(&silu_mul)?.to_dtype(xs.dtype())
     }
 }
 
@@ -1213,10 +1227,23 @@ impl Module for DenseMlp {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(xs)
+            // Квантуем активации один раз: если MMQ-путь доступен, Q8_1 для
+            // него и есть нужная раскладка, второй проход (prequantize_q8_1)
+            // не нужен и только тратит время на слой.
+            let mmq_prequant = self
+                .feed_forward_w1
+                .prequantize_mmq_q8_1(xs)
                 .ok()
                 .flatten();
-            let g2 = std::env::var("GPROF").as_deref() == Ok("2") && xs.device().is_cuda();
+            let prequant = if mmq_prequant.is_some() {
+                None
+            } else {
+                candle_core::quantized::QTensor::prequantize_q8_1(xs)
+                    .ok()
+                    .flatten()
+            };
+            let g2 = matches!(std::env::var("GPROF").as_deref(), Ok("2") | Ok("3"))
+                && xs.device().is_cuda();
             let sync = || {
                 // Гейт по feature, а не по target_os: блок снаружи закрыт
                 // `not(target_os = "macos")`, и без CUDA на Windows/Linux
@@ -1230,12 +1257,20 @@ impl Module for DenseMlp {
                 std::time::Instant::now()
             };
             let t0 = sync();
-            let w1 = self
-                .feed_forward_w1
-                .forward_with_prequant(xs, prequant.as_ref())?;
-            let w3 = self
-                .feed_forward_w3
-                .forward_with_prequant(xs, prequant.as_ref())?;
+            let w1 = if mmq_prequant.is_some() {
+                self.feed_forward_w1
+                    .forward_with_mmq_prequant(xs, mmq_prequant.as_ref())?
+            } else {
+                self.feed_forward_w1
+                    .forward_with_prequant(xs, prequant.as_ref())?
+            };
+            let w3 = if mmq_prequant.is_some() {
+                self.feed_forward_w3
+                    .forward_with_mmq_prequant(xs, mmq_prequant.as_ref())?
+            } else {
+                self.feed_forward_w3
+                    .forward_with_prequant(xs, prequant.as_ref())?
+            };
             let t13 = sync();
             let silu_mul = w1.silu_mul_direct(&w3)?;
             let ts = sync();
@@ -1251,7 +1286,7 @@ impl Module for DenseMlp {
                 S13.fetch_add(t13.duration_since(t0).as_micros() as u64, Ordering::Relaxed);
                 SS.fetch_add(ts.duration_since(t13).as_micros() as u64, Ordering::Relaxed);
                 S2.fetch_add(t2.duration_since(ts).as_micros() as u64, Ordering::Relaxed);
-                if n % 256 == 0 {
+                if n % 24 == 0 {
                     eprintln!(
                         "[ffnprof] n={n} w13_avg={:.2}ms silu_avg={:.3}ms w2_avg={:.2}ms",
                         S13.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
@@ -1876,6 +1911,19 @@ impl DeltaNetLayer {
             let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x)
                 .ok()
                 .flatten();
+            let mmq_prequant = self.wqkv.prequantize_mmq_q8_1(x).ok().flatten();
+            if mmq_prequant.is_some() {
+                return Ok((
+                    self.wqkv
+                        .forward_with_mmq_prequant(x, mmq_prequant.as_ref())?,
+                    self.wgate
+                        .forward_with_mmq_prequant(x, mmq_prequant.as_ref())?,
+                    self.w_beta
+                        .forward_with_mmq_prequant(x, mmq_prequant.as_ref())?,
+                    self.w_alpha
+                        .forward_with_mmq_prequant(x, mmq_prequant.as_ref())?,
+                ));
+            }
             return Ok((
                 self.wqkv.forward_with_prequant(x, prequant.as_ref())?,
                 self.wgate.forward_with_prequant(x, prequant.as_ref())?,
@@ -2638,6 +2686,7 @@ impl DeltaNetLayer {
                     &z_t,
                     &beta_t,
                     &alpha_t,
+                    false,
                 )?;
                 dump_sub("dn.gated", &gated_all);
                 if gprof2 {
@@ -3305,6 +3354,10 @@ pub(crate) struct GatedAttentionLayer {
     /// q [cap,n_head,hd] F16, gate [cap,n_head,hd] F32, k/v [cap,n_kv,hd] F16.
     #[cfg(feature = "cuda")]
     attn_prep_scratch: Option<crate::real::attn_prepare_cuda::AttnPrepScratch>,
+    /// Отдельные большие буферы prefill: декод продолжает работать на маленьком
+    /// рабочем наборе и не наследует локальность 512-токенного чанка.
+    #[cfg(feature = "cuda")]
+    attn_prefill_scratch: Option<crate::real::attn_prepare_cuda::AttnPrepScratch>,
     kv_cache: Option<(Tensor, Tensor)>,
     /// Текущая длина заполненного KV-cache
     kv_cache_len: usize,
@@ -3814,35 +3867,49 @@ impl GatedAttentionLayer {
                 let y = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
                 y.to_dtype(DType::F32)?
             } else {
-                // CUDA path: manual matmul attention для seq_len=1 в F32 precision.
-                // F16 дал заметный numerical drift vs SDPA (output divergence через
-                // 32 layers × 1024 decode steps). F32 совпадает с CPU SDPA путём.
-                // Performance hit minor: attention occupies ~10% от total decode time.
-                // CUDA matmul требует contiguous; q после rope/transpose может быть
-                // non-contiguous (stride [1, 1, 1, 16]).
-                let q_f32 = q.to_dtype(DType::F32)?.contiguous()?;
-                let k_f32 = k.to_dtype(DType::F32)?.contiguous()?;
-                let v_f32 = v.to_dtype(DType::F32)?.contiguous()?;
-                let kv_seq = k_f32.dim(2)?;
-                let (k_exp, v_exp) = if self.n_kv_head != self.n_head {
-                    let repeats = self.n_head / self.n_kv_head;
-                    let k = k_f32
-                        .unsqueeze(2)?
-                        .broadcast_as((b_sz, self.n_kv_head, repeats, kv_seq, self.head_dim))?
-                        .contiguous()?
-                        .reshape((b_sz, self.n_head, kv_seq, self.head_dim))?;
-                    let v = v_f32
-                        .unsqueeze(2)?
-                        .broadcast_as((b_sz, self.n_kv_head, repeats, kv_seq, self.head_dim))?
-                        .contiguous()?
-                        .reshape((b_sz, self.n_head, kv_seq, self.head_dim))?;
-                    (k, v)
-                } else {
-                    (k_f32, v_f32)
-                };
-                let scores = (q_f32.matmul(&k_exp.transpose(2, 3)?.contiguous()?)? * scale)?;
-                let attn = candle_nn::ops::softmax_last_dim(&scores)?;
-                attn.matmul(&v_exp)?
+                #[cfg(feature = "turing")]
+                {
+                    let q_f = q.to_dtype(DType::F16)?.contiguous()?;
+                    let k_f = k.transpose(1, 2)?.to_dtype(DType::F16)?.contiguous()?;
+                    let v_f = v.transpose(1, 2)?.to_dtype(DType::F16)?.contiguous()?;
+                    super::flash_decode_cuda::dispatch_flash_decode(
+                        q.device().as_cuda_device()?,
+                        &q_f,
+                        &k_f,
+                        &v_f,
+                        scale as f32,
+                    )?
+                    .to_dtype(DType::F32)?
+                }
+                #[cfg(not(feature = "turing"))]
+                {
+                    // CUDA path: manual matmul attention для seq_len=1 в F32 precision.
+                    // F16 дал заметный numerical drift vs SDPA (output divergence через
+                    // 32 layers × 1024 decode steps). F32 совпадает с CPU SDPA путём.
+                    let q_f32 = q.to_dtype(DType::F32)?.contiguous()?;
+                    let k_f32 = k.to_dtype(DType::F32)?.contiguous()?;
+                    let v_f32 = v.to_dtype(DType::F32)?.contiguous()?;
+                    let kv_seq = k_f32.dim(2)?;
+                    let (k_exp, v_exp) = if self.n_kv_head != self.n_head {
+                        let repeats = self.n_head / self.n_kv_head;
+                        let k = k_f32
+                            .unsqueeze(2)?
+                            .broadcast_as((b_sz, self.n_kv_head, repeats, kv_seq, self.head_dim))?
+                            .contiguous()?
+                            .reshape((b_sz, self.n_head, kv_seq, self.head_dim))?;
+                        let v = v_f32
+                            .unsqueeze(2)?
+                            .broadcast_as((b_sz, self.n_kv_head, repeats, kv_seq, self.head_dim))?
+                            .contiguous()?
+                            .reshape((b_sz, self.n_head, kv_seq, self.head_dim))?;
+                        (k, v)
+                    } else {
+                        (k_f32, v_f32)
+                    };
+                    let scores = (q_f32.matmul(&k_exp.transpose(2, 3)?.contiguous()?)? * scale)?;
+                    let attn = candle_nn::ops::softmax_last_dim(&scores)?;
+                    attn.matmul(&v_exp)?
+                }
             }
         } else {
             // Prefill. CUDA: flash-attn v2 (causal, GQA нативно, F16 входы /
@@ -3850,7 +3917,7 @@ impl GatedAttentionLayer {
             // численно близко к F32). Откат: DISABLE_FLASH_PREFILL=1.
             // Маска на CPU (Vec<f32> seq×kv на чанк на блок) и F32 matmul
             // уходят — это была основная цена prefill attention.
-            #[cfg(feature = "cuda")]
+            #[cfg(all(feature = "cuda", not(feature = "turing")))]
             if q.device().is_cuda() && std::env::var("DISABLE_FLASH_PREFILL").is_err() {
                 let at_gpf3 = std::env::var("GPROF").as_deref() == Ok("3");
                 if at_gpf3 {
@@ -3941,7 +4008,11 @@ impl GatedAttentionLayer {
             // F32 — иначе он не годится как эталон: сверка 2026-09-04 показала
             // расхождение CUDA↔CPU с первого attention-слоя (1.1% при 1654
             // токенах) при побитовом совпадении всех DeltaNet-слоёв.
-            let attn_dtype = if q.device().is_metal() {
+            // Experimental Turing mixed path: F16 tensor-core matmuls with an
+            // explicit F32 softmax. Off by default while greedy parity is gated.
+            let mixed_f16 = q.device().is_cuda()
+                && std::env::var("YTTRI_PREFILL_ATTN_F16").as_deref() == Ok("1");
+            let attn_dtype = if q.device().is_metal() || mixed_f16 {
                 DType::F16
             } else {
                 DType::F32
@@ -3992,8 +4063,12 @@ impl GatedAttentionLayer {
                 let mask = Tensor::from_vec(mask, (1, 1, seq_len, kv_len), attn_weights.device())?
                     .to_dtype(attn_dtype)?;
                 let attn_weights = attn_weights.broadcast_add(&mask)?;
-                let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-                attn_weights.matmul(&v)?
+                let probs = if mixed_f16 {
+                    candle_nn::ops::softmax_last_dim(&attn_weights.to_dtype(DType::F32)?)?
+                } else {
+                    candle_nn::ops::softmax_last_dim(&attn_weights)?
+                };
+                probs.to_dtype(attn_dtype)?.matmul(&v)?
             } else {
                 // Длинный prefill — chunked path. После каждого chunk вызываем
                 // flush_buffers() чтобы Metal освободил intermediate scores+softmax
@@ -4025,8 +4100,12 @@ impl GatedAttentionLayer {
                         .to_dtype(attn_dtype)?;
                     let scores = scores.broadcast_add(&mask)?;
 
-                    let attn_w = candle_nn::ops::softmax_last_dim(&scores)?;
-                    let out_chunk = attn_w.matmul(&v)?.contiguous()?;
+                    let attn_w = if mixed_f16 {
+                        candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?
+                    } else {
+                        candle_nn::ops::softmax_last_dim(&scores)?
+                    };
+                    let out_chunk = attn_w.to_dtype(attn_dtype)?.matmul(&v)?.contiguous()?;
                     chunk_outputs.push(out_chunk);
 
                     // scores и attn_w большие — Drop сразу через scope.
@@ -4064,6 +4143,18 @@ impl GatedAttentionLayer {
         #[cfg(not(target_os = "macos"))]
         let y = self.attention_wo.forward(&y)?;
         let t_gate_out = t0.elapsed();
+
+        if seq_len > 1 && std::env::var("GPROF").as_deref() == Ok("3") {
+            eprintln!(
+                "[pf-attn] T={} proj={:.1} reshape={:.1} kv={:.1} sdpa={:.1} gate={:.1}",
+                seq_len,
+                t_proj.as_secs_f64() * 1e3,
+                t_reshape.as_secs_f64() * 1e3,
+                t_kv_cache.as_secs_f64() * 1e3,
+                t_sdpa.as_secs_f64() * 1e3,
+                t_gate_out.as_secs_f64() * 1e3,
+            );
+        }
 
         // Аккумулируем тайминги
         acc_us!(attn_proj_us, t_proj);
@@ -4262,37 +4353,87 @@ impl GatedAttentionLayer {
         let window = ctx.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE;
         // Свой вызов: op-механика candle здесь не нужна, а её дженерики по
         // dtype не дают подать байтовый int8-пул.
-        let total_q = q_f16.dim(0)?;
-        let out = Tensor::zeros(q_f16.shape(), DType::F16, q_f16.device())?;
-        let lse = Tensor::zeros((self.n_head, total_q), DType::F32, q_f16.device())?;
-        crate::real::paged_attn::PagedAttn {
-            q: &q_f16,
-            k_pool: &pool.k_pool,
-            v_pool: &pool.v_pool,
-            kv_scales: match (&pool.k_scale, &pool.v_scale) {
-                (Some(ks), Some(vs)) => Some((ks, vs)),
-                _ => None,
-            },
-            seqlens_q: &seqlens_q,
-            seqlens_k: &seqlens_k,
-            block_table: &block_table,
-            out: &out,
-            softmax_lse: &lse,
-            b: b_sz,
-            h: self.n_head,
-            h_k: self.n_kv_head,
-            d: self.head_dim,
-            max_seqlen_q: 1,
-            max_seqlen_k: window,
-            softmax_scale: scale,
-            window_left: -1,
-            window_right: -1,
-            page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
-            shared_block_table: false,
-            rows_per_position: 0,
-            trie_ranges: None,
-        }
-        .forward()?;
+        #[cfg(feature = "turing")]
+        let out = if std::env::var("YTTRI_LEGACY_PAGED_DECODE").as_deref() == Ok("1") {
+            let total_q = q_f16.dim(0)?;
+            let out = Tensor::zeros(q_f16.shape(), DType::F16, q_f16.device())?;
+            let lse = Tensor::zeros((self.n_head, total_q), DType::F32, q_f16.device())?;
+            crate::real::paged_attn::PagedAttn {
+                q: &q_f16,
+                k_pool: &pool.k_pool,
+                v_pool: &pool.v_pool,
+                kv_scales: match (&pool.k_scale, &pool.v_scale) {
+                    (Some(ks), Some(vs)) => Some((ks, vs)),
+                    _ => None,
+                },
+                seqlens_q: &seqlens_q,
+                seqlens_k: &seqlens_k,
+                block_table: &block_table,
+                out: &out,
+                softmax_lse: &lse,
+                b: b_sz,
+                h: self.n_head,
+                h_k: self.n_kv_head,
+                d: self.head_dim,
+                max_seqlen_q: 1,
+                max_seqlen_k: window,
+                softmax_scale: scale,
+                window_left: -1,
+                window_right: -1,
+                page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+                shared_block_table: false,
+                rows_per_position: 0,
+                trie_ranges: None,
+            }
+            .forward()?;
+            out
+        } else {
+            let _ = &seqlens_q;
+            crate::real::flash_decode_cuda::dispatch_flash_decode_paged(
+                q_f16.device().as_cuda_device()?,
+                &q_f16,
+                &pool.k_pool,
+                &pool.v_pool,
+                &seqlens_k,
+                &block_table,
+                scale,
+            )?
+        };
+        #[cfg(not(feature = "turing"))]
+        let out = {
+            let total_q = q_f16.dim(0)?;
+            let out = Tensor::zeros(q_f16.shape(), DType::F16, q_f16.device())?;
+            let lse = Tensor::zeros((self.n_head, total_q), DType::F32, q_f16.device())?;
+            crate::real::paged_attn::PagedAttn {
+                q: &q_f16,
+                k_pool: &pool.k_pool,
+                v_pool: &pool.v_pool,
+                kv_scales: match (&pool.k_scale, &pool.v_scale) {
+                    (Some(ks), Some(vs)) => Some((ks, vs)),
+                    _ => None,
+                },
+                seqlens_q: &seqlens_q,
+                seqlens_k: &seqlens_k,
+                block_table: &block_table,
+                out: &out,
+                softmax_lse: &lse,
+                b: b_sz,
+                h: self.n_head,
+                h_k: self.n_kv_head,
+                d: self.head_dim,
+                max_seqlen_q: 1,
+                max_seqlen_k: window,
+                softmax_scale: scale,
+                window_left: -1,
+                window_right: -1,
+                page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+                shared_block_table: false,
+                rows_per_position: 0,
+                trie_ranges: None,
+            }
+            .forward()?;
+            out
+        };
 
         // 7. Gate + Wo (как eager path).
         if crate::scheduler::trace_on() {
@@ -4349,12 +4490,131 @@ impl GatedAttentionLayer {
         // 1. Проекции (F16-сайдкар если подключён — dual-read prefill)
         let (qg, k, v) = match (&self.f16_q, &self.f16_k, &self.f16_v) {
             (Some(fq), Some(fk), Some(fv)) => (fq.forward(x)?, fk.forward(x)?, fv.forward(x)?),
-            _ => (
-                self.attention_wq.forward(x)?,
-                self.attention_wk.forward(x)?,
-                self.attention_wv.forward(x)?,
-            ),
+            _ => {
+                let prequant = self.attention_wq.prequantize_mmq_q8_1(x).ok().flatten();
+                (
+                    self.attention_wq
+                        .forward_with_mmq_prequant(x, prequant.as_ref())?,
+                    self.attention_wk
+                        .forward_with_mmq_prequant(x, prequant.as_ref())?,
+                    self.attention_wv
+                        .forward_with_mmq_prequant(x, prequant.as_ref())?,
+                )
+            }
         };
+
+        // Prefill uses the same fused Q/K/V preparation kernel as decode: each
+        // token is one row. This removes ~15 layout/norm/RoPE launches per
+        // attention layer and keeps Q, K, V, and gate in persistent buffers.
+        // Ядро attn_prepare_decode живёт в flash_decode.cu (собирается и для
+        // sm75) и не использует sm80-only инструкций, поэтому на Turing оно
+        // тоже годится: 15 мелких запусков на слой превращаются в один.
+        let fused_prep = crate::real::attn_prepare_cuda::enabled()
+            && !per_row_gqa
+            && trie_ranges.is_none()
+            && kv_exact_f16()
+            && self.head_dim == 256
+            && self.rope_dim > 0
+            && self.rope_dim < self.head_dim;
+        if fused_prep {
+            let cap = seq_len.max(decode_capacity() as usize);
+            if self.attn_prefill_scratch.as_ref().map(|s| s.cap).unwrap_or(0) < cap {
+                self.attn_prefill_scratch =
+                    Some(crate::real::attn_prepare_cuda::AttnPrepScratch::new(
+                        cap,
+                        self.n_head,
+                        self.n_kv_head,
+                        self.head_dim,
+                        x.device(),
+                    )?);
+            }
+            let scratch = self
+                .attn_prefill_scratch
+                .as_ref()
+                .expect("prefill scratch just allocated");
+            let qg3 = qg.reshape((seq_len, self.n_head, self.head_dim * 2))?;
+            let k3 = k.reshape((seq_len, self.n_kv_head, self.head_dim))?;
+            let v3 = v.reshape((seq_len, self.n_kv_head, self.head_dim))?;
+            let (q_f16, gate, k_rows, v_rows) = crate::real::attn_prepare_cuda::dispatch(
+                scratch,
+                &qg3,
+                &k3,
+                &v3,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                &self.cos,
+                &self.sin,
+                rope_pos_dev,
+                seq_len,
+                self.n_head,
+                self.n_kv_head,
+                self.head_dim,
+                self.rope_dim,
+                self.rms_norm_eps,
+            )?;
+
+            let pool = self
+                .paged_pool
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::Msg("paged pool not initialized".into()))?;
+            pool.launch_append_multi(
+                ctx,
+                &k_rows,
+                &v_rows,
+                b_sz,
+                seq_len,
+                self.n_kv_head,
+                self.head_dim,
+                self.attn_window,
+            )?;
+
+            let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
+            let window = ctx.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE;
+            let block_table = ctx.block_table(b_sz)?;
+            let out = Tensor::zeros(q_f16.shape(), DType::F16, q_f16.device())?;
+            let seqlens_q = ctx.seqlens_q_prefill();
+            let seqlens_k = ctx.seqlens_k(b_sz)?;
+            let lse = Tensor::zeros((self.n_head, seq_len), DType::F32, q_f16.device())?;
+            crate::real::paged_attn::PagedAttn {
+                q: &q_f16,
+                k_pool: &pool.k_pool,
+                v_pool: &pool.v_pool,
+                kv_scales: match (&pool.k_scale, &pool.v_scale) {
+                    (Some(ks), Some(vs)) => Some((ks, vs)),
+                    _ => None,
+                },
+                seqlens_q: &seqlens_q,
+                seqlens_k: &seqlens_k,
+                block_table: &block_table,
+                out: &out,
+                softmax_lse: &lse,
+                b: b_sz,
+                h: self.n_head,
+                h_k: self.n_kv_head,
+                d: self.head_dim,
+                max_seqlen_q: seq_len,
+                max_seqlen_k: window,
+                softmax_scale: scale,
+                window_left: -1,
+                window_right: 0,
+                page_block_size: crate::real::paged_kv_cuda::PAGE_SIZE,
+                shared_block_table: false,
+                rows_per_position: 0,
+                trie_ranges: None,
+            }
+            .forward()?;
+
+            let y = out
+                .to_dtype(DType::F32)?
+                .reshape((b_sz, seq_len, self.n_head, self.head_dim))?;
+            let gate = gate.reshape((b_sz, seq_len, self.n_head, self.head_dim))?;
+            let gated = (y * candle_nn::ops::sigmoid(&gate)?)?;
+            let y_all = gated.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+            return match &self.f16_o {
+                Some(fo) => fo.forward(&y_all),
+                None => self.attention_wo.forward(&y_all),
+            };
+        }
 
         // 2. Reshape + norms
         let qg = qg.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
@@ -4462,12 +4722,30 @@ impl GatedAttentionLayer {
         let verify_onepass = per_row_gqa
             && seq_len > 1
             && std::env::var("VERIFY_ONEPASS").ok().as_deref() == Some("1");
+        // Turing has no FA2 build. The existing split-K kernel supports
+        // per-row causal lengths through seqlens_k, exactly like MTP verify.
+        #[cfg(feature = "turing")]
+        let turing_prefill = !per_row_gqa && trie_ranges.is_none();
         if trie_ranges.is_some() {
             eprintln!(
                 "[mtp-tree] attn branch seq_len={seq_len} per_row={per_row_gqa} fused={verify_fused} onepass={verify_onepass}"
             );
         }
-        if per_row_gqa && !verify_fused && !verify_onepass {
+        #[cfg(feature = "turing")]
+        if turing_prefill {
+            let seqlens_k = ctx.seqlens_k_for_verify(seq_len)?;
+            let block_table = block_table.broadcast_as((seq_len, ctx.max_blocks))?.contiguous()?;
+            let row_out = crate::real::flash_decode_cuda::dispatch_flash_decode_paged(
+                q_f16.device().as_cuda_device()?,
+                &q_f16,
+                &pool.k_pool,
+                &pool.v_pool,
+                &seqlens_k,
+                &block_table,
+                scale,
+            )?;
+            out.slice_set(&row_out.reshape(out.shape())?, 0, 0)?;
+        } else if per_row_gqa && !verify_fused && !verify_onepass {
             // Построчно: строка i — декодный вызов (seqlen_q = 1, маска noop),
             // ключи 0..kv0+i задаются через seqlens_k = kv0+i+1. Строки уже
             // дописаны в пул выше, kv_len_dev ещё не инкрементирован.
@@ -4963,9 +5241,23 @@ impl GatedAttentionLayer {
                 candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?
                     .to_dtype(DType::F32)?
             } else {
-                // CUDA: FA2 default. Split-K remains diagnostic-only: at
-                // kv_len=2048 it drifts from FA2 without a throughput gain.
-                #[cfg(feature = "cuda")]
+                // Turing has no FA2 build. Use the split-K F16 decoder on every
+                // attention layer; this is also the path used by CandleEngine.
+                #[cfg(feature = "turing")]
+                {
+                    let q_f = q.to_dtype(DType::F16)?.contiguous()?;
+                    let k_f = k.to_dtype(DType::F16)?.contiguous()?;
+                    let v_f = v.to_dtype(DType::F16)?.contiguous()?;
+                    super::flash_decode_cuda::dispatch_flash_decode(
+                        device.as_cuda_device()?,
+                        &q_f,
+                        &k_f,
+                        &v_f,
+                        scale as f32,
+                    )?
+                    .to_dtype(DType::F32)?
+                }
+                #[cfg(all(feature = "cuda", not(feature = "turing")))]
                 {
                     let splitk_ok = kv_len >= 2048
                         && std::env::var("ENABLE_SPLITK_DECODE").as_deref() == Ok("1");
@@ -5649,8 +5941,44 @@ impl HybridBlock {
         }
         let t_mix = std::time::Instant::now();
 
+        // PFB_SPLIT=1 — разбивка блока по стадиям через CUDA-события.
+        // Instant бесполезен: очередь асинхронна, меряем реальное GPU-время.
+        #[cfg(feature = "cuda")]
+        let split = std::env::var("PFB_SPLIT").as_deref() == Ok("1");
+        #[cfg(feature = "cuda")]
+        let mut events: Vec<(cudarc::driver::sys::CUevent, &'static str)> = Vec::new();
+        #[cfg(feature = "cuda")]
+        if split {
+            if let Ok(cd) = x.device().as_cuda_device() {
+                let stream = cd.cuda_stream().cu_stream();
+                for tag in [
+                    "start", "attn_norm", "layer", "ffn_norm", "ffn",
+                ] {
+                    let mut e: cudarc::driver::sys::CUevent = std::ptr::null_mut();
+                    // CU_EVENT_RECORD_EXTERNAL (0x1) — обязателен в capture.
+                    if unsafe { cudarc::driver::sys::cuEventCreate(&mut e, 1) }
+                        == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+                    {
+                        events.push((e, tag));
+                    }
+                }
+                let _ = stream;
+            }
+        }
+        #[cfg(feature = "cuda")]
+        let mark = |idx: usize| {
+            if let (Some((e, _)), Ok(cd)) = (events.get(idx), x.device().as_cuda_device()) {
+                let stream = cd.cuda_stream().cu_stream();
+                let _ = unsafe { cudarc::driver::result::event::record(*e, stream) };
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let mark = |_: usize| {};
+        mark(0);
+
         let residual = x;
         let normed = self.attn_norm.forward(x)?;
+        mark(1);
 
         let layer_out = match &mut self.layer {
             HybridLayerType::DeltaNet(delta) => delta.forward_prefill(&normed)?,
@@ -5658,6 +5986,7 @@ impl HybridBlock {
                 attn.forward_attn_with_rope(&normed, index_pos, rope)?
             }
         };
+        mark(2);
         let x = (layer_out + residual)?;
         let t_mix_el = t_mix.elapsed();
 
@@ -5665,12 +5994,33 @@ impl HybridBlock {
         let t_ffn = std::time::Instant::now();
         let residual = &x;
         let normed = self.ffn_norm.forward(&x)?;
+        mark(3);
         let ffn_out = self.ff.forward_prefill(&normed)?;
         let x = (ffn_out + residual)?;
+        mark(4);
+        #[cfg(feature = "cuda")]
+        if split && events.len() == 5 {
+            if let Ok(cd) = x.device().as_cuda_device() {
+                let _ = cd.cuda_stream().synchronize();
+            }
+            let mut parts = Vec::with_capacity(4);
+            for w in events.windows(2) {
+                let ms = unsafe { cudarc::driver::result::event::elapsed(w[0].0, w[1].0) }
+                    .unwrap_or(f32::NAN);
+                parts.push(format!("{}:{ms:.2}", w[1].1));
+            }
+            eprintln!("[pfb-split] {}", parts.join(" "));
+            for (e, _) in &events {
+                let _ = unsafe { cudarc::driver::sys::cuEventDestroy_v2(*e) };
+            }
+        }
         if trace {
             let mix_ms = t_mix_el.as_secs_f64() * 1000.0;
             let ffn_ms = t_ffn.elapsed().as_secs_f64() * 1000.0;
-            if mix_ms + ffn_ms > 50.0 {
+            // PFB_ALL=1 — печатать каждый блок (диагностика распределения
+            // времени по стадиям, иначе выводятся только «медленные» > 50 мс).
+            let pfb_all = std::env::var("PFB_ALL").as_deref() == Ok("1");
+            if pfb_all || mix_ms + ffn_ms > 50.0 {
                 eprintln!("[pfb] mix={mix_ms:.1}ms ffn={ffn_ms:.1}ms");
             }
         }
@@ -5698,6 +6048,7 @@ impl HybridBlock {
         x: &Tensor,
         ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
         rope_pos_dev: &Tensor,
+        reset_state: bool,
     ) -> Result<Tensor> {
         let residual = x;
         let normed = self.attn_norm.forward(x)?;
@@ -5707,21 +6058,19 @@ impl HybridBlock {
                 // Fused GDN: проекции (F16 dual-read) → dispatch → ssm_out
                 let (b_sz, seq_len, _n_embd) = normed.dims3()?;
                 let _ = b_sz;
-                let qkv_t = match &delta.f16_wqkv {
-                    Some(f) => f.forward(&normed)?,
-                    None => delta.wqkv.forward(&normed)?,
-                };
-                let z_t = match &delta.f16_wgate {
-                    Some(f) => f.forward(&normed)?,
-                    None => delta.wgate.forward(&normed)?,
-                };
-                let beta_t = match &delta.f16_w_beta {
-                    Some(f) => f.forward(&normed)?,
-                    None => delta.w_beta.forward(&normed)?,
-                };
-                let alpha_t = match &delta.f16_w_alpha {
-                    Some(f) => f.forward(&normed)?,
-                    None => delta.w_alpha.forward(&normed)?,
+                let (qkv_t, z_t, beta_t, alpha_t) = match (
+                    &delta.f16_wqkv,
+                    &delta.f16_wgate,
+                    &delta.f16_w_beta,
+                    &delta.f16_w_alpha,
+                ) {
+                    (Some(fq), Some(fg), Some(fb), Some(fa)) => (
+                        fq.forward(&normed)?,
+                        fg.forward(&normed)?,
+                        fb.forward(&normed)?,
+                        fa.forward(&normed)?,
+                    ),
+                    _ => delta.project_in(&normed)?,
                 };
 
                 let ctx_cuda = delta.cuda_ctx.as_mut().ok_or_else(|| {
@@ -5735,6 +6084,7 @@ impl HybridBlock {
                     &z_t,
                     &beta_t,
                     &alpha_t,
+                    reset_state,
                 )
                 .map_err(|e| candle_core::Error::Msg(format!("delta fused: {e}")))?;
                 let head_in = gated_all;
@@ -5747,12 +6097,25 @@ impl HybridBlock {
                 attn.forward_attn_prefill_paged(&normed, ctx, rope_pos_dev, false)?
             }
         };
-        let x = (layer_out + residual)?;
-
-        let residual = &x;
-        let normed = self.ffn_norm.forward(&x)?;
+        // Пара «add + rmsnorm» одним ядром: на префил-чанк это 36 запусков
+        // меньше и на один проход по активациям (2 × T × n_embd × 4 байта)
+        // меньше на слой. Тот же фьюжн уже работает в декодном forward();
+        // здесь его не было, хотя путь тот же — CUDA + F32.
+        let (x, normed) = match try_add_rmsnorm(
+            &layer_out,
+            residual,
+            self.ffn_norm.weight(),
+            self.ffn_norm.eps(),
+        ) {
+            Some(pair) => pair,
+            None => {
+                let x = (layer_out + residual)?;
+                let normed = self.ffn_norm.forward(&x)?;
+                (x, normed)
+            }
+        };
         let ffn_out = self.ff.forward_prefill(&normed)?;
-        Ok((ffn_out + residual)?)
+        Ok((ffn_out + &x)?)
     }
 
     /// Проверка спекуляции на страничном пути: k строк ОДНОГО слота, capture-safe.
@@ -6014,7 +6377,169 @@ pub struct ModelWeights {
     pub(crate) gprof_block_events: Option<Vec<cudarc::driver::sys::CUevent>>,
 }
 
+#[cfg(feature = "cuda")]
+fn turing_prefill_cache_weight(q: &QMatMul) -> Result<QMatMul> {
+    q.dequantize_f16().map(QMatMul::TensorF16)
+}
+
+#[cfg(feature = "cuda")]
+fn turing_prefill_cache_bytes(q: &QMatMul) -> Option<u64> {
+    let QMatMul::QTensor(t) = q else {
+        return None;
+    };
+    Some((t.shape().elem_count() * std::mem::size_of::<half::f16>()) as u64)
+}
+
 impl ModelWeights {
+    /// CUDA Turing prefill-only F16 copies for DeltaNet input projections.
+    #[cfg(feature = "cuda")]
+    pub fn attach_turing_f16_delta_cache(&mut self, max_mib: u64, include_out: bool) -> Result<()> {
+        if max_mib == 0 {
+            return Ok(());
+        }
+        let budget = max_mib.saturating_mul(1024 * 1024);
+        let mut used = 0u64;
+        let mut cached_layers = 0usize;
+        let mut cached_out = 0usize;
+        for block in &mut self.blocks {
+            let HybridLayerType::DeltaNet(delta) = &mut block.layer else {
+                continue;
+            };
+            if delta.f16_wqkv.is_some() || delta.f16_wgate.is_some() {
+                continue;
+            }
+            let mut bytes = [&delta.wqkv, &delta.wgate, &delta.w_beta, &delta.w_alpha]
+                .into_iter()
+                .filter_map(turing_prefill_cache_bytes)
+                .sum::<u64>();
+            if include_out && delta.f16_ssm_out.is_none() {
+                bytes = bytes.saturating_add(
+                    turing_prefill_cache_bytes(&delta.ssm_out).unwrap_or(0),
+                );
+            }
+            if bytes == 0 || used.saturating_add(bytes) > budget {
+                continue;
+            }
+            delta.f16_wqkv = Some(turing_prefill_cache_weight(&delta.wqkv)?);
+            delta.f16_wgate = Some(turing_prefill_cache_weight(&delta.wgate)?);
+            delta.f16_w_beta = Some(turing_prefill_cache_weight(&delta.w_beta)?);
+            delta.f16_w_alpha = Some(turing_prefill_cache_weight(&delta.w_alpha)?);
+            if include_out && delta.f16_ssm_out.is_none() {
+                delta.f16_ssm_out = Some(turing_prefill_cache_weight(&delta.ssm_out)?);
+                cached_out += 1;
+            }
+            used = used.saturating_add(bytes);
+            cached_layers += 1;
+        }
+        eprintln!(
+            "[f16-cache] delta layers={cached_layers} ssm_out={cached_out} bytes={:.0}MiB budget={max_mib}MiB",
+            used as f64 / 1048576.0
+        );
+        Ok(())
+    }
+
+    /// Подобрать бюджет F16-кэша FFN под конкретную модель и контекст.
+    ///
+    /// Бюджет нельзя брать константой: он конкурирует за VRAM с весами и с
+    /// KV-пулом, а обе величины зависят от модели. На Ornith-1.5-9B 5.49 ГиБ
+    /// и контексте 8192 помещается 15 слоёв (4400 МиБ), на другой модели с
+    /// меньшим числом attention-слоёв — больше, на 27B — ноль.
+    ///
+    /// Считаем от **фактически свободной** VRAM в момент после загрузки весов:
+    ///
+    /// ```text
+    /// budget = free - kv_bytes(ctx) - headroom
+    /// ```
+    ///
+    /// `kv_bytes` — K+V всех attention-слоёв на обслуживаемый контекст в F16
+    /// (или int8, если `KV_POOL_Q8=1`). `headroom` — `VRAM_HEADROOM_MIB`
+    /// (по умолчанию 1024): графы, активации префила, буферы драйвера.
+    ///
+    /// Возвращает 0, если места на кэш не остаётся — тогда кэш не включается
+    /// и движок работает как раньше.
+    #[cfg(feature = "cuda")]
+    pub fn auto_turing_mlp_cache_mib(&self, device: &candle_core::Device) -> u64 {
+        let candle_core::Device::Cuda(c) = device else {
+            return 0;
+        };
+        let Ok((free, _)) = c.cuda_stream().context().mem_get_info() else {
+            return 0;
+        };
+        // Байт на токен по всем слоям внимания, K и V, все слоты.
+        let q8 = super::paged_kv_cuda::kv_pool_is_q8();
+        let mut bytes_per_token = 0usize;
+        for block in self.blocks.iter() {
+            if let HybridLayerType::Attention(a) = &block.layer {
+                let per_head = if q8 { a.head_dim + 2 } else { a.head_dim * 2 };
+                bytes_per_token += a.kv_cache_batched.len() * 2 * a.n_kv_head * per_head;
+            }
+        }
+        // Контекст, который сервер реально обслуживает; без CTX движок
+        // ограничивает окно 32768 (см. init_paged_decode).
+        let served_ctx = std::env::var("CTX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32768);
+        let kv_bytes = bytes_per_token.saturating_mul(served_ctx.min(32768));
+        let headroom = std::env::var("VRAM_HEADROOM_MIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1024)
+            * 1024
+            * 1024;
+        let free = free as u64;
+        let spare = free.saturating_sub(kv_bytes as u64).saturating_sub(headroom);
+        // Фиксированный запас на фрагментацию и пики транзиентов первого
+        // префилла. Доли от свободного брать нельзя: на 11 ГиБ четверть
+        // запаса — это 900 МиБ, то есть три слоя кэша, выброшенных зря.
+        // Откалибровано на Ornith-1.5-9B: при CTX=32768 и резерве 1024
+        // остаётся 3648 МиБ, из них 3456 (12 слоёв) грузятся стабильно; 128 МиБ хватает.
+        spare.saturating_sub(128 * 1024 * 1024) / (1024 * 1024)
+    }
+
+    /// CUDA Turing prefill-only F16 copies for dense SwiGLU layers.
+    #[cfg(feature = "cuda")]
+    pub fn attach_turing_f16_mlp_cache(&mut self, max_mib: u64) -> Result<()> {
+        if max_mib == 0 {
+            return Ok(());
+        }
+        let max_layers = std::env::var("YTTRI_F16_MLP_LAYERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        let budget = max_mib.saturating_mul(1024 * 1024);
+        let mut used = 0u64;
+        let mut cached_layers = 0usize;
+        for block in &mut self.blocks {
+            if cached_layers >= max_layers {
+                break;
+            }
+            let FeedForward::Dense(mlp) = &mut block.ff else {
+                continue;
+            };
+            if mlp.f16_w1.is_some() || mlp.f16_w2.is_some() || mlp.f16_w3.is_some() {
+                continue;
+            }
+            let bytes = [&mlp.feed_forward_w1, &mlp.feed_forward_w2, &mlp.feed_forward_w3]
+                .into_iter()
+                .filter_map(turing_prefill_cache_bytes)
+                .sum::<u64>();
+            if bytes == 0 || used.saturating_add(bytes) > budget {
+                continue;
+            }
+            mlp.f16_w1 = Some(turing_prefill_cache_weight(&mlp.feed_forward_w1)?);
+            mlp.f16_w2 = Some(turing_prefill_cache_weight(&mlp.feed_forward_w2)?);
+            mlp.f16_w3 = Some(turing_prefill_cache_weight(&mlp.feed_forward_w3)?);
+            used += bytes;
+            cached_layers += 1;
+        }
+        eprintln!(
+            "[f16-cache] dense MLP layers={cached_layers} bytes={:.0}MiB budget={max_mib}MiB",
+            used as f64 / 1048576.0
+        );
+        Ok(())
+    }
+
     /// Рантайм выгрузки (Some — эксперты в RAM, FR-001).
     #[cfg(feature = "cuda")]
     pub fn moe_runtime(&self) -> Option<&Arc<super::expert_store::MoeRuntime>> {
@@ -7808,6 +8333,8 @@ impl ModelWeights {
                     rms_norm_eps: rms_norm_eps as f32,
                     #[cfg(feature = "cuda")]
                     attn_prep_scratch: None,
+                    #[cfg(feature = "cuda")]
+                    attn_prefill_scratch: None,
                     kv_cache: None,
                     kv_cache_len: 0,
                     max_cache_len: context_length,
@@ -7960,6 +8487,37 @@ impl ModelWeights {
                 }
             }
         }
+    }
+
+    /// Reset everything except CUDA single-slot Delta state. The first
+    /// prefill kernels zero their state internally, avoiding 48 tiny memsets.
+    #[cfg(feature = "cuda")]
+    pub fn clear_state_for_prefill(&mut self) {
+        for block in self.blocks.iter_mut() {
+            match &mut block.layer {
+                HybridLayerType::DeltaNet(delta) => {
+                    if delta.cuda_ctx.is_none() {
+                        delta.state.clear();
+                    }
+                }
+                HybridLayerType::Attention(attn) => {
+                    attn.kv_cache = None;
+                    attn.kv_cache_len = 0;
+                }
+            }
+        }
+    }
+
+    /// The in-kernel reset path supports the model's 128x128 Delta state.
+    #[cfg(feature = "cuda")]
+    pub fn supports_in_kernel_prefill_reset(&self) -> bool {
+        self.blocks.iter().all(|block| match &block.layer {
+            HybridLayerType::DeltaNet(d) => d
+                .cuda_ctx
+                .as_ref()
+                .is_some_and(|ctx| ctx.params.head_k_dim == 128 && ctx.params.head_v_dim == 128),
+            HybridLayerType::Attention(_) => true,
+        })
     }
 
     /// Получить текущую длину KV-cache (количество закэшированных токенов).
@@ -8516,6 +9074,67 @@ impl ModelWeights {
     /// device→device, без пары dtoh+htod. Замер 2026-09-17 на 30k-предикате
     /// (`[pfin]`): полный seed стоил 162 мс, dominated htod по pageable-памяти.
     /// Snapshot (`snap`) нужен только для host-зеркала CPU-fallback.
+    #[cfg(feature = "cuda")]
+    /// Seed slot 0's batched Delta state from the live single-slot prefill
+    /// context. This is the no-MTP/no-prefix-cache path: no snapshot is needed.
+    pub fn seed_slot_batched_from_single(&mut self, slot: usize, position: usize) -> Result<()> {
+        for block in self.blocks.iter_mut() {
+            match &mut block.layer {
+                HybridLayerType::DeltaNet(d) => {
+                    if let (Some(batched), Some(single)) =
+                        (d.cuda_ctx_batched.as_mut(), d.cuda_ctx.as_ref())
+                    {
+                        let dev = batched.dev.clone();
+                        delta_rule_batched_cuda::seed_slot_cuda_state_from_single(
+                            &dev,
+                            &mut batched.layer_state,
+                            slot,
+                            &single.layer_state,
+                        )?;
+                    }
+                }
+                HybridLayerType::Attention(a) => {
+                    // Заполняем batched-KV прямо из single-slot кэша: префил
+                    // его уже посчитал, глубокий snapshot с последующим
+                    // q8-roundtrip стоил 58 мс на чанк 491 (23% времени).
+                    match (&a.kv_cache, a.kv_cache_len) {
+                        (Some((k, v)), len) if len > 0 => {
+                            let take = len.min(position);
+                            let kt = k
+                                .narrow(2, 0, take)?
+                                .transpose(1, 2)?
+                                .contiguous()?;
+                            let vt = v
+                                .narrow(2, 0, take)?
+                                .transpose(1, 2)?
+                                .contiguous()?;
+                            if a.use_q8_f16_kv_cache {
+                                let (kq, ks) = q8_quantize_rows(&kt)?;
+                                let (vq, vs) = q8_quantize_rows(&vt)?;
+                                a.kv_cache_batched[slot] = Some(BatchedKvCache::F16(F16KvCache {
+                                    k: q8_dequantize_rows(&kq, &ks)?,
+                                    v: q8_dequantize_rows(&vq, &vs)?,
+                                }));
+                            } else {
+                                let (kq, ks) = q8_quantize_rows(&kt)?;
+                                let (vq, vs) = q8_quantize_rows(&vt)?;
+                                a.kv_cache_batched[slot] =
+                                    Some(BatchedKvCache::Q8(Q8KvCache { k_q: kq, k_s: ks, v_q: vq, v_s: vs }));
+                            }
+                            a.kv_cache_len_batched[slot] = position;
+                        }
+                        _ => {
+                            a.kv_cache_batched[slot] = None;
+                            a.kv_cache_len_batched[slot] = position;
+                        }
+                    }
+                }
+            }
+        }
+        self.invalidate_mirror(slot);
+        Ok(())
+    }
+
     #[cfg(feature = "cuda")]
     pub fn seed_slot_batched_from_device(
         &mut self,
@@ -9186,9 +9805,25 @@ impl ModelWeights {
             #[cfg(not(target_os = "macos"))]
             {
                 let trace = crate::scheduler::trace_on();
+                // GPROF=1: реальное GPU-время блоков через CUDA-события.
+                // Instant-таймеры ниже меряют постановку в очередь, а не
+                // исполнение, поэтому их сумма может быть вдвое меньше факта.
+                let evs = if std::env::var("GPROF").as_deref() == Ok("1") {
+                    self.gprof_block_events.as_ref()
+                } else {
+                    None
+                };
+                if let (Some(evs), Ok(cd)) = (evs, layer_in.device().as_cuda_device()) {
+                    let stream = cd.cuda_stream().cu_stream();
+                    let _ = unsafe { cudarc::driver::result::event::record(evs[0], stream) };
+                }
                 let mut d_ms = 0f64;
                 let mut a_ms = 0f64;
                 for (bi, block) in self.blocks.iter_mut().enumerate() {
+                    if let (Some(evs), Ok(cd)) = (evs, layer_in.device().as_cuda_device()) {
+                        let stream = cd.cuda_stream().cu_stream();
+                        let _ = unsafe { cudarc::driver::result::event::record(evs[bi], stream) };
+                    }
                     let t0 = std::time::Instant::now();
                     let block_dev = block.device();
                     if !layer_in.device().same_device(&block_dev) {
@@ -9235,6 +9870,31 @@ impl ModelWeights {
                 }
                 if trace {
                     eprintln!("[pf] chunk blocks: delta={d_ms:.1}ms attn={a_ms:.1}ms");
+                }
+                if let (Some(evs), Ok(cd)) = (evs, layer_in.device().as_cuda_device()) {
+                    let stream = cd.cuda_stream().cu_stream();
+                    let last = evs.len() - 1;
+                    let _ = unsafe { cudarc::driver::result::event::record(evs[last], stream) };
+                    let _ = cd.cuda_stream().synchronize();
+                    // elapsed возвращает миллисекунды.
+                    if let Ok(ms) =
+                        unsafe { cudarc::driver::result::event::elapsed(evs[0], evs[last]) }
+                    {
+                        eprintln!("[pf-gpu] blocks_gpu={ms:.1}ms");
+                    }
+                    // PFB_PER_BLOCK=1 — по каждому блоку: какие слои медленные.
+                    // Показывает, помогает ли F16-кэш MLP на самом деле.
+                    if std::env::var("PFB_PER_BLOCK").as_deref() == Ok("1") {
+                        let mut per = Vec::with_capacity(self.blocks.len());
+                        for i in 0..self.blocks.len() {
+                            let ms = unsafe {
+                                cudarc::driver::result::event::elapsed(evs[i], evs[i + 1])
+                            }
+                            .unwrap_or(f32::NAN);
+                            per.push(format!("{i}:{ms:.2}"));
+                        }
+                        eprintln!("[pf-blocks] {}", per.join(" "));
+                    }
                 }
             }
             #[cfg(target_os = "macos")]
@@ -9284,10 +9944,13 @@ impl ModelWeights {
         let t_head = t_head_start.elapsed();
 
         // Профилирование
-        let should_log = index_pos % 32 == 0 || index_pos < 3 || seq_len > 1;
+        let should_log = std::env::var("GPROF").as_deref() == Ok("2")
+            || index_pos % 32 == 0
+            || index_pos < 3
+            || seq_len > 1;
         if should_log {
             let total = t_start.elapsed();
-            log::debug!(
+            profile_debug!(
                 "[Qwen3.5/forward] pos={} seq={} total={:.1}ms (embed={:.1}ms layers={:.1}ms head={:.1}ms)",
                 index_pos,
                 seq_len,
@@ -9306,7 +9969,7 @@ impl ModelWeights {
                 let delta_total = g.total_delta_us();
                 let attn_total = g.total_attn_us();
 
-                log::debug!(
+                profile_debug!(
                     "[GenProfile] pos={} | DeltaNet({}): {:.1}ms [proj={:.1} xfer={:.1} prep={:.1} norm={:.1} delta={:.1} rms+gate={:.1} out={:.1}]",
                     index_pos,
                     g.delta_count,
@@ -9319,7 +9982,7 @@ impl ModelWeights {
                     g.delta_rms_gate_us as f64 / 1000.0,
                     g.delta_out_proj_us as f64 / 1000.0,
                 );
-                log::debug!(
+                profile_debug!(
                     "[GenProfile] pos={} | Attn({}): {:.1}ms [proj={:.1} reshape={:.1} kv={:.1} sdpa={:.1} gate+out={:.1}]",
                     index_pos,
                     g.attn_count,
@@ -9330,7 +9993,7 @@ impl ModelWeights {
                     g.attn_sdpa_us as f64 / 1000.0,
                     g.attn_gate_out_us as f64 / 1000.0,
                 );
-                log::debug!(
+                profile_debug!(
                     "[GenProfile] pos={} | Norms: {:.1}ms | MLP: {:.1}ms | sum={:.1}ms vs total={:.1}ms",
                     index_pos,
                     g.norm_us as f64 / 1000.0,
@@ -9530,6 +10193,7 @@ impl ModelWeights {
         emb_in: &Tensor,
         rope_pos_dev: &Tensor,
         t_len: usize,
+        reset_state: bool,
     ) -> Result<(Tensor, Tensor)> {
         // Вход — готовые эмбеддинги [1, T, H] F32 (см. embed_for_graph):
         // lookup в графе не нужен, копия token_embd на GPU — тоже.
@@ -9548,7 +10212,7 @@ impl ModelWeights {
         ctx.seqlens_k_for_prefill(1, t_len)?;
 
         for block in self.blocks.iter_mut() {
-            layer_in = block.forward_prefill_paged(&layer_in, ctx, rope_pos_dev)?;
+            layer_in = block.forward_prefill_paged(&layer_in, ctx, rope_pos_dev, reset_state)?;
         }
 
         // kv_len[slot] += T — после ВСЕХ attention слоёв (все слои видят одну длину).
@@ -10700,6 +11364,18 @@ impl ModelWeights {
             #[cfg(not(target_os = "macos"))]
             {
                 let trace = crate::scheduler::trace_on();
+                // GPROF=1: CUDA-события вокруг префил-прохода. Instant-таймеры
+                // ниже меряют постановку в очередь, а не исполнение, поэтому
+                // сумма «блоков» может расходиться с фактом.
+                let evs = if std::env::var("GPROF").as_deref() == Ok("1") {
+                    self.gprof_block_events.as_ref()
+                } else {
+                    None
+                };
+                if let (Some(evs), Ok(cd)) = (evs, self.norm.weight().device().as_cuda_device()) {
+                    let stream = cd.cuda_stream().cu_stream();
+                    let _ = unsafe { cudarc::driver::result::event::record(evs[0], stream) };
+                }
                 let mut d_ms = 0f64;
                 let mut a_ms = 0f64;
                 for (bi, block) in self.blocks.iter_mut().enumerate() {
@@ -10722,6 +11398,18 @@ impl ModelWeights {
                 }
                 if trace {
                     eprintln!("[pf] chunk blocks: delta={d_ms:.1}ms attn={a_ms:.1}ms");
+                }
+                if let (Some(evs), Ok(cd)) = (evs, self.norm.weight().device().as_cuda_device()) {
+                    let stream = cd.cuda_stream().cu_stream();
+                    let last = evs.len() - 1;
+                    let _ = unsafe { cudarc::driver::result::event::record(evs[last], stream) };
+                    let _ = cd.cuda_stream().synchronize();
+                    // elapsed возвращает миллисекунды.
+                    if let Ok(ms) =
+                        unsafe { cudarc::driver::result::event::elapsed(evs[0], evs[last]) }
+                    {
+                        eprintln!("[pf-gpu] blocks_gpu={ms:.1}ms");
+                    }
                 }
             }
             #[cfg(target_os = "macos")]

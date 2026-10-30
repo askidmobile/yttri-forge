@@ -4556,7 +4556,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 // https://github.com/ggerganov/llama.cpp/blob/c50a82ce0f71558cbb8e555146ba124251504b38/ggml-cuda/mmvq.cu#L4
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs);
 
-template <int ncols_y, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+template <int ncols_y, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda, int nwarps_ = 0>
 static __device__ void mul_mat_vec_q(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
@@ -4565,7 +4565,7 @@ static __device__ void mul_mat_vec_q(
     constexpr int nwarps              = 1;
     constexpr int rows_per_cuda_block = 1;
 #else
-    constexpr int nwarps              = ncols_y <= 4 ? 4 : 2;
+    constexpr int nwarps              = nwarps_ ? nwarps_ : (ncols_y <= 4 ? 4 : 2);
     constexpr int rows_per_cuda_block = ncols_y == 1 ? 1 : 2;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
@@ -4907,6 +4907,14 @@ extern "C" __global__ void mul_mat_vec_q6_K_q8_1_cuda1(
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
 
     mul_mat_vec_q<1, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
+        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1) mul_mat_vec_q4_K_q8_1_cuda1_t2(
+    const void * vx, const void * vy, float * dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    mul_mat_vec_q<1, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 2>
         (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 

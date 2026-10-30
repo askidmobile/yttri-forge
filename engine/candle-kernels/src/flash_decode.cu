@@ -199,6 +199,171 @@ extern "C" __global__ void flash_decode_combine(
     }
 }
 
+// Graph-safe split-K decode for the paged KV pool. All step-varying values stay
+// in device buffers so the same launches can be captured into a CUDA graph.
+struct PagedFlashDecodeParams {
+    unsigned int n_head;
+    unsigned int n_kv;
+    unsigned int hd;
+    unsigned int splits;
+    float scale;
+    unsigned int page_size;
+    unsigned int block_table_stride;
+};
+
+extern "C" __global__ void flash_decode_paged_partial(
+    const __half* __restrict__ q,                    // [B, n_head, hd]
+    const __half* __restrict__ k_pool,               // [tokens, n_kv, hd]
+    const __half* __restrict__ v_pool,               // [tokens, n_kv, hd]
+    const unsigned int* __restrict__ seqlens_k,      // [B + 1]
+    const unsigned int* __restrict__ block_table,    // [B, max_blocks]
+    float* __restrict__ partials,
+    const PagedFlashDecodeParams params
+) {
+    const unsigned int h = blockIdx.x;
+    const unsigned int s = blockIdx.y;
+    const unsigned int b = blockIdx.z;
+    const unsigned int hd = params.hd;
+    const unsigned int n_kv = params.n_kv;
+    const unsigned int kv_len = seqlens_k[b + 1] - seqlens_k[b];
+    const unsigned int kvh = h / (params.n_head / n_kv);
+    const unsigned int lane = threadIdx.x % 32;
+    const unsigned int warp = threadIdx.x / 32;
+    const unsigned int nwarp = blockDim.x / 32;
+    const unsigned int *bt = block_table + (size_t)b * params.block_table_stride;
+
+    const unsigned int chunk = (kv_len + params.splits - 1) / params.splits;
+    const unsigned int p0 = s * chunk;
+    float *out = partials + (((size_t)b * params.n_head + h) * params.splits + s) * (2 + hd);
+    if (p0 >= kv_len) {
+        if (threadIdx.x == 0) {
+            out[0] = -INFINITY;
+            out[1] = 0.0f;
+        }
+        for (unsigned int d = threadIdx.x; d < hd; d += blockDim.x) out[2 + d] = 0.0f;
+        return;
+    }
+    const unsigned int p1 = min(p0 + chunk, kv_len);
+    const unsigned int wchunk = (p1 - p0 + nwarp - 1) / nwarp;
+    const unsigned int w_start = p0 + warp * wchunk;
+    const unsigned int w_end = min(w_start + wchunk, p1);
+
+    __shared__ float q_sh[256];
+    const __half *qh = q + ((size_t)b * params.n_head + h) * hd;
+    for (unsigned int d = threadIdx.x; d < hd; d += blockDim.x) q_sh[d] = __half2float(qh[d]);
+    __syncthreads();
+
+    float m_l = -INFINITY;
+    float l_l = 0.0f;
+    float acc[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) acc[i] = 0.0f;
+
+    for (unsigned int p = w_start; p < w_end; p++) {
+        const unsigned int page = bt[p / params.page_size];
+        const unsigned int row = page * params.page_size + p % params.page_size;
+        const __half *kp = k_pool + ((size_t)row * n_kv + kvh) * hd;
+        float part = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const unsigned int d = lane * 8 + i;
+            if (d < hd) part += q_sh[d] * __half2float(kp[d]);
+        }
+        for (int o = 16; o > 0; o >>= 1) part += __shfl_xor_sync(0xffffffff, part, o);
+        const float dot = part * params.scale;
+
+        const float m_new = fmaxf(m_l, dot);
+        const float corr = __expf(m_l - m_new);
+        const float p_exp = __expf(dot - m_new);
+        l_l = l_l * corr + p_exp;
+        m_l = m_new;
+
+        const __half *vp = v_pool + ((size_t)row * n_kv + kvh) * hd;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const unsigned int d = lane * 8 + i;
+            if (d < hd) acc[i] = acc[i] * corr + p_exp * __half2float(vp[d]);
+        }
+    }
+
+    __shared__ float warp_partial[4][2 + 256];
+    if (lane == 0) {
+        warp_partial[warp][0] = l_l > 0.0f ? m_l : -INFINITY;
+        warp_partial[warp][1] = l_l;
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const unsigned int d = lane * 8 + i;
+        if (d < hd) warp_partial[warp][2 + d] = acc[i];
+    }
+    __syncthreads();
+
+    __shared__ float block_max, block_sum;
+    if (threadIdx.x == 0) {
+        float m = -INFINITY;
+        for (unsigned int w = 0; w < nwarp; ++w) m = fmaxf(m, warp_partial[w][0]);
+        float l = 0.0f;
+        for (unsigned int w = 0; w < nwarp; ++w) {
+            if (warp_partial[w][1] > 0.0f) {
+                l += warp_partial[w][1] * __expf(warp_partial[w][0] - m);
+            }
+        }
+        block_max = m;
+        block_sum = l;
+        out[0] = l > 0.0f ? m : -INFINITY;
+        out[1] = l;
+    }
+    __syncthreads();
+    const float inv_l = block_sum > 0.0f ? 1.0f / block_sum : 0.0f;
+    for (unsigned int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float value = 0.0f;
+        for (unsigned int w = 0; w < nwarp; ++w) {
+            if (warp_partial[w][1] > 0.0f) {
+                value += warp_partial[w][2 + d] * __expf(warp_partial[w][0] - block_max);
+            }
+        }
+        out[2 + d] = value * inv_l;
+    }
+}
+
+extern "C" __global__ void flash_decode_paged_combine(
+    const float* __restrict__ partials,
+    __half* __restrict__ out,
+    const PagedFlashDecodeParams params
+) {
+    const unsigned int h = blockIdx.x;
+    const unsigned int b = blockIdx.y;
+    const unsigned int hd = params.hd;
+    const unsigned int NS = params.splits;
+    const size_t stride = 2 + hd;
+    const float *base = partials + ((size_t)b * params.n_head + h) * NS * stride;
+
+    __shared__ float m_g, l_g;
+    if (threadIdx.x == 0) {
+        float m = -INFINITY;
+        for (unsigned int s = 0; s < NS; s++) m = fmaxf(m, base[s * stride]);
+        float l = 0.0f;
+        for (unsigned int s = 0; s < NS; s++) {
+            const float *p = base + s * stride;
+            if (p[1] > 0.0f) l += p[1] * __expf(p[0] - m);
+        }
+        m_g = m;
+        l_g = l;
+    }
+    __syncthreads();
+
+    const float inv_l = l_g > 0.0f ? 1.0f / l_g : 0.0f;
+    __half *dst = out + ((size_t)b * params.n_head + h) * hd;
+    for (unsigned int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned int s = 0; s < NS; s++) {
+            const float *p = base + s * stride;
+            if (p[1] > 0.0f) acc += p[2 + d] * __expf(p[0] - m_g);
+        }
+        dst[d] = __float2half(acc * inv_l);
+    }
+}
+
 // --- Fused attention-prep для paged-декода (YTTRI_ATTN_PREP_FUSED=1) -------
 // Один запуск вместо ~15 мелких: q/k RMSNorm, partial RoPE (первые rope_dim из
 // hd), раскладка head-last для FA2, извлечение gate-половины q-проекции и каст

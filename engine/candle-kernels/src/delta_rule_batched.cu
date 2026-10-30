@@ -792,21 +792,20 @@ extern "C" __global__ void delta_rule_kernel_batched_warpcol(
 //
 // Launch: grid=(n_v, B, hd/CW), block=(32, 32), shared=CW*(hd+1)*4.
 // Требует hd == 128 и hd % CW == 0.
-extern "C" __global__ void __launch_bounds__(1024, 2) delta_rule_kernel_batched_tile(
+template <unsigned int CW, unsigned int WR>
+static __device__ __forceinline__ void delta_rule_tile_impl(
     const float* __restrict__ q,
     const float* __restrict__ k,
     const float* __restrict__ v,
     const float* __restrict__ beta,
     const float* __restrict__ gate,
-    float* __restrict__ ssm_state,   // persistent (real slot_idx), row-major S[row*hd+col]
+    float* __restrict__ ssm_state,
     float* __restrict__ output,
     const DeltaParams params,
     const unsigned int* __restrict__ slots
 ) {
     extern __shared__ float tile[];              // [CW][hd+1]
-    constexpr unsigned int CW = 64;
     constexpr unsigned int LANES = 32;
-    constexpr unsigned int WR = 32;              // warps на блок
     const unsigned int hd = params.head_v_dim;
     const unsigned int n_v = params.n_v_heads;
     const unsigned int head = blockIdx.x;
@@ -886,6 +885,24 @@ extern "C" __global__ void __launch_bounds__(1024, 2) delta_rule_kernel_batched_
             state[r * hd + (col0 + c)] = tile[c * TS + r];
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(1024, 2) delta_rule_kernel_batched_tile(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ beta,
+    const float* __restrict__ gate, float* __restrict__ ssm_state,
+    float* __restrict__ output, const DeltaParams params,
+    const unsigned int* __restrict__ slots) {
+    delta_rule_tile_impl<64, 32>(q, k, v, beta, gate, ssm_state, output, params, slots);
+}
+
+extern "C" __global__ void __launch_bounds__(1024, 1) delta_rule_kernel_batched_tile32w32r1(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ beta,
+    const float* __restrict__ gate, float* __restrict__ ssm_state,
+    float* __restrict__ output, const DeltaParams params,
+    const unsigned int* __restrict__ slots) {
+    delta_rule_tile_impl<32, 32>(q, k, v, beta, gate, ssm_state, output, params, slots);
 }
 
 // ═══════════════════════════════════════════════════════════════

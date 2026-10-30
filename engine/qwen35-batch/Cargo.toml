@@ -51,6 +51,7 @@ cuda = [
     "dep:cudarc",
     "dep:candle-flash-attn",
 ]
+turing = ["cuda", "candle-flash-attn/turing"]
 
 # Тест зовёт real::ytf16 и без объявления собирался даже без фич.
 # Соседи (vision_qwen35, prefix_snapshot_parity) закрыты внутренним
@@ -135,6 +136,16 @@ required-features = ["real-model", "cuda"]
 [[bin]]
 name = "bench_delta"
 path = "src/bin/bench_delta.rs"
+required-features = ["real-model", "cuda"]
+
+[[bin]]
+name = "fa_prefill_probe"
+path = "src/bin/fa_prefill_probe.rs"
+required-features = ["real-model", "cuda"]
+
+[[bin]]
+name = "fa_decode_probe"
+path = "src/bin/fa_decode_probe.rs"
 required-features = ["real-model", "cuda"]
 
 [[bin]]

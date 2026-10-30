@@ -26,8 +26,8 @@ use std::time::Instant;
 use anyhow::Result;
 
 use crate::model::{
-    BatchModel, DecodeBatch, DecodeItem, GreedySampler, PrefillChunk, Sampler, SpeculativeFallback,
-    SpeculativeMetrics,
+    BatchModel, DecodeBatch, DecodeItem, DecodeRow, GreedySampler, PrefillChunk, Sampler,
+    SpeculativeFallback, SpeculativeMetrics,
 };
 use crate::slot::{Slot, SlotRequest, SlotStatus};
 
@@ -65,10 +65,18 @@ impl SchedulerStats {
 /// Размер чанка prefill. usize::MAX = весь prompt одним forward (прототип).
 /// Ограничение обязательно для длинных промптов: цельный prefill на N токенов
 /// создаёт attention scores N×N×F32×heads (5.6K → ~2 GB transient → CUDA OOM
-/// на 12 GB карте). 512 → scores 512×kv_len, десятки MB.
+/// на 12 GB карте). 2048 → scores 2048×kv_len, сотни MB.
 /// Interleaving с decode других слотов безопасен: prefill копит single-slot
 /// state, decode работает по batched buffers — пересечений нет.
-pub const PREFILL_CHUNK: usize = 512;
+///
+/// Почему на Turing 2048, а не 512: рост чанка сокращает число переходов
+/// «хост ↔ GPU» на промпт, а вместе с ними и простои. Замер на RTX 2080 Ti
+/// (Ornith-1.5-9B Q4_K_M), tok/s при 512/1024/2048/4096: 2198 / 2211 /
+/// 2219 / 2208. За 2048 начинают расти транзиенты attention и время падает.
+///
+/// На остальных профилях остаётся 512: там чанк ограничен памятью под scores,
+/// а не простоями (27B на 12 ГБ — 2048×kv_len в F32 туда не влезает).
+pub const PREFILL_CHUNK: usize = if cfg!(feature = "turing") { 2048 } else { 512 };
 
 /// Размер чанка prefill с учётом env PREFILL_CHUNK (0/большое = целиком).
 #[inline]
@@ -1013,19 +1021,28 @@ impl<M: BatchModel> BatchScheduler<M> {
             let poss: Vec<usize> = batch.items.iter().map(|item| item.pos).collect();
             eprintln!("[step] decode begin B={} pos={poss:?}", batch.len());
         }
-        let logits = self.model.decode_batch(&batch)?;
-        if logits.len() != batch.len() {
+        let greedy: Vec<bool> = batch
+            .items
+            .iter()
+            .map(|item| self.sampler.greedy_for_slot(item.slot_idx))
+            .collect();
+        let rows = self.model.decode_batch_mixed(&batch, &greedy)?;
+        if rows.len() != batch.len() {
             anyhow::bail!(
                 "decode returned {} rows for batch {}",
-                logits.len(),
+                rows.len(),
                 batch.len()
             );
         }
-        for (item, logits) in batch.items.iter().zip(&logits) {
-            let generated = self.slots[item.slot_idx].generated_tokens().to_vec();
-            let token = self
-                .sampler
-                .sample_indexed(item.slot_idx, &generated, logits);
+        for (item, row) in batch.items.iter().zip(&rows) {
+            let token = match row {
+                DecodeRow::Token(token) => *token,
+                DecodeRow::Logits(logits) => {
+                    let generated = self.slots[item.slot_idx].generated_tokens().to_vec();
+                    self.sampler
+                        .sample_indexed(item.slot_idx, &generated, logits)
+                }
+            };
             self.stats.total_decode_tokens += 1;
             self.slots[item.slot_idx].push_token(token);
             if should_stop(item.slot_idx, self.slots[item.slot_idx].generated_tokens()) {
