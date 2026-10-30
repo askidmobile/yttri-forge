@@ -4497,8 +4497,10 @@ impl GatedAttentionLayer {
         // Prefill uses the same fused Q/K/V preparation kernel as decode: each
         // token is one row. This removes ~15 layout/norm/RoPE launches per
         // attention layer and keeps Q, K, V, and gate in persistent buffers.
+        // Ядро attn_prepare_decode живёт в flash_decode.cu (собирается и для
+        // sm75) и не использует sm80-only инструкций, поэтому на Turing оно
+        // тоже годится: 15 мелких запусков на слой превращаются в один.
         let fused_prep = crate::real::attn_prepare_cuda::enabled()
-            && !cfg!(feature = "turing")
             && !per_row_gqa
             && trie_ranges.is_none()
             && kv_exact_f16()
