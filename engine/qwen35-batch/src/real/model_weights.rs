@@ -5932,8 +5932,38 @@ impl HybridBlock {
         }
         let t_mix = std::time::Instant::now();
 
+        // PFB_SPLIT=1 — разбивка блока по стадиям через CUDA-события.
+        // Instant бесполезен: очередь асинхронна, меряем реальное GPU-время.
+        let split = std::env::var("PFB_SPLIT").as_deref() == Ok("1");
+        let mut events: Vec<(cudarc::driver::sys::CUevent, &'static str)> = Vec::new();
+        if split {
+            if let Ok(cd) = x.device().as_cuda_device() {
+                let stream = cd.cuda_stream().cu_stream();
+                for tag in [
+                    "start", "attn_norm", "layer", "ffn_norm", "ffn",
+                ] {
+                    let mut e: cudarc::driver::sys::CUevent = std::ptr::null_mut();
+                    // CU_EVENT_RECORD_EXTERNAL (0x1) — обязателен в capture.
+                    if unsafe { cudarc::driver::sys::cuEventCreate(&mut e, 1) }
+                        == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+                    {
+                        events.push((e, tag));
+                    }
+                }
+                let _ = stream;
+            }
+        }
+        let mark = |idx: usize| {
+            if let (Some((e, _)), Ok(cd)) = (events.get(idx), x.device().as_cuda_device()) {
+                let stream = cd.cuda_stream().cu_stream();
+                let _ = unsafe { cudarc::driver::result::event::record(*e, stream) };
+            }
+        };
+        mark(0);
+
         let residual = x;
         let normed = self.attn_norm.forward(x)?;
+        mark(1);
 
         let layer_out = match &mut self.layer {
             HybridLayerType::DeltaNet(delta) => delta.forward_prefill(&normed)?,
@@ -5941,6 +5971,7 @@ impl HybridBlock {
                 attn.forward_attn_with_rope(&normed, index_pos, rope)?
             }
         };
+        mark(2);
         let x = (layer_out + residual)?;
         let t_mix_el = t_mix.elapsed();
 
@@ -5948,8 +5979,25 @@ impl HybridBlock {
         let t_ffn = std::time::Instant::now();
         let residual = &x;
         let normed = self.ffn_norm.forward(&x)?;
+        mark(3);
         let ffn_out = self.ff.forward_prefill(&normed)?;
         let x = (ffn_out + residual)?;
+        mark(4);
+        if split && events.len() == 5 {
+            if let Ok(cd) = x.device().as_cuda_device() {
+                let _ = cd.cuda_stream().synchronize();
+            }
+            let mut parts = Vec::with_capacity(4);
+            for w in events.windows(2) {
+                let ms = unsafe { cudarc::driver::result::event::elapsed(w[0].0, w[1].0) }
+                    .unwrap_or(f32::NAN);
+                parts.push(format!("{}:{ms:.2}", w[1].1));
+            }
+            eprintln!("[pfb-split] {}", parts.join(" "));
+            for (e, _) in &events {
+                let _ = unsafe { cudarc::driver::sys::cuEventDestroy_v2(*e) };
+            }
+        }
         if trace {
             let mix_ms = t_mix_el.as_secs_f64() * 1000.0;
             let ffn_ms = t_ffn.elapsed().as_secs_f64() * 1000.0;
