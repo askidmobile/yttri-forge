@@ -9694,6 +9694,10 @@ impl ModelWeights {
                 let mut d_ms = 0f64;
                 let mut a_ms = 0f64;
                 for (bi, block) in self.blocks.iter_mut().enumerate() {
+                    if let (Some(evs), Ok(cd)) = (evs, layer_in.device().as_cuda_device()) {
+                        let stream = cd.cuda_stream().cu_stream();
+                        let _ = unsafe { cudarc::driver::result::event::record(evs[bi], stream) };
+                    }
                     let t0 = std::time::Instant::now();
                     let block_dev = block.device();
                     if !layer_in.device().same_device(&block_dev) {
@@ -9751,6 +9755,19 @@ impl ModelWeights {
                         unsafe { cudarc::driver::result::event::elapsed(evs[0], evs[last]) }
                     {
                         eprintln!("[pf-gpu] blocks_gpu={ms:.1}ms");
+                    }
+                    // PFB_PER_BLOCK=1 — по каждому блоку: какие слои медленные.
+                    // Показывает, помогает ли F16-кэш MLP на самом деле.
+                    if std::env::var("PFB_PER_BLOCK").as_deref() == Ok("1") {
+                        let mut per = Vec::with_capacity(self.blocks.len());
+                        for i in 0..self.blocks.len() {
+                            let ms = unsafe {
+                                cudarc::driver::result::event::elapsed(evs[i], evs[i + 1])
+                            }
+                            .unwrap_or(f32::NAN);
+                            per.push(format!("{i}:{ms:.2}"));
+                        }
+                        eprintln!("[pf-blocks] {}", per.join(" "));
                     }
                 }
             }
