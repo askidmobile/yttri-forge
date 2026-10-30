@@ -9679,6 +9679,18 @@ impl ModelWeights {
             #[cfg(not(target_os = "macos"))]
             {
                 let trace = crate::scheduler::trace_on();
+                // GPROF=1: реальное GPU-время блоков через CUDA-события.
+                // Instant-таймеры ниже меряют постановку в очередь, а не
+                // исполнение, поэтому их сумма может быть вдвое меньше факта.
+                let evs = if std::env::var("GPROF").as_deref() == Ok("1") {
+                    self.gprof_block_events.as_ref()
+                } else {
+                    None
+                };
+                if let (Some(evs), Ok(cd)) = (evs, layer_in.device().as_cuda_device()) {
+                    let stream = cd.cuda_stream().cu_stream();
+                    let _ = unsafe { cudarc::driver::result::event::record(evs[0], stream) };
+                }
                 let mut d_ms = 0f64;
                 let mut a_ms = 0f64;
                 for (bi, block) in self.blocks.iter_mut().enumerate() {
@@ -9728,6 +9740,18 @@ impl ModelWeights {
                 }
                 if trace {
                     eprintln!("[pf] chunk blocks: delta={d_ms:.1}ms attn={a_ms:.1}ms");
+                }
+                if let (Some(evs), Ok(cd)) = (evs, layer_in.device().as_cuda_device()) {
+                    let stream = cd.cuda_stream().cu_stream();
+                    let last = evs.len() - 1;
+                    let _ = unsafe { cudarc::driver::result::event::record(evs[last], stream) };
+                    let _ = cd.cuda_stream().synchronize();
+                    // elapsed возвращает миллисекунды.
+                    if let Ok(ms) =
+                        unsafe { cudarc::driver::result::event::elapsed(evs[0], evs[last]) }
+                    {
+                        eprintln!("[pf-gpu] blocks_gpu={ms:.1}ms");
+                    }
                 }
             }
             #[cfg(target_os = "macos")]
