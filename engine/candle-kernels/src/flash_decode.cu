@@ -314,7 +314,11 @@ extern "C" __global__ void flash_decode_paged_partial(
         out[1] = l;
     }
     __syncthreads();
-    const float inv_l = block_sum > 0.0f ? 1.0f / block_sum : 0.0f;
+    // ВАЖНО: частичный выход — НЕнормированный числитель. Combine-ядро само
+    // делит на глобальный l после взвешивания сплитов. Раньше здесь стояло
+    // `value * inv_l` — двойная нормировка уменьшала выход attention в ~l_s
+    // раз (найдено пробником prefill_sm75 parity 2026-10-31:
+    // |dec|/|cpu| = 1/13…1/500).
     for (unsigned int d = threadIdx.x; d < hd; d += blockDim.x) {
         float value = 0.0f;
         for (unsigned int w = 0; w < nwarp; ++w) {
@@ -322,7 +326,7 @@ extern "C" __global__ void flash_decode_paged_partial(
                 value += warp_partial[w][2 + d] * __expf(warp_partial[w][0] - block_max);
             }
         }
-        out[2 + d] = value * inv_l;
+        out[2 + d] = value;
     }
 }
 
