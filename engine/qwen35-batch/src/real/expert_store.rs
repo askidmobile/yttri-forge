@@ -256,6 +256,10 @@ pub struct ExpertMatrix {
     /// Байты одного эксперта: n · row_bytes.
     pub expert_bytes: usize,
     host: HostBuf,
+    /// Обычная RAM-копия весов (MOE_CPU=1): GEMV на CPU идёт по ней.
+    /// Managed-память из HostBuf для CPU-чтения плоха: страницы под GPU.
+    /// 18.6 ГиБ дублируются только когда ядро реально считает на CPU.
+    cpu_data: Option<Vec<u8>>,
     table: cudarc::driver::CudaSlice<u64>,
 }
 
@@ -316,6 +320,13 @@ impl ExpertMatrix {
         }
         let mut host = HostBuf::alloc(bytes)?;
         host.as_slice_mut().copy_from_slice(&data[start..start + size]);
+        // MOE_CPU=1: обычная RAM-копия, иначе CPU-GEMV читал бы managed
+        // память, чьи страницы держит GPU.
+        let cpu_data = if std::env::var("MOE_CPU").as_deref() == Ok("1") {
+            Some(data[start..start + size].to_vec())
+        } else {
+            None
+        };
         let table = alloc_host_table(dev, host.dev_ptr(), n_experts, expert_bytes)?;
         log::info!(
             "[moe] matrix: [{n_experts},{n},{k}] {dtype:?} — {:.1} МиБ {}",
@@ -332,6 +343,7 @@ impl ExpertMatrix {
             k,
             expert_bytes,
             host,
+            cpu_data,
             table,
         })
     }
@@ -344,9 +356,12 @@ impl ExpertMatrix {
         &mut self.table
     }
 
-    /// Pinned-байты эксперта (источник подъёма в кэш).
+    /// Байты эксперта: RAM-копия при MOE_CPU=1, иначе host-буфер CUDA.
     pub fn expert_host_slice(&self, expert: usize) -> &[u8] {
-        self.host.expert_slice(expert, self.expert_bytes)
+        match &self.cpu_data {
+            Some(d) => &d[expert * self.expert_bytes..(expert + 1) * self.expert_bytes],
+            None => self.host.expert_slice(expert, self.expert_bytes),
+        }
     }
 
     /// Табличная запись host-размещения эксперта (zero-copy адрес).
