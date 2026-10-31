@@ -4571,7 +4571,20 @@ impl GatedAttentionLayer {
             let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
             let block_table = ctx.block_table(b_sz)?;
             #[cfg(feature = "turing")]
-            let out = {
+            let out = if crate::real::flash_decode_cuda::prefill_sm75_enabled()
+                && seq_len >= crate::real::flash_decode_cuda::prefill_sm75_min_t()
+            {
+                // Тайловое sm75-ядро (Фаза 6): линейный по T трафик KV.
+                crate::real::flash_decode_cuda::dispatch_flash_prefill_sm75(
+                    q_f16.device().as_cuda_device()?,
+                    &q_f16,
+                    &pool.k_pool,
+                    &pool.v_pool,
+                    ctx,
+                    &block_table,
+                    scale,
+                )?
+            } else {
                 // FA2 в cuda-turing сборке отсутствует (turing-stub паникует).
                 // Пер-строчный split-KV decode: строка i видит префикс
                 // kv0+i+1 — та же механика, что в turing-ветке ниже и в
@@ -4764,7 +4777,22 @@ impl GatedAttentionLayer {
             );
         }
         #[cfg(feature = "turing")]
-        if turing_prefill {
+        if turing_prefill
+            && crate::real::flash_decode_cuda::prefill_sm75_enabled()
+            && seq_len >= crate::real::flash_decode_cuda::prefill_sm75_min_t()
+        {
+            // Тайловое sm75-ядро (Фаза 6).
+            let row_out = crate::real::flash_decode_cuda::dispatch_flash_prefill_sm75(
+                q_f16.device().as_cuda_device()?,
+                &q_f16,
+                &pool.k_pool,
+                &pool.v_pool,
+                ctx,
+                &block_table,
+                scale,
+            )?;
+            out.slice_set(&row_out.reshape(out.shape())?, 0, 0)?;
+        } else if turing_prefill {
             let seqlens_k = ctx.seqlens_k_for_verify(seq_len)?;
             let block_table = block_table.broadcast_as((seq_len, ctx.max_blocks))?.contiguous()?;
             let row_out = crate::real::flash_decode_cuda::dispatch_flash_decode_paged(

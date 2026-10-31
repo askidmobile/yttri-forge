@@ -222,6 +222,144 @@ pub fn dispatch_flash_decode_paged(
     )))
 }
 
+
+// ─── Тайловый prefill для Turing (sm_75) ─────────────────────────────────────
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FlashPrefillSm75Params {
+    pub n_head: u32,
+    pub n_kv: u32,
+    pub hd: u32,
+    pub t: u32,
+    pub b: u32,
+    pub page_size: u32,
+    pub block_table_stride: u32,
+    pub causal: u32,
+    pub scale: f32,
+}
+
+// SAFETY: POD repr(C) из u32/f32.
+unsafe impl cudarc::driver::DeviceRepr for FlashPrefillSm75Params {}
+
+/// `PREFILL_SM75=1` включает тайловый prefill-kernel на Turing.
+/// Фаза 6: по умолчанию выключен; Фаза 9 (после паритета и бенча) — включит.
+pub fn prefill_sm75_enabled() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| match std::env::var("PREFILL_SM75") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => false,
+    })
+}
+
+/// Чанки короче этого значения идут пер-строчным путём.
+pub fn prefill_sm75_min_t() -> usize {
+    static MIN_T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN_T.get_or_init(|| {
+        std::env::var("PREFILL_SM75_MIN_T")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(16)
+    })
+}
+
+/// Тайловый paged prefill-attention (см. docs/design/2026-10-31-sm75-prefill-kernel.md).
+///
+/// q: `[B·T, n_head, hd]` F16; пулы: `[pool_blocks, 64, n_kv, hd]` F16;
+/// block_table: `[B, max_blocks]` u32. Возвращает `[B·T, n_head, hd]` F16.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_prefill_sm75(
+    dev: &CudaDevice,
+    q: &Tensor,
+    k_pool: &Tensor,
+    v_pool: &Tensor,
+    ctx: &super::paged_kv_cuda::PagedModelCtx,
+    block_table: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    use super::paged_kv_cuda::{tensor_cuda_ptr, PAGE_SIZE};
+
+    let (rows, n_head, hd) = q.dims3()?;
+    let (pool_blocks, page_size, n_kv, pool_hd) = k_pool.dims4()?;
+    let (b, table_stride) = block_table.dims2()?;
+    if q.dtype() != candle_core::DType::F16
+        || k_pool.dtype() != candle_core::DType::F16
+        || v_pool.dtype() != candle_core::DType::F16
+    {
+        candle_core::bail!("sm75 prefill требует F16 q/k/v");
+    }
+    if b == 0 || rows % b != 0 {
+        candle_core::bail!("sm75 prefill: rows {rows} не делится на batch {b}");
+    }
+    if pool_hd != hd || n_kv == 0 || n_head % n_kv != 0 || hd != 256 {
+        candle_core::bail!(
+            "sm75 prefill dims: q={:?} k={:?} (нужен hd=256)",
+            q.dims(),
+            k_pool.dims()
+        );
+    }
+    if page_size != PAGE_SIZE {
+        candle_core::bail!("sm75 prefill: page_size {page_size}, ожидался {PAGE_SIZE}");
+    }
+    let t = rows / b;
+
+    let (q_st, q_lay) = q.storage_and_layout();
+    let (k_st, k_lay) = k_pool.storage_and_layout();
+    let (v_st, v_lay) = v_pool.storage_and_layout();
+    let q_v = view_f16(&q_st, q_lay.start_offset())?;
+    let k_v = view_f16(&k_st, k_lay.start_offset())?;
+    let v_v = view_f16(&v_st, v_lay.start_offset())?;
+    let kv_len_ptr = unsafe {
+        cudarc::driver::DevicePtr::device_ptr(&ctx.kv_len_dev, &dev.cuda_stream()).0
+    };
+    let slots_ptr = unsafe {
+        cudarc::driver::DevicePtr::device_ptr(&ctx.slots_dev, &dev.cuda_stream()).0
+    };
+    let bt_ptr = tensor_cuda_ptr(block_table)?;
+
+    let mut out = unsafe { dev.alloc::<half::f16>(rows * n_head * hd)? };
+    let params = FlashPrefillSm75Params {
+        n_head: n_head as u32,
+        n_kv: n_kv as u32,
+        hd: hd as u32,
+        t: t as u32,
+        b: b as u32,
+        page_size: PAGE_SIZE as u32,
+        block_table_stride: table_stride as u32,
+        causal: 1,
+        scale,
+    };
+    let func = dev.get_or_load_func("flash_prefill_sm75", &candle_kernels::FLASH_PREFILL_SM75)?;
+    func.set_attribute(
+        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        65536,
+    )
+    .map_err(candle_core::Error::wrap)?;
+    let cfg = LaunchConfig {
+        grid_dim: (t.div_ceil(64) as u32, n_head as u32, b as u32),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 65536,
+    };
+    let mut builder = func.builder();
+    builder.arg(&q_v);
+    builder.arg(&k_v);
+    builder.arg(&v_v);
+    builder.arg(&kv_len_ptr);
+    builder.arg(&slots_ptr);
+    builder.arg(&bt_ptr);
+    builder.arg(&mut out);
+    builder.arg(&0u64);
+    builder.arg(&params);
+    unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+
+    drop((q_st, k_st, v_st));
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev.clone());
+    Ok(Tensor::from((
+        candle_core::Storage::Cuda(storage),
+        (rows, n_head, hd),
+    )))
+}
+
 fn view_f16<'a>(
     st: &'a candle_core::Storage,
     offset: usize,

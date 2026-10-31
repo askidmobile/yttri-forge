@@ -927,6 +927,21 @@ parity: t=505 kv0=   0 mean|d|=2.012e-6 max|d|=2.441e-4
 t=16 — 4.4×, t=64 — 17.3×. Дефолт `PREFILL_SM75_MIN_T=16` оставлен с
 запасом.
 
+**Фаза 6 (2026-10-31) — интеграция за `PREFILL_SM75` OK.**
+`dispatch_flash_prefill_sm75` в `flash_decode_cuda.rs`, env-функции
+`prefill_sm75_enabled()`/`prefill_sm75_min_t()`, обе точки замены в
+`model_weights.rs` (fused_prep и turing_prefill). Сборка
+`cargo build --release --features cuda-turing` на стенде прошла; A/B на
+512-токенном промпте (greedy, 64 токена):
+
+```
+PREFILL_SM75=1: 1, 2, 3, ..., 64   (7.09 с)
+PREFILL_SM75=0: 1, 2, 3, ..., 64   (6.98 с)
+identical=True (64/64 символов)
+```
+
+Флаг по умолчанию выключен; fallback — прежний пер-строчный путь.
+
 ---
 
 ## 6. Правила ведения файла
