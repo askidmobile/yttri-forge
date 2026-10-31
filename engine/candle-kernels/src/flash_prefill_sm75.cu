@@ -119,3 +119,314 @@ extern "C" __global__ void flash_prefill_sm75_layout_probe(
     d_pv[(g + 8) * 8 + 2 * t + 1] = pv3;
 #endif
 }
+
+// ─── Боевое ядро (Фаза 2: фиксированная форма, без маски) ────────────────────
+
+struct FlashPrefillSm75Params {
+    unsigned int n_head;
+    unsigned int n_kv;
+    unsigned int hd;                 // 256 (контракт диспетчера)
+    unsigned int t;                  // строк Q в чанке
+    unsigned int b;                  // batch
+    unsigned int page_size;          // 64
+    unsigned int block_table_stride;
+    unsigned int causal;             // 1 — каузальная маска, 0 — все ключи
+    float scale;
+};
+
+#define YF_BR 64
+#define YF_BC 64
+#define YF_HD 256
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+__device__ __forceinline__ unsigned yf_pack_half2(float lo, float hi) {
+    __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<unsigned*>(&h);
+}
+
+// Загрузка 64×256 F16 тайла из пула в свизленный smem с zero-fill
+// невидимых токенов (alloc пула не инициализирован: 0·NaN отравил бы O).
+__device__ __forceinline__ void yf_load_pool_tile(
+    __half* __restrict__ dst,
+    const __half* __restrict__ pool,
+    unsigned int phys_page,
+    unsigned int n_kv,
+    unsigned int kvh,
+    unsigned int kv0_base,      // первый логический токен страницы
+    unsigned int k_end,
+    int threadIdx_flat)
+{
+    const unsigned int r_in_group = threadIdx_flat >> 3;   // 0..15
+    const unsigned int g = threadIdx_flat & 7;             // гранула внутри 64
+    #pragma unroll
+    for (int r0 = 0; r0 < 4; r0++) {
+        const unsigned int row = 16 * (unsigned int)r0 + r_in_group;
+        const unsigned int tok = kv0_base + row;
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const unsigned int col = 64u * (unsigned int)c + 8u * g;
+            int4* d = reinterpret_cast<int4*>(&dst[yf_smem_idx((int)row, (int)col)]);
+            if (tok < k_end) {
+                const __half* src = pool
+                    + (((size_t)phys_page * YF_BC + row) * n_kv + kvh) * YF_HD + col;
+                *d = *reinterpret_cast<const int4*>(src);
+            } else {
+                *d = make_int4(0, 0, 0, 0);
+            }
+        }
+    }
+}
+
+// Загрузка/выкладка Q-тайла 64×256 (row-major со свизлом).
+__device__ __forceinline__ void yf_load_q_tile(
+    __half* __restrict__ dst,
+    const __half* __restrict__ q,
+    unsigned int row_base,      // q0 строк в чанке
+    unsigned int t,
+    unsigned int n_head,
+    unsigned int h,
+    int threadIdx_flat)
+{
+    const unsigned int r_in_group = threadIdx_flat >> 3;
+    const unsigned int g = threadIdx_flat & 7;
+    #pragma unroll
+    for (int r0 = 0; r0 < 4; r0++) {
+        const unsigned int row = 16 * (unsigned int)r0 + r_in_group;
+        const bool valid = (row_base + row) < t;
+        const __half* src = q + ((size_t)(row_base + row) * n_head + h) * YF_HD;
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const unsigned int col = 64u * (unsigned int)c + 8u * g;
+            int4* d = reinterpret_cast<int4*>(&dst[yf_smem_idx((int)row, (int)col)]);
+            *d = valid ? *reinterpret_cast<const int4*>(src + col) : make_int4(0, 0, 0, 0);
+        }
+    }
+}
+
+__device__ __forceinline__ void yf_store_q_tile(
+    const __half* __restrict__ src_smem,
+    __half* __restrict__ out,
+    unsigned int row_base,
+    unsigned int t,
+    unsigned int n_head,
+    unsigned int h,
+    int threadIdx_flat)
+{
+    const unsigned int r_in_group = threadIdx_flat >> 3;
+    const unsigned int g = threadIdx_flat & 7;
+    #pragma unroll
+    for (int r0 = 0; r0 < 4; r0++) {
+        const unsigned int row = 16 * (unsigned int)r0 + r_in_group;
+        if ((row_base + row) >= t) {
+            continue;
+        }
+        __half* dst = out + ((size_t)(row_base + row) * n_head + h) * YF_HD;
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            const unsigned int col = 64u * (unsigned int)c + 8u * g;
+            *reinterpret_cast<int4*>(dst + col) =
+                *reinterpret_cast<const int4*>(&src_smem[yf_smem_idx((int)row, (int)col)]);
+        }
+    }
+}
+#endif
+
+// Тайловый paged prefill-attention: Br=64 (4 warp × 16 строк), Bc=64 = PAGE.
+// grid = (ceil(T/64), n_head, b), block = 128, dynamic smem = 65536 Б.
+// out допускает out == q (запись поверх Q после чтения тайла).
+extern "C" __global__ void flash_prefill_sm75(
+    const __half* q,
+    const __half* __restrict__ k_pool,
+    const __half* __restrict__ v_pool,
+    const unsigned int* __restrict__ kv_len,
+    const unsigned int* __restrict__ slots,
+    const unsigned int* __restrict__ block_table,
+    __half* out,
+    float* lse,
+    const FlashPrefillSm75Params params)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    extern __shared__ __align__(16) __half smem[];
+    __half* sQ = smem;                    // 64×256 half = 32 КиБ
+    __half* sKV = smem + YF_BR * YF_HD;   // 64×256 half = 32 КиБ
+
+    const unsigned int h = blockIdx.y;
+    const unsigned int b = blockIdx.z;
+    const unsigned int q0 = blockIdx.x * YF_BR;
+    const unsigned int n_head = params.n_head;
+    const unsigned int n_kv = params.n_kv;
+    const unsigned int kvh = h / (n_head / n_kv);
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31;
+    const unsigned int w = tid >> 5;
+    const unsigned int g = lane >> 2;     // 0..7
+    const unsigned int tg = lane & 3;     // 0..3
+
+    const unsigned int n_rows = min(YF_BR, params.t - q0);
+    const unsigned int kv0 = kv_len[slots[b]];
+    const unsigned int *bt = block_table + (size_t)b * params.block_table_stride;
+    unsigned int k_end = kv0 + q0 + n_rows;
+    const unsigned int pool_cap = params.block_table_stride * params.page_size;
+    if (k_end > pool_cap) {
+        k_end = pool_cap;
+    }
+    const unsigned int n_pages = (k_end + YF_BC - 1) / YF_BC;
+
+    // --- Q-тайл ---
+    yf_load_q_tile(sQ, q + (size_t)b * params.t * n_head * YF_HD, q0, params.t, n_head, h,
+                   (int)tid);
+    __syncthreads();
+
+    float O[32][4];
+    #pragma unroll
+    for (int dc = 0; dc < 32; dc++) {
+        O[dc][0] = 0.f; O[dc][1] = 0.f; O[dc][2] = 0.f; O[dc][3] = 0.f;
+    }
+    float m_x[2] = {-INFINITY, -INFINITY};
+    float m_ref[2] = {-INFINITY, -INFINITY};
+    float l_x[2] = {0.f, 0.f};
+
+    for (unsigned int p = 0; p < n_pages; p++) {
+        const unsigned int page = bt[p];
+        yf_load_pool_tile(sKV, k_pool, page, n_kv, kvh, p * YF_BC, k_end, (int)tid);
+        __syncthreads();
+
+        // --- QK^T: S[nc][4] ---
+        float S[8][4];
+        #pragma unroll
+        for (int nc = 0; nc < 8; nc++) {
+            S[nc][0] = 0.f; S[nc][1] = 0.f; S[nc][2] = 0.f; S[nc][3] = 0.f;
+        }
+        #pragma unroll
+        for (int kc = 0; kc < 32; kc++) {
+            unsigned a0, a1;
+            yf_ldmatrix_x2(a0, a1,
+                yf_smem_u32(&sQ[yf_smem_idx((int)(16 * w + (lane & 15)), 8 * kc)]));
+            #pragma unroll
+            for (int nc = 0; nc < 8; nc++) {
+                unsigned b0;
+                yf_ldmatrix_x1(b0,
+                    yf_smem_u32(&sKV[yf_smem_idx((int)(8 * nc + (lane & 7)), 8 * kc)]));
+                float d0, d1, d2, d3;
+                yf_mma_m16n8k8(d0, d1, d2, d3, a0, a1, b0,
+                               S[nc][0], S[nc][1], S[nc][2], S[nc][3]);
+                S[nc][0] = d0; S[nc][1] = d1; S[nc][2] = d2; S[nc][3] = d3;
+            }
+        }
+
+        // --- scale + маска; максимум строки по тайлу ---
+        float m_tile[2] = {-INFINITY, -INFINITY};
+        #pragma unroll
+        for (int nc = 0; nc < 8; nc++) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const int x = i >> 1;
+                const unsigned int row = 16 * w + g + 8 * x;
+                const unsigned int tok = p * YF_BC + 8 * nc + 2 * tg + (i & 1);
+                const bool vis = (row < n_rows) &&
+                    (params.causal == 0 || tok <= kv0 + q0 + row);
+                S[nc][i] = vis ? S[nc][i] * params.scale : -INFINITY;
+                m_tile[x] = fmaxf(m_tile[x], S[nc][i]);
+            }
+        }
+        #pragma unroll
+        for (int x = 0; x < 2; x++) {
+            m_tile[x] = fmaxf(m_tile[x], __shfl_xor_sync(0xffffffffu, m_tile[x], 1));
+            m_tile[x] = fmaxf(m_tile[x], __shfl_xor_sync(0xffffffffu, m_tile[x], 2));
+        }
+
+        // --- online softmax: норма на максимум тайла (см. дизайн §4.5) ---
+        float corr[2];
+        #pragma unroll
+        for (int x = 0; x < 2; x++) {
+            m_ref[x] = fmaxf(m_ref[x], m_tile[x]);
+            const float m_new = (m_tile[x] > -INFINITY)
+                ? fmaxf(m_tile[x], m_ref[x] - 40.f)
+                : m_x[x];
+            corr[x] = (m_x[x] > -INFINITY) ? __expf(m_x[x] - m_new) : 0.f;
+            l_x[x] *= corr[x];
+            m_x[x] = m_new;
+        }
+        #pragma unroll
+        for (int dc = 0; dc < 32; dc++) {
+            O[dc][0] *= corr[0]; O[dc][1] *= corr[0];
+            O[dc][2] *= corr[1]; O[dc][3] *= corr[1];
+        }
+
+        float sum[2] = {0.f, 0.f};
+        #pragma unroll
+        for (int nc = 0; nc < 8; nc++) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const int x = i >> 1;
+                const float sv = (S[nc][i] > -INFINITY) ? __expf(S[nc][i] - m_x[x]) : 0.f;
+                S[nc][i] = sv;
+                sum[x] += sv;
+            }
+        }
+        #pragma unroll
+        for (int x = 0; x < 2; x++) {
+            sum[x] += __shfl_xor_sync(0xffffffffu, sum[x], 1);
+            sum[x] += __shfl_xor_sync(0xffffffffu, sum[x], 2);
+            l_x[x] += sum[x];
+        }
+
+        unsigned P0[8], P1[8];
+        #pragma unroll
+        for (int nc = 0; nc < 8; nc++) {
+            P0[nc] = yf_pack_half2(S[nc][0], S[nc][1]);
+            P1[nc] = yf_pack_half2(S[nc][2], S[nc][3]);
+        }
+
+        // --- V этой же страницы ---
+        __syncthreads();
+        yf_load_pool_tile(sKV, v_pool, page, n_kv, kvh, p * YF_BC, k_end, (int)tid);
+        __syncthreads();
+
+        // --- P·V ---
+        #pragma unroll
+        for (int nc = 0; nc < 8; nc++) {
+            #pragma unroll
+            for (int dc = 0; dc < 32; dc++) {
+                unsigned bv;
+                yf_ldmatrix_x1_trans(bv,
+                    yf_smem_u32(&sKV[yf_smem_idx((int)(8 * nc + (lane & 7)), 8 * dc)]));
+                float d0, d1, d2, d3;
+                yf_mma_m16n8k8(d0, d1, d2, d3, P0[nc], P1[nc], bv,
+                               O[dc][0], O[dc][1], O[dc][2], O[dc][3]);
+                O[dc][0] = d0; O[dc][1] = d1; O[dc][2] = d2; O[dc][3] = d3;
+            }
+        }
+        __syncthreads();
+    }
+
+    // --- эпилог: O/l → F16 в sQ, затем в out ---
+    #pragma unroll
+    for (int dc = 0; dc < 32; dc++) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int x = i >> 1;
+            const unsigned int row = 16 * w + g + 8 * x;
+            const unsigned int d = 8 * dc + 2 * tg + (i & 1);
+            if (row < n_rows) {
+                const float inv = (l_x[x] > 0.f) ? (1.f / l_x[x]) : 0.f;
+                sQ[yf_smem_idx((int)row, (int)d)] = __float2half_rn(O[dc][i] * inv);
+            }
+        }
+    }
+    __syncthreads();
+    yf_store_q_tile(sQ, out + (size_t)b * params.t * n_head * YF_HD, q0, params.t, n_head,
+                    h, (int)tid);
+
+    if (lse != nullptr) {
+        #pragma unroll
+        for (int x = 0; x < 2; x++) {
+            const unsigned int row = 16 * w + g + 8 * x;
+            if (row < n_rows && tg == 0) {
+                lse[h * (params.b * params.t) + b * params.t + q0 + row] =
+                    (l_x[x] > 0.f) ? (m_x[x] + logf(l_x[x])) : -INFINITY;
+            }
+        }
+    }
+#endif
+}
