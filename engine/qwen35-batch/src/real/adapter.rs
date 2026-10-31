@@ -139,6 +139,15 @@ fn launch_decode_argmax(
             })
         }
         .map_err(candle_core::Error::wrap)?;
+        if crate::real::flash_decode_cuda::nan_trace_enabled() {
+            if let Ok(row_t) = logits.flatten_all()?.narrow(0, row_idx * vocab, vocab) {
+                crate::real::flash_decode_cuda::check_nonfinite_f32(cuda_dev, "logits", &row_t)?;
+            }
+            let argmax = cuda_dev
+                .clone_dtoh(&tokens.slice(row_idx..row_idx + 1))
+                .map_err(candle_core::Error::wrap)?;
+            eprintln!("[nancheck] tag=argmax row={row_idx} id={}", argmax[0]);
+        }
     }
     Ok(())
 }

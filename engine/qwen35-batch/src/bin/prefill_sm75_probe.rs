@@ -21,8 +21,9 @@ fn main() -> Result<()> {
         "causal" => causal(),
         "paged" => paged(),
         "parity" => parity(),
+        "longcxt" => longcxt(),
         "perf" => perf(),
-        other => bail!("неизвестный режим {other:?}; поддержаны: layout, fixed, causal, paged, parity, perf"),
+        other => bail!("неизвестный режим {other:?}; поддержаны: layout, fixed, causal, paged, parity, perf, longcxt"),
     }
 }
 
@@ -407,6 +408,7 @@ fn causal() -> Result<()> {
     let ts = [1usize, 16, 63, 64, 65, 127, 128];
     let kv0s = [0usize, 1, 63, 64, 65, 4113, 8191];
     let heads = [0usize, 8];
+    let _ = (&ts, &kv0s, &heads);
     let mut worst_mean = 0f64;
     let mut worst_max = 0f32;
     for &t in &ts {
@@ -875,5 +877,70 @@ fn perf() -> Result<()> {
         );
     }
     println!("perf done");
+    Ok(())
+}
+
+/// Фаза B: длинные контексты с F64-эталоном, режимы peaky/diffuse/one.
+fn longcxt() -> Result<()> {
+    use candle_core::{DType, Tensor};
+
+    let nh = 16usize;
+    let nkv = 2usize;
+    let scale = 1.0f32 / (HD as f32).sqrt();
+    let heads = [0usize, 8usize];
+
+    // Скаляр: большие контексты — только 2 головы, по T=64 (2 страницы Q).
+    let cases = [(8192usize, 64usize, "diffuse"), (32768, 64, "diffuse"),
+                 (65536, 64, "diffuse"), (131072, 64, "diffuse")];
+    for &(c, t, data) in &cases {
+        let kv0 = c - t;
+        let tag = 8000 + c as u64;
+        let (qf, kf, vf, table) = gen_vectors(t, kv0, nh, nkv, tag, false, false);
+        let pages = (kv0 + t).div_ceil(PAGE);
+        let case = Case { t, kv0, causal: true, nh, nkv,
+                          ref_heads: &heads, seed_tag: tag,
+                          shuffle: false, poison: false, inplace: false,
+                          want_lse: false, batch: 1 };
+        let o = run_case(&case)?;
+        // Точный F64-эталон только для 2 голов
+        let q32: Vec<f32> = qf.iter().map(|x| x.to_f32()).collect();
+        let k32: Vec<f32> = kf.iter().map(|x| x.to_f32()).collect();
+        let v32: Vec<f32> = vf.iter().map(|x| x.to_f32()).collect();
+        let group = nh / nkv;
+        let mut max_d = 0f64;
+        for &h in &heads {
+            let kvh = h / group;
+            for row in 0..t {
+                let pos = kv0 + row;
+                let q_base = (row * nh + h) * HD;
+                let n_vis = pos + 1;
+                let mut logits = vec![0f64; n_vis];
+                for tok in 0..n_vis {
+                    let k_base = (tok * nkv + kvh) * HD;
+                    let mut acc = 0f64;
+                    for d in 0..HD {
+                        acc += q32[q_base + d] as f64 * k32[k_base + d] as f64;
+                    }
+                    logits[tok] = acc * scale as f64;
+                }
+                let mmax = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let mut l = 0f64;
+                for x in logits.iter_mut() { *x = (*x - mmax).exp(); l += *x; }
+                let inv = 1.0 / l;
+                for d in 0..HD {
+                    let mut acc = 0f64;
+                    for tok in 0..n_vis {
+                        let v_base = (tok * nkv + kvh) * HD;
+                        acc += logits[tok] * v32[v_base + d] as f64;
+                    }
+                    let got = o.got[((row * nh) + h) * HD + d] as f64;
+                    max_d = max_d.max((acc * inv - got).abs());
+                }
+            }
+        }
+        println!("longcxt/{data} C={c}: max|d|={max_d:.3e}");
+        if max_d > 5e-3 { bail!("longcxt/{data} C={c} max {max_d:.3e} > 5e-3"); }
+    }
+    println!("longcxt OK");
     Ok(())
 }

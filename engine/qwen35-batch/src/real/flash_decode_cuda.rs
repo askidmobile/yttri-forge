@@ -360,6 +360,197 @@ pub fn dispatch_flash_prefill_sm75(
     )))
 }
 
+
+// ─── Диагностика PREFILL_NAN_TRACE ──────────────────────────────────────────
+
+static NAN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NAN_COUNTER: std::sync::Mutex<Option<cudarc::driver::CudaSlice<u32>>> =
+    std::sync::Mutex::new(None);
+
+pub fn nan_trace_enabled() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var("PREFILL_NAN_TRACE").map(|v| v.trim() != "0").unwrap_or(false))
+}
+
+fn nan_stride() -> u64 {
+    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("PREFILL_NAN_STRIDE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&v: &u64| v > 0)
+            .unwrap_or(10)
+    })
+}
+
+/// Посчитать NaN/Inf в F16-тензоре и залогировать строкой
+/// `[nancheck] call=N seq=T tag=... n=K`. Проверка идёт раз в `stride`
+/// вызовов (по умолчанию 10 — раз на чанк, последний слой), счётчик-буфер
+/// переиспользуется: на 130k первых версий с аллокацией на слой был OOM.
+pub fn check_nonfinite_f16(dev: &CudaDevice, tag: &str, t: &Tensor, seq_len: usize) -> Result<()> {
+    if !nan_trace_enabled() {
+        return Ok(());
+    }
+    let call = NAN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if call % nan_stride() != 0 {
+        return Ok(());
+    }
+    if t.dtype() != candle_core::DType::F16 {
+        eprintln!("[nancheck] call={call} seq={seq_len} tag={tag} skipped_non_f16");
+        return Ok(());
+    }
+    let (st, lay) = t.storage_and_layout();
+    let v = view_f16(&st, lay.start_offset())?;
+    let n = t.elem_count() as u32;
+    let mut guard = NAN_COUNTER.lock().expect("nan counter lock");
+    if guard.is_none() {
+        *guard = Some(dev.alloc_zeros::<u32>(1).map_err(candle_core::Error::wrap)?);
+    }
+    let counter = guard.as_mut().expect("nan counter just allocated");
+    dev.cuda_stream()
+        .memset_zeros(counter)
+        .map_err(candle_core::Error::wrap)?;
+    let func = dev.get_or_load_func(
+        "yf_count_nonfinite_f16",
+        &candle_kernels::FLASH_PREFILL_SM75,
+    )?;
+    let blocks = n.div_ceil(256).clamp(1, 2048);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = func.builder();
+    builder.arg(&v);
+    builder.arg(&n);
+    builder.arg(&mut *counter);
+    unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    dev.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+    let host = dev.clone_dtoh(&*counter).map_err(candle_core::Error::wrap)?;
+    drop(st);
+    eprintln!("[nancheck] call={call} seq={seq_len} tag={tag} n={}", host[0]);
+    Ok(())
+}
+
+
+static LOGIT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+
+/// Принудительная проверка (без страйда): используется для трассы блоков.
+pub fn check_nonfinite_force(dev: &CudaDevice, tag: &str, t: &Tensor) -> Result<()> {
+    if !nan_trace_enabled() {
+        return Ok(());
+    }
+    match t.dtype() {
+        candle_core::DType::F16 => {
+            let (st, lay) = t.storage_and_layout();
+            let v = view_f16(&st, lay.start_offset())?;
+            let n = t.elem_count() as u32;
+            count_launch(dev, tag, "f16", &v, n)?;
+            drop(st);
+            Ok(())
+        }
+        candle_core::DType::F32 => {
+            let (st, lay) = t.storage_and_layout();
+            let v = match &*st {
+                candle_core::Storage::Cuda(cs) => {
+                    cs.as_cuda_slice::<f32>()?.slice(lay.start_offset()..)
+                }
+                _ => candle_core::bail!("check_nonfinite_force: ожидался CUDA"),
+            };
+            let n = t.elem_count() as u32;
+            count_launch(dev, tag, "f32", &v, n)?;
+            drop(st);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn count_launch<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + 'static>(
+    dev: &CudaDevice,
+    tag: &str,
+    kind: &str,
+    view: &cudarc::driver::CudaView<'_, T>,
+    n: u32,
+) -> Result<()> {
+    let mut guard = NAN_COUNTER.lock().expect("nan counter lock");
+    if guard.is_none() {
+        *guard = Some(dev.alloc_zeros::<u32>(1).map_err(candle_core::Error::wrap)?);
+    }
+    let counter = guard.as_mut().expect("counter");
+    dev.cuda_stream()
+        .memset_zeros(counter)
+        .map_err(candle_core::Error::wrap)?;
+    let name = if kind == "f16" {
+        "yf_count_nonfinite_f16"
+    } else {
+        "yf_count_nonfinite_f32"
+    };
+    let func = dev.get_or_load_func(name, &candle_kernels::FLASH_PREFILL_SM75)?;
+    let blocks = n.div_ceil(256).clamp(1, 2048);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = func.builder();
+    builder.arg(view);
+    builder.arg(&n);
+    builder.arg(&mut *counter);
+    unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    dev.cuda_stream()
+        .synchronize()
+        .map_err(candle_core::Error::wrap)?;
+    let host = dev.clone_dtoh(&*counter).map_err(candle_core::Error::wrap)?;
+    eprintln!("[nancheck] force tag={tag} n={}", host[0]);
+    Ok(())
+}
+
+/// Диагностика логитов (PREFILL_NAN_TRACE=1): сколько NaN/Inf в строке.
+pub fn check_nonfinite_f32(dev: &CudaDevice, tag: &str, t: &Tensor) -> Result<()> {
+    if !nan_trace_enabled() || t.dtype() != candle_core::DType::F32 {
+        return Ok(());
+    }
+    let call = LOGIT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let (st, lay) = t.storage_and_layout();
+    let v = match &*st {
+        candle_core::Storage::Cuda(cs) => cs.as_cuda_slice::<f32>()?.slice(lay.start_offset()..),
+        _ => candle_core::bail!("check_nonfinite_f32: ожидался CUDA-тензор"),
+    };
+    let n = t.elem_count() as u32;
+    let mut guard = NAN_COUNTER.lock().expect("nan counter lock");
+    if guard.is_none() {
+        *guard = Some(dev.alloc_zeros::<u32>(1).map_err(candle_core::Error::wrap)?);
+    }
+    let counter = guard.as_mut().expect("nan counter just allocated");
+    dev.cuda_stream()
+        .memset_zeros(counter)
+        .map_err(candle_core::Error::wrap)?;
+    let func = dev.get_or_load_func(
+        "yf_count_nonfinite_f32",
+        &candle_kernels::FLASH_PREFILL_SM75,
+    )?;
+    let blocks = n.div_ceil(256).clamp(1, 2048);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = func.builder();
+    builder.arg(&v);
+    builder.arg(&n);
+    builder.arg(&mut *counter);
+    unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    dev.cuda_stream()
+        .synchronize()
+        .map_err(candle_core::Error::wrap)?;
+    let host = dev.clone_dtoh(&*counter).map_err(candle_core::Error::wrap)?;
+    drop(st);
+    eprintln!("[nancheck] call={call} tag={tag} n={}", host[0]);
+    Ok(())
+}
+
 fn view_f16<'a>(
     st: &'a candle_core::Storage,
     offset: usize,

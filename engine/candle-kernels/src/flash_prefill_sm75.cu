@@ -353,15 +353,29 @@ extern "C" __global__ void flash_prefill_sm75(
             O[dc][2] *= corr[1]; O[dc][3] *= corr[1];
         }
 
+        // Фаза D: l должна суммироваться из ТОГО ЖЕ значения P, которое
+        // получит mma (F16-округление), иначе O и l расходятся на ~5e-4 на
+        // тайл. Округляем p -> half -> float, и эти же half уходят в P.
+        unsigned P0[8], P1[8];
         float sum[2] = {0.f, 0.f};
         #pragma unroll
         for (int nc = 0; nc < 8; nc++) {
+            float p[4];
             #pragma unroll
             for (int i = 0; i < 4; i++) {
-                const int x = i >> 1;
-                const float sv = (S[nc][i] > -INFINITY) ? __expf(S[nc][i] - m_x[x]) : 0.f;
-                S[nc][i] = sv;
-                sum[x] += sv;
+                p[i] = (S[nc][i] > -INFINITY) ? __expf(S[nc][i] - m_x[i >> 1]) : 0.f;
+            }
+            P0[nc] = yf_pack_half2(p[0], p[1]);
+            P1[nc] = yf_pack_half2(p[2], p[3]);
+            {
+                __half2 h2 = *reinterpret_cast<__half2*>(&P0[nc]);
+                float2 f2 = __half22float2(h2);
+                sum[0] += f2.x + f2.y;
+            }
+            {
+                __half2 h2 = *reinterpret_cast<__half2*>(&P1[nc]);
+                float2 f2 = __half22float2(h2);
+                sum[1] += f2.x + f2.y;
             }
         }
         #pragma unroll
@@ -369,13 +383,6 @@ extern "C" __global__ void flash_prefill_sm75(
             sum[x] += __shfl_xor_sync(0xffffffffu, sum[x], 1);
             sum[x] += __shfl_xor_sync(0xffffffffu, sum[x], 2);
             l_x[x] += sum[x];
-        }
-
-        unsigned P0[8], P1[8];
-        #pragma unroll
-        for (int nc = 0; nc < 8; nc++) {
-            P0[nc] = yf_pack_half2(S[nc][0], S[nc][1]);
-            P1[nc] = yf_pack_half2(S[nc][2], S[nc][3]);
         }
 
         // --- V этой же страницы ---
@@ -429,4 +436,34 @@ extern "C" __global__ void flash_prefill_sm75(
         }
     }
 #endif
+}
+
+// ─── Диагностика (PREFILL_NAN_TRACE=1) ───────────────────────────────────────
+// Счётчик NaN/Inf в F16-тензоре: ищем, где именно ломается 128k-префил.
+extern "C" __global__ void yf_count_nonfinite_f16(
+    const __half* __restrict__ x,
+    unsigned int n,
+    unsigned int* __restrict__ out)
+{
+    unsigned int c = 0;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float v = __half2float(x[i]);
+        if (isnan(v) || isinf(v)) c++;
+    }
+    if (c) atomicAdd(out, c);
+}
+
+extern "C" __global__ void yf_count_nonfinite_f32(
+    const float* __restrict__ x,
+    unsigned int n,
+    unsigned int* __restrict__ out)
+{
+    unsigned int c = 0;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float v = x[i];
+        if (isnan(v) || isinf(v)) c++;
+    }
+    if (c) atomicAdd(out, c);
 }

@@ -4575,7 +4575,7 @@ impl GatedAttentionLayer {
                 && seq_len >= crate::real::flash_decode_cuda::prefill_sm75_min_t()
             {
                 // Тайловое sm75-ядро (Фаза 6): линейный по T трафик KV.
-                crate::real::flash_decode_cuda::dispatch_flash_prefill_sm75(
+                let o = crate::real::flash_decode_cuda::dispatch_flash_prefill_sm75(
                     q_f16.device().as_cuda_device()?,
                     &q_f16,
                     &pool.k_pool,
@@ -4583,7 +4583,14 @@ impl GatedAttentionLayer {
                     ctx,
                     &block_table,
                     scale,
-                )?
+                )?;
+                crate::real::flash_decode_cuda::check_nonfinite_f16(
+                    q_f16.device().as_cuda_device()?,
+                    "fused_prep_out",
+                    &o,
+                    seq_len,
+                )?;
+                o
             } else {
                 // FA2 в cuda-turing сборке отсутствует (turing-stub паникует).
                 // Пер-строчный split-KV decode: строка i видит префикс
@@ -4790,6 +4797,12 @@ impl GatedAttentionLayer {
                 ctx,
                 &block_table,
                 scale,
+            )?;
+            crate::real::flash_decode_cuda::check_nonfinite_f16(
+                q_f16.device().as_cuda_device()?,
+                "prefill_out",
+                &row_out,
+                seq_len,
             )?;
             out.slice_set(&row_out.reshape(out.shape())?, 0, 0)?;
         } else if turing_prefill {
@@ -10271,14 +10284,33 @@ impl ModelWeights {
         // (kv_len инкрементируется только в конце). Один launch вместо N.
         ctx.seqlens_k_for_prefill(1, t_len)?;
 
+        let mut block_idx = 0usize;
+        let n_blocks = self.blocks.len();
         for block in self.blocks.iter_mut() {
             layer_in = block.forward_prefill_paged(&layer_in, ctx, rope_pos_dev, reset_state)?;
+            if (block_idx % 10 == 9 || block_idx + 1 == n_blocks)
+                && crate::real::flash_decode_cuda::nan_trace_enabled()
+            {
+                crate::real::flash_decode_cuda::check_nonfinite_force(
+                    emb_in.device().as_cuda_device()?,
+                    &format!("block_{}", block_idx + 1),
+                    &layer_in,
+                )?;
+            }
+            block_idx += 1;
         }
 
         // kv_len[slot] += T — после ВСЕХ attention слоёв (все слои видят одну длину).
         ctx.launch_increment_t(1, t_len)?;
 
         let hidden_all = self.norm.forward(&layer_in)?;
+        if crate::real::flash_decode_cuda::nan_trace_enabled() {
+            crate::real::flash_decode_cuda::check_nonfinite_force(
+                emb_in.device().as_cuda_device()?,
+                "final_norm",
+                &hidden_all,
+            )?;
+        }
         // head только над последней позицией
         let hidden_last = hidden_all.i((.., t_len - 1..t_len, ..))?;
         let logits = self.output.forward(&hidden_last)?;
