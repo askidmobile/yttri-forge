@@ -14,6 +14,8 @@ pub enum Id {
     DeltaRuleBatched,
     /// Split-K flash-decoding (длинный KV, seqlen_q=1).
     FlashDecode,
+    /// Тайловый prefill-attention для Turing (sm_75), см. docs/design.
+    FlashPrefillSm75,
     Fill,
     Indexing,
     Moe,
@@ -35,7 +37,7 @@ pub enum Id {
     MmqDp4a,
 }
 
-pub const ALL_IDS: [Id; 20] = [
+pub const ALL_IDS: [Id; 21] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -43,6 +45,7 @@ pub const ALL_IDS: [Id; 20] = [
     Id::DeltaRule,
     Id::DeltaRuleBatched,
     Id::FlashDecode,
+    Id::FlashPrefillSm75,
     Id::Fill,
     Id::Indexing,
     Id::Moe,
@@ -99,6 +102,7 @@ mdl!(CAST, Cast);
 mdl!(CONV, Conv);
 mdl!(DELTA_RULE, DeltaRule);
 mdl!(FLASH_DECODE, FlashDecode);
+mdl!(FLASH_PREFILL_SM75, FlashPrefillSm75);
 mdl!(DELTA_RULE_BATCHED, DeltaRuleBatched);
 mdl!(FILL, Fill);
 mdl!(INDEXING, Indexing);

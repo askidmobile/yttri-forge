@@ -832,6 +832,23 @@ qwen35moe.context_length           = 262144
 **Вердикт:** предпосылки дизайна подтверждены; ядро проектируется под
 `n_head=16, n_kv=2, hd=256, page=64`, но параметризовано по `n_head`/`n_kv`.
 
+**Фаза 1 (2026-10-31) — layout OK на железе.** Добавлен модуль
+`engine/candle-kernels/src/flash_prefill_sm75.cu` (пока только служебное
+ядро `flash_prefill_sm75_layout_probe`) и бинарник
+`qwen35-batch/src/bin/prefill_sm75_probe.rs` (режим `layout`). Проверено на
+2080 Ti:
+
+```
+device: cc=7.5 sm=68 smem_optin=65536 B
+layout: max|dQK|=2.384e-7 max|dPV|=2.384e-7
+layout OK
+```
+
+То есть подтверждены: свизл `yf_smem_idx`, `ldmatrix.x2` для A 16×8,
+`ldmatrix.x1` для K→B, `ldmatrix.x1.trans` для V→B и `mma.m16n8k8`
+(ошибка на уровне F32-округления). CPU-сборка crate проходит
+(`cargo check -p qwen35-batch`).
+
 ---
 
 ## 6. Правила ведения файла
