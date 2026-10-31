@@ -1133,31 +1133,58 @@ pub fn moe_cpu_enabled() -> bool {
 #[cfg(feature = "cuda")]
 mod cpu_moe {
     use super::*;
-    use candle_core::quantized::k_quants::{BlockQ4K, BlockQ8K, QK_K};
-    use candle_core::quantized::GgmlType;
+    use candle_core::quantized::k_quants::{BlockQ4K, BlockQ6K, BlockQ8K, QK_K};
+    use candle_core::quantized::{GgmlType, GgmlDType};
     use rayon::prelude::*;
 
-    /// GEMV Q4_K: `w` — сырые блоки [n_rows × k/256], `x8` — квантованная
-    /// активация [k/256]. Строки считаются параллельно по потокам rayon.
-    pub fn gemv_q4k(w: &[u8], x8: &[BlockQ8K], n_rows: usize, k: usize) -> Result<Vec<f32>> {
+    /// GEMV по сырым байтам Q4_K / Q6_K. Строки идут параллельно по rayon.
+    /// dtype выбирается по матрице: в GGUF down-проекция экспертов обычно
+    /// Q6_K, а gate/up — Q4_K; читать их одним типом нельзя (мусор).
+    pub fn gemv(
+        w: &[u8],
+        dtype: GgmlDType,
+        x8: &[BlockQ8K],
+        n_rows: usize,
+        k: usize,
+    ) -> Result<Vec<f32>> {
         let blocks_per_row = k / QK_K;
-        let need = n_rows * blocks_per_row;
-        let have = w.len() / std::mem::size_of::<BlockQ4K>();
-        if have < need {
-            candle_core::bail!("gemv_q4k: байт {} мало для {n_rows}×{k} (нужно {need} блоков)", w.len());
+        match dtype {
+            GgmlDType::Q4K => {
+                let need = n_rows * blocks_per_row;
+                let bs = std::mem::size_of::<BlockQ4K>();
+                if w.len() < need * bs {
+                    candle_core::bail!(
+                        "cpu gemv q4k: {} байт мало для {n_rows}×{k} (нужно {})",
+                        w.len(),
+                        need * bs
+                    );
+                }
+                let wb: &[BlockQ4K] =
+                    unsafe { std::slice::from_raw_parts(w.as_ptr() as *const BlockQ4K, need) };
+                Ok((0..n_rows)
+                    .into_par_iter()
+                    .map(|r| BlockQ4K::vec_dot(k, &wb[r * blocks_per_row..(r + 1) * blocks_per_row], x8))
+                    .collect())
+            }
+            GgmlDType::Q6K => {
+                let need = n_rows * blocks_per_row;
+                let bs = std::mem::size_of::<BlockQ6K>();
+                if w.len() < need * bs {
+                    candle_core::bail!(
+                        "cpu gemv q6k: {} байт мало для {n_rows}×{k} (нужно {})",
+                        w.len(),
+                        need * bs
+                    );
+                }
+                let wb: &[BlockQ6K] =
+                    unsafe { std::slice::from_raw_parts(w.as_ptr() as *const BlockQ6K, need) };
+                Ok((0..n_rows)
+                    .into_par_iter()
+                    .map(|r| BlockQ6K::vec_dot(k, &wb[r * blocks_per_row..(r + 1) * blocks_per_row], x8))
+                    .collect())
+            }
+            other => candle_core::bail!("cpu gemv: dtype {other:?} не поддержан"),
         }
-        // Сырые байты GGUF — это уже раскладка BlockQ4K; выравнивание
-        // обеспечивает host-буфер CUDA (≥256 Б).
-        let wb: &[BlockQ4K] = unsafe {
-            std::slice::from_raw_parts(w.as_ptr() as *const BlockQ4K, need)
-        };
-        Ok((0..n_rows)
-            .into_par_iter()
-            .map(|r| {
-                let row = &wb[r * blocks_per_row..(r + 1) * blocks_per_row];
-                BlockQ4K::vec_dot(k, row, x8)
-            })
-            .collect())
     }
 
     /// Квантование активации f32 → Q8_K (та же схема, что ждёт vec_dot).
@@ -1168,29 +1195,6 @@ mod cpu_moe {
         let mut out = vec![BlockQ8K::zeros(); x.len() / QK_K];
         BlockQ8K::from_float(x, &mut out);
         Ok(out)
-    }
-
-    /// Один эксперт: gate/up → SwiGLU → down, всё на CPU по сырым байтам.
-    pub fn expert_forward(
-        gate_w: &[u8],
-        up_w: &[u8],
-        down_w: &[u8],
-        x8: &[BlockQ8K],
-        n_ff: usize,
-        n_embd: usize,
-    ) -> Result<Vec<f32>> {
-        let gate = gemv_q4k(gate_w, x8, n_ff, n_embd)?;
-        let up = gemv_q4k(up_w, x8, n_ff, n_embd)?;
-        let act: Vec<f32> = gate
-            .iter()
-            .zip(up.iter())
-            .map(|(&g, &u)| {
-                let s = g / (1.0 + (-g).exp());
-                s * u
-            })
-            .collect();
-        let act8 = quantize_activation(&act)?;
-        gemv_q4k(down_w, &act8, n_embd, n_ff)
     }
 }
 
@@ -1217,23 +1221,24 @@ pub fn moe_forward_cpu(
     }
     let x8 = cpu_moe::quantize_activation(xs_cpu)?;
     let mut acc = vec![0f32; n_embd];
-    for (jm, (&e, &w)) in ids.iter().zip(weights.iter()).enumerate() {
+    for (&e, &w) in ids.iter().zip(weights.iter()) {
         let e = e as usize;
         if e >= st.gate.n_experts {
             continue;
         }
-        let out = cpu_moe::expert_forward(
-            st.gate.expert_host_slice(e),
-            st.up.expert_host_slice(e),
-            st.down.expert_host_slice(e),
-            &x8,
-            n_ff,
-            n_embd,
-        )?;
+        let gate = cpu_moe::gemv(
+            st.gate.expert_host_slice(e), st.gate.dtype, &x8, n_ff, n_embd)?;
+        let up = cpu_moe::gemv(
+            st.up.expert_host_slice(e), st.up.dtype, &x8, n_ff, n_embd)?;
+        let act: Vec<f32> = gate.iter().zip(up.iter())
+            .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
+            .collect();
+        let act8 = cpu_moe::quantize_activation(&act)?;
+        let out = cpu_moe::gemv(
+            st.down.expert_host_slice(e), st.down.dtype, &act8, n_embd, n_ff)?;
         for (a, v) in acc.iter_mut().zip(out.iter()) {
             *a += w * v;
         }
-        let _ = jm;
     }
     Ok(acc)
 }
