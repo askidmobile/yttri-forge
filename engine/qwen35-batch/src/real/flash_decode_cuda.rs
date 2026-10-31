@@ -242,13 +242,22 @@ pub struct FlashPrefillSm75Params {
 // SAFETY: POD repr(C) из u32/f32.
 unsafe impl cudarc::driver::DeviceRepr for FlashPrefillSm75Params {}
 
-/// `PREFILL_SM75=1` включает тайловый prefill-kernel на Turing.
-/// Фаза 6: по умолчанию выключен; Фаза 9 (после паритета и бенча) — включит.
+/// `PREFILL_SM75=0` отключает тайловый prefill-kernel на Turing.
+/// Фаза E (2026-10-31): включён по умолчанию после паритета
+/// 505/16k/32k/128k на одном бинарнике (журнал §5p–§5q).
 pub fn prefill_sm75_enabled() -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENV.get_or_init(|| match std::env::var("PREFILL_SM75") {
-        Ok(v) => v.trim() != "0",
-        Err(_) => false,
+    *ENV.get_or_init(|| {
+        let (on, src) = match std::env::var("PREFILL_SM75") {
+            Ok(v) => (v.trim() != "0", "env"),
+            Err(_) => (true, "default"),
+        };
+        eprintln!(
+            "[prefill] sm75 kernel {} ({src}); fallback: T<{} или PREFILL_SM75=0",
+            if on { "ON" } else { "OFF" },
+            prefill_sm75_min_t()
+        );
+        on
     })
 }
 
