@@ -21,7 +21,8 @@ fn main() -> Result<()> {
         "causal" => causal(),
         "paged" => paged(),
         "parity" => parity(),
-        other => bail!("неизвестный режим {other:?}; поддержаны: layout, fixed, causal, paged, parity"),
+        "perf" => perf(),
+        other => bail!("неизвестный режим {other:?}; поддержаны: layout, fixed, causal, paged, parity, perf"),
     }
 }
 
@@ -617,5 +618,262 @@ fn parity() -> Result<()> {
         }
     }
     println!("parity done");
+    Ok(())
+}
+
+/// Фаза 5: производительность ядра и сравнение с пер-строчным путём.
+fn perf() -> Result<()> {
+    use candle_core::{DType, Tensor};
+    use qwen35_batch::real::flash_decode_cuda::dispatch_flash_decode_paged;
+
+    let nh = 16usize;
+    let nkv = 2usize;
+    let scale = 1.0f32 / (HD as f32).sqrt();
+
+    let flops = |t: usize, kv0: usize| -> f64 {
+        let keys: u64 = (0..t).map(|i| (kv0 + i + 1) as u64).sum();
+        nh as f64 * keys as f64 * (4 * HD) as f64
+    };
+
+    for &c in &[16384usize, 65536, 131072] {
+        let t = 512usize;
+        let kv0 = c - t;
+        let tag = 7000 + c as u64;
+        let (qf, kf, vf, table) = gen_vectors(t, kv0, nh, nkv, tag, false, false);
+        let pages = (kv0 + t).div_ceil(PAGE);
+
+        let device = Device::new_cuda(0)?;
+        let cuda = device.as_cuda_device()?.clone();
+        let q_dev = cuda.clone_htod(&qf)?;
+        let k_dev = cuda.clone_htod(&kf)?;
+        let v_dev = cuda.clone_htod(&vf)?;
+        let kv_len_dev = cuda.clone_htod(&[kv0 as u32])?;
+        let slots_dev = cuda.clone_htod(&[0u32])?;
+        let table_dev = cuda.clone_htod(&table)?;
+        let mut out_dev = unsafe { cuda.alloc::<f16>(t * nh * HD)? };
+        let params = FlashPrefillSm75Params {
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            hd: HD as u32,
+            t: t as u32,
+            b: 1,
+            page_size: PAGE as u32,
+            block_table_stride: pages as u32,
+            causal: 1,
+            scale,
+        };
+        let func =
+            cuda.get_or_load_func("flash_prefill_sm75", &candle_kernels::FLASH_PREFILL_SM75)?;
+        func.set_attribute(
+            candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            65536,
+        )?;
+        let cfg = LaunchConfig {
+            grid_dim: (t.div_ceil(64) as u32, nh as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 65536,
+        };
+        let iters = 7;
+        for _ in 0..2 {
+            let mut bld = func.builder();
+            bld.arg(&q_dev);
+            bld.arg(&k_dev);
+            bld.arg(&v_dev);
+            bld.arg(&kv_len_dev);
+            bld.arg(&slots_dev);
+            bld.arg(&table_dev);
+            bld.arg(&mut out_dev);
+            bld.arg(&0u64);
+            bld.arg(&params);
+            unsafe { bld.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        }
+        cuda.cuda_stream().synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut bld = func.builder();
+            bld.arg(&q_dev);
+            bld.arg(&k_dev);
+            bld.arg(&v_dev);
+            bld.arg(&kv_len_dev);
+            bld.arg(&slots_dev);
+            bld.arg(&table_dev);
+            bld.arg(&mut out_dev);
+            bld.arg(&0u64);
+            bld.arg(&params);
+            unsafe { bld.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        }
+        cuda.cuda_stream().synchronize()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        let tf = flops(t, kv0) / (ms * 1e9);
+        let tok_s = t as f64 / ms * 1e3;
+        let est_total = 2.65 + 10.0 * ms / t as f64;
+        println!(
+            "perf/sm75: C={c:6} t={t} {ms:8.2} ms  R={tf:5.1} TFLOPS  layer={tok_s:6.0} t/s  est_prefill={:.0} t/s",
+            1000.0 / est_total
+        );
+        drop((q_dev, k_dev, v_dev, kv_len_dev, slots_dev, table_dev, out_dev));
+
+        // Сравнение с пер-строчным decode-путём на тех же данных.
+        let (qf, kf, vf, table) = gen_vectors(t, kv0, nh, nkv, tag, false, false);
+        let q_t = Tensor::from_vec(qf, (t, nh, HD), &device)?.to_dtype(DType::F16)?;
+        let k_t = Tensor::from_vec(kf, (pages, PAGE, nkv, HD), &device)?
+            .to_dtype(DType::F16)?;
+        let v_t = Tensor::from_vec(vf, (pages, PAGE, nkv, HD), &device)?
+            .to_dtype(DType::F16)?;
+        let mut seqlens = Vec::with_capacity(t + 1);
+        let mut acc = 0u32;
+        seqlens.push(0u32);
+        for i in 0..t {
+            acc += (kv0 + i + 1) as u32;
+            seqlens.push(acc);
+        }
+        let sl = Tensor::from_vec(seqlens, (t + 1,), &device)?;
+        let bt = Tensor::from_vec(table, (1, pages), &device)?
+            .broadcast_as((t, pages))?
+            .contiguous()?;
+        let _ = dispatch_flash_decode_paged(
+            device.as_cuda_device()?,
+            &q_t,
+            &k_t,
+            &v_t,
+            &sl,
+            &bt,
+            scale,
+        )?;
+        cuda.cuda_stream().synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = dispatch_flash_decode_paged(
+                device.as_cuda_device()?,
+                &q_t,
+                &k_t,
+                &v_t,
+                &sl,
+                &bt,
+                scale,
+            )?;
+        }
+        cuda.cuda_stream().synchronize()?;
+        let dec_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        println!("perf/decode: C={c:6} {dec_ms:8.2} ms  ускорение {:.1}x", dec_ms / ms);
+    }
+
+    // Свип T на C=65536: где ядро выигрывает у пер-строчного пути.
+    println!("perf/sweep C=65536:");
+    for &t in &[4usize, 8, 16, 32, 64] {
+        let kv0 = 65536 - t;
+        let tag = 9000 + t as u64;
+        let (qf, kf, vf, table) = gen_vectors(t, kv0, nh, nkv, tag, false, false);
+        let pages = (kv0 + t).div_ceil(PAGE);
+        let device = Device::new_cuda(0)?;
+        let cuda = device.as_cuda_device()?.clone();
+        let q_dev = cuda.clone_htod(&qf)?;
+        let k_dev = cuda.clone_htod(&kf)?;
+        let v_dev = cuda.clone_htod(&vf)?;
+        let kv_len_dev = cuda.clone_htod(&[kv0 as u32])?;
+        let slots_dev = cuda.clone_htod(&[0u32])?;
+        let table_dev = cuda.clone_htod(&table)?;
+        let mut out_dev = unsafe { cuda.alloc::<f16>(t * nh * HD)? };
+        let params = FlashPrefillSm75Params {
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            hd: HD as u32,
+            t: t as u32,
+            b: 1,
+            page_size: PAGE as u32,
+            block_table_stride: pages as u32,
+            causal: 1,
+            scale,
+        };
+        let func =
+            cuda.get_or_load_func("flash_prefill_sm75", &candle_kernels::FLASH_PREFILL_SM75)?;
+        func.set_attribute(
+            candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            65536,
+        )?;
+        let cfg = LaunchConfig {
+            grid_dim: (t.div_ceil(64) as u32, nh as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 65536,
+        };
+        for _ in 0..2 {
+            let mut bld = func.builder();
+            bld.arg(&q_dev);
+            bld.arg(&k_dev);
+            bld.arg(&v_dev);
+            bld.arg(&kv_len_dev);
+            bld.arg(&slots_dev);
+            bld.arg(&table_dev);
+            bld.arg(&mut out_dev);
+            bld.arg(&0u64);
+            bld.arg(&params);
+            unsafe { bld.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        }
+        cuda.cuda_stream().synchronize()?;
+        let iters = 7;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut bld = func.builder();
+            bld.arg(&q_dev);
+            bld.arg(&k_dev);
+            bld.arg(&v_dev);
+            bld.arg(&kv_len_dev);
+            bld.arg(&slots_dev);
+            bld.arg(&table_dev);
+            bld.arg(&mut out_dev);
+            bld.arg(&0u64);
+            bld.arg(&params);
+            unsafe { bld.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        }
+        cuda.cuda_stream().synchronize()?;
+        let ours_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+        let (qf, kf, vf, table) = gen_vectors(t, kv0, nh, nkv, tag, false, false);
+        let q_t = Tensor::from_vec(qf, (t, nh, HD), &device)?.to_dtype(DType::F16)?;
+        let k_t =
+            Tensor::from_vec(kf, (pages, PAGE, nkv, HD), &device)?.to_dtype(DType::F16)?;
+        let v_t =
+            Tensor::from_vec(vf, (pages, PAGE, nkv, HD), &device)?.to_dtype(DType::F16)?;
+        let mut seqlens = Vec::with_capacity(t + 1);
+        let mut acc = 0u32;
+        seqlens.push(0u32);
+        for i in 0..t {
+            acc += (kv0 + i + 1) as u32;
+            seqlens.push(acc);
+        }
+        let sl = Tensor::from_vec(seqlens, (t + 1,), &device)?;
+        let bt = Tensor::from_vec(table, (1, pages), &device)?
+            .broadcast_as((t, pages))?
+            .contiguous()?;
+        let _ = dispatch_flash_decode_paged(
+            device.as_cuda_device()?,
+            &q_t,
+            &k_t,
+            &v_t,
+            &sl,
+            &bt,
+            scale,
+        )?;
+        cuda.cuda_stream().synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = dispatch_flash_decode_paged(
+                device.as_cuda_device()?,
+                &q_t,
+                &k_t,
+                &v_t,
+                &sl,
+                &bt,
+                scale,
+            )?;
+        }
+        cuda.cuda_stream().synchronize()?;
+        let dec_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        println!(
+            "perf/sweep t={t:3}: ours={ours_ms:8.3} ms decode={dec_ms:8.3} ms ratio={:.2}",
+            dec_ms / ours_ms
+        );
+    }
+    println!("perf done");
     Ok(())
 }
