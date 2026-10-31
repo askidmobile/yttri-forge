@@ -18,7 +18,8 @@ fn main() -> Result<()> {
     match mode {
         "layout" => layout(),
         "fixed" => fixed(),
-        other => bail!("неизвестный режим {other:?}; поддержаны: layout, fixed"),
+        "causal" => causal(),
+        other => bail!("неизвестный режим {other:?}; поддержаны: layout, fixed, causal"),
     }
 }
 
@@ -147,91 +148,112 @@ fn lcg(seed: &mut u64) -> f32 {
     (((*seed >> 33) as u32 as f32) / (u32::MAX as f32)) * 2.0 - 1.0
 }
 
-/// Фаза 2: фиксированная форма — T=64, kv0=960, 16 страниц, без маски.
-fn fixed() -> Result<()> {
+/// Один прогон ядра против CPU-эталона. Возвращает (mean|Δ|, max|Δ|).
+#[allow(clippy::too_many_arguments)]
+fn run_case(
+    t: usize,
+    kv0: usize,
+    causal: bool,
+    nh: usize,
+    nkv: usize,
+    ref_heads: &[usize],
+    seed_tag: u64,
+) -> Result<(f64, f32)> {
     use candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum;
 
-    const T: usize = 64;
-    const NH: usize = 16;
-    const NKV: usize = 2;
     const HD: usize = 256;
-    const KV0: usize = 960;
-    const PAGES: usize = 16;
     const PAGE: usize = 64;
 
     let device = Device::new_cuda(0)?;
     let cuda = device.as_cuda_device()?.clone();
     let scale = 1.0f32 / (HD as f32).sqrt();
 
-    let mut seed = 0x5eed_1234u64;
-    let qf: Vec<f16> = (0..T * NH * HD)
+    let pages = (kv0 + t).div_ceil(PAGE);
+    let mut seed = 0x5eed_1234u64 ^ seed_tag.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let qf: Vec<f16> = (0..t * nh * HD)
         .map(|_| f16::from_f32(0.35 * lcg(&mut seed)))
         .collect();
-    let kf: Vec<f16> = (0..PAGES * PAGE * NKV * HD)
+    let kf: Vec<f16> = (0..pages * PAGE * nkv * HD)
         .map(|_| f16::from_f32(0.35 * lcg(&mut seed)))
         .collect();
-    let vf: Vec<f16> = (0..PAGES * PAGE * NKV * HD)
+    let vf: Vec<f16> = (0..pages * PAGE * nkv * HD)
         .map(|_| f16::from_f32(0.35 * lcg(&mut seed)))
         .collect();
 
-    println!("fixed: T={T} kv0={KV0} pages={PAGES} nh={NH} nkv={NKV} hd={HD}");
-
-    // CPU-эталон: каждая строка видит все 1024 ключа (causal=0).
+    // CPU-эталон (F32) только для выбранных голов — параллельно по головам.
     let q32: Vec<f32> = qf.iter().map(|x| x.to_f32()).collect();
     let k32: Vec<f32> = kf.iter().map(|x| x.to_f32()).collect();
     let v32: Vec<f32> = vf.iter().map(|x| x.to_f32()).collect();
-    let total_kv = PAGES * PAGE;
-    let mut reference = vec![0f32; T * NH * HD];
-    let group = NH / NKV;
-    for row in 0..T {
-        for h in 0..NH {
-            let kvh = h / group;
-            let q_base = (row * NH + h) * HD;
-            let mut logits = vec![0f32; total_kv];
-            for tok in 0..total_kv {
-                let k_base = (tok * NKV + kvh) * HD;
-                let mut acc = 0f32;
-                for d in 0..HD {
-                    acc += q32[q_base + d] * k32[k_base + d];
-                }
-                logits[tok] = acc * scale;
-            }
-            let mmax = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut l = 0f32;
-            for x in logits.iter_mut() {
-                *x = (*x - mmax).exp();
-                l += *x;
-            }
-            let inv = 1.0 / l;
-            for d in 0..HD {
-                let mut acc = 0f32;
-                for tok in 0..total_kv {
-                    let v_base = (tok * NKV + kvh) * HD;
-                    acc += logits[tok] * v32[v_base + d];
-                }
-                reference[q_base + d] = acc * inv;
-            }
+    let group = nh / nkv;
+    // Эталон по каждой голове отдельно, параллельно; наружу — (h, [t][HD]).
+    let refs: Vec<(usize, Vec<f32>)> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for &h in ref_heads {
+            let q32 = q32.as_slice();
+            let k32 = k32.as_slice();
+            let v32 = v32.as_slice();
+            handles.push((
+                h,
+                scope.spawn(move || -> Vec<f32> {
+                    let mut out = vec![0f32; t * HD];
+                    let kvh = h / group;
+                    for row in 0..t {
+                        let pos = kv0 + row;
+                        let q_base = (row * nh + h) * HD;
+                        let n_vis = if causal { pos + 1 } else { pages * PAGE };
+                        let mut logits = vec![0f32; n_vis];
+                        for tok in 0..n_vis {
+                            let k_base = (tok * nkv + kvh) * HD;
+                            let mut acc = 0f32;
+                            for d in 0..HD {
+                                acc += q32[q_base + d] * k32[k_base + d];
+                            }
+                            logits[tok] = acc * scale;
+                        }
+                        let mmax = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let mut lsum = 0f32;
+                        for x in logits.iter_mut() {
+                            *x = (*x - mmax).exp();
+                            lsum += *x;
+                        }
+                        let inv = 1.0 / lsum;
+                        for d in 0..HD {
+                            let mut acc = 0f32;
+                            for tok in 0..n_vis {
+                                let v_base = (tok * nkv + kvh) * HD;
+                                acc += logits[tok] * v32[v_base + d];
+                            }
+                            out[row * HD + d] = acc * inv;
+                        }
+                    }
+                    out
+                }),
+            ));
         }
-    }
+        handles
+            .into_iter()
+            .map(|(h, j)| (h, j.join().expect("cpu reference thread")))
+            .collect()
+    });
 
     let q_dev = cuda.clone_htod(&qf)?;
     let k_dev = cuda.clone_htod(&kf)?;
     let v_dev = cuda.clone_htod(&vf)?;
-    let kv_len_dev = cuda.clone_htod(&[KV0 as u32])?;
+    let kv_len_dev = cuda.clone_htod(&[kv0 as u32])?;
     let slots_dev = cuda.clone_htod(&[0u32])?;
-    let table: Vec<u32> = (0..PAGES as u32).collect();
+    let table: Vec<u32> = (0..pages as u32).collect();
     let table_dev = cuda.clone_htod(&table)?;
-    let mut out_dev = unsafe { cuda.alloc::<f16>(T * NH * HD)? };
+    let mut out_dev = unsafe { cuda.alloc::<f16>(t * nh * HD)? };
 
     let params = FlashPrefillSm75Params {
-        n_head: NH as u32,
-        n_kv: NKV as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
         hd: HD as u32,
-        t: T as u32,
+        t: t as u32,
         b: 1,
         page_size: PAGE as u32,
-        block_table_stride: PAGES as u32,
-        causal: 0,
+        block_table_stride: pages as u32,
+        causal: causal as u32,
         scale,
     };
 
@@ -241,7 +263,7 @@ fn fixed() -> Result<()> {
         65536,
     )?;
     let cfg = LaunchConfig {
-        grid_dim: ((T.div_ceil(64)) as u32, NH as u32, 1),
+        grid_dim: (t.div_ceil(64) as u32, nh as u32, 1),
         block_dim: (128, 1, 1),
         shared_mem_bytes: 65536,
     };
@@ -261,25 +283,54 @@ fn fixed() -> Result<()> {
     let got = cuda.clone_dtoh(&out_dev)?;
     let mut max_abs = 0f32;
     let mut sum_abs = 0f64;
-    let mut nan = 0usize;
-    for i in 0..got.len() {
-        let x = got[i].to_f32();
-        if !x.is_finite() {
-            nan += 1;
-            continue;
+    let mut count = 0usize;
+    for (h, ref_h) in &refs {
+        for row in 0..t {
+            let base = (row * nh + *h) * HD;
+            for d in 0..HD {
+                let x = got[base + d].to_f32();
+                if !x.is_finite() {
+                    bail!("не-конечное значение t={t} kv0={kv0} h={h} row={row} d={d}: {x}");
+                }
+                let diff = (x - ref_h[row * HD + d]).abs();
+                max_abs = max_abs.max(diff);
+                sum_abs += diff as f64;
+                count += 1;
+            }
         }
-        let d = (x - reference[i]).abs();
-        max_abs = max_abs.max(d);
-        sum_abs += d as f64;
     }
-    let mean_abs = sum_abs / got.len() as f64;
-    println!("fixed: mean|d|={mean_abs:.3e} max|d|={max_abs:.3e} nan={nan}");
-    if nan > 0 {
-        bail!("fixed: {nan} не-конечных значений");
-    }
-    if mean_abs > 5e-4 || max_abs > 5e-3 {
-        bail!("fixed mismatch: mean {mean_abs:.3e} > 5e-4 или max {max_abs:.3e} > 5e-3");
+    Ok((sum_abs / count as f64, max_abs))
+}
+
+/// Фаза 2: фиксированная форма — T=64, kv0=960, 16 страниц, без маски.
+fn fixed() -> Result<()> {
+    let (mean, max) = run_case(64, 960, false, 16, 2, &(0..16).collect::<Vec<_>>(), 0)?;
+    println!("fixed: mean|d|={mean:.3e} max|d|={max:.3e} nan=0");
+    if mean > 5e-4 || max > 5e-3 {
+        bail!("fixed mismatch: mean {mean:.3e} max {max:.3e}");
     }
     println!("fixed OK");
+    Ok(())
+}
+
+/// Фаза 3: причинность и границы kv0. Сравниваем головы 0 и 8
+/// (kvh = 0 и 1), чтобы покрыть GQA и не гонять CPU-эталон по всем головам.
+fn causal() -> Result<()> {
+    let ts = [1usize, 16, 63, 64, 65, 127, 128];
+    let kv0s = [0usize, 1, 63, 64, 65, 4113, 8191];
+    let mut worst_mean = 0f64;
+    let mut worst_max = 0f32;
+    for &t in &ts {
+        for &kv0 in &kv0s {
+            let (mean, max) = run_case(t, kv0, true, 16, 2, &[0, 8], (t * 10_000 + kv0) as u64)?;
+            worst_mean = worst_mean.max(mean);
+            worst_max = worst_max.max(max);
+            println!("causal: t={t:3} kv0={kv0:5} mean|d|={mean:.3e} max|d|={max:.3e}");
+            if mean > 5e-4 || max > 5e-3 {
+                bail!("causal mismatch at t={t} kv0={kv0}: mean {mean:.3e} max {max:.3e}");
+            }
+        }
+    }
+    println!("causal OK: worst mean={worst_mean:.3e} worst max={worst_max:.3e}");
     Ok(())
 }
