@@ -530,6 +530,27 @@ impl Qwen35MoeBlock {
         };
 
         match (&self.routed, mode) {
+            (ExpertWeights::Store(store), ForwardMode::DecodeBatch)
+                if moe_cpu_enabled() && n_tokens == 1 =>
+            {
+                // CPU-путь: сырые Q4_K байты уже в host-памяти, никаких H2D
+                // на экспертные матрицы. Обмениваются только активации
+                // (8 КиБ вниз/вверх на слой) и ids/веса маршрута.
+                let ids_host = ids_t.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+                let w_host = w_t.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+                let xs_cpu = xs.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+                let routed_cpu = {
+                    let store = store.lock().expect("expert layer store");
+                    moe_forward_cpu(&store, &ids_host, &w_host, &xs_cpu, xs.dims2()?.1)?
+                };
+                let routed = Tensor::from_vec(
+                    routed_cpu,
+                    (1usize, 1usize, xs.dims2()?.1),
+                    &Device::Cpu,
+                )?
+                .to_device(xs.device())?;
+                return add_shared(routed, xs);
+            }
             (ExpertWeights::Store(store), ForwardMode::DecodeBatch) => {
                 let store = store.lock().expect("expert layer store");
                 let (g_shape, d_shape) = store.shapes();
@@ -1093,4 +1114,126 @@ mod cuda_router_tests {
         }
         Ok(())
     }
+}
+
+// ─── CPU-путь экспертов (MOE_CPU=1) ──────────────────────────────────────────
+//
+// Причина: декод 35B-A3B читает 540 МиБ весов экспертов на токен. Через
+// PCIe 3.0 x16 (15.75 ГБ/с) это потолок ~29 т/с, а llama.cpp считает
+// экспертов на CPU из RAM (полоса >100 ГБ/с) и берёт 45 т/с. Поэтому на
+// выгруженном хранилище (`MOE_EXPERTS=ram`) считаем так же: сырые байты
+// Q4_K уже лежат в host-памяти, GEMV идёт по ним напрямую с rayon по
+// потокам, без единого H2D на экспертные матрицы.
+#[cfg(feature = "cuda")]
+pub fn moe_cpu_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MOE_CPU").as_deref() == Ok("1"))
+}
+
+#[cfg(feature = "cuda")]
+mod cpu_moe {
+    use super::*;
+    use candle_core::quantized::k_quants::{BlockQ4K, BlockQ8K, QK_K};
+    use candle_core::quantized::GgmlType;
+    use rayon::prelude::*;
+
+    /// GEMV Q4_K: `w` — сырые блоки [n_rows × k/256], `x8` — квантованная
+    /// активация [k/256]. Строки считаются параллельно по потокам rayon.
+    pub fn gemv_q4k(w: &[u8], x8: &[BlockQ8K], n_rows: usize, k: usize) -> Result<Vec<f32>> {
+        let blocks_per_row = k / QK_K;
+        let need = n_rows * blocks_per_row;
+        let have = w.len() / std::mem::size_of::<BlockQ4K>();
+        if have < need {
+            candle_core::bail!("gemv_q4k: байт {} мало для {n_rows}×{k} (нужно {need} блоков)", w.len());
+        }
+        // Сырые байты GGUF — это уже раскладка BlockQ4K; выравнивание
+        // обеспечивает host-буфер CUDA (≥256 Б).
+        let wb: &[BlockQ4K] = unsafe {
+            std::slice::from_raw_parts(w.as_ptr() as *const BlockQ4K, need)
+        };
+        Ok((0..n_rows)
+            .into_par_iter()
+            .map(|r| {
+                let row = &wb[r * blocks_per_row..(r + 1) * blocks_per_row];
+                BlockQ4K::vec_dot(k, row, x8)
+            })
+            .collect())
+    }
+
+    /// Квантование активации f32 → Q8_K (та же схема, что ждёт vec_dot).
+    pub fn quantize_activation(x: &[f32]) -> Result<Vec<BlockQ8K>> {
+        if x.len() % QK_K != 0 {
+            candle_core::bail!("quantize_activation: длина {} не кратна {QK_K}", x.len());
+        }
+        let mut out = vec![BlockQ8K::zeros(); x.len() / QK_K];
+        BlockQ8K::from_float(x, &mut out);
+        Ok(out)
+    }
+
+    /// Один эксперт: gate/up → SwiGLU → down, всё на CPU по сырым байтам.
+    pub fn expert_forward(
+        gate_w: &[u8],
+        up_w: &[u8],
+        down_w: &[u8],
+        x8: &[BlockQ8K],
+        n_ff: usize,
+        n_embd: usize,
+    ) -> Result<Vec<f32>> {
+        let gate = gemv_q4k(gate_w, x8, n_ff, n_embd)?;
+        let up = gemv_q4k(up_w, x8, n_ff, n_embd)?;
+        let act: Vec<f32> = gate
+            .iter()
+            .zip(up.iter())
+            .map(|(&g, &u)| {
+                let s = g / (1.0 + (-g).exp());
+                s * u
+            })
+            .collect();
+        let act8 = quantize_activation(&act)?;
+        gemv_q4k(down_w, &act8, n_embd, n_ff)
+    }
+}
+
+/// Полный CPU-проход MoE для одного слота: 8 экспертов × (gate,up,down),
+/// затем взвешенная сумма. `xs_cpu` — [n_embd] f32.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_forward_cpu(
+    st: &super::expert_store::ExpertLayerStore,
+    ids: &[u32],
+    weights: &[f32],
+    xs_cpu: &[f32],
+    n_embd: usize,
+) -> Result<Vec<f32>> {
+    let (g_shape, _d_shape) = st.shapes();
+    // g_shape = (n_experts, n_ff, n_embd); d_shape = (n_experts, n_embd, n_ff).
+    let n_ff = g_shape.1;
+    if g_shape.2 != n_embd {
+        candle_core::bail!(
+            "moe_forward_cpu: n_embd {} != gate.k {}",
+            n_embd,
+            g_shape.2
+        );
+    }
+    let x8 = cpu_moe::quantize_activation(xs_cpu)?;
+    let mut acc = vec![0f32; n_embd];
+    for (jm, (&e, &w)) in ids.iter().zip(weights.iter()).enumerate() {
+        let e = e as usize;
+        if e >= st.gate.n_experts {
+            continue;
+        }
+        let out = cpu_moe::expert_forward(
+            st.gate.expert_host_slice(e),
+            st.up.expert_host_slice(e),
+            st.down.expert_host_slice(e),
+            &x8,
+            n_ff,
+            n_embd,
+        )?;
+        for (a, v) in acc.iter_mut().zip(out.iter()) {
+            *a += w * v;
+        }
+        let _ = jm;
+    }
+    Ok(acc)
 }
