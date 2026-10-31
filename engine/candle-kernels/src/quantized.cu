@@ -4918,6 +4918,36 @@ extern "C" __global__ void __launch_bounds__(64, 1) mul_mat_vec_q4_K_q8_1_cuda1_
         (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
+// Одна warp на строку — при Q4_K строка весит 8 блоков, это ровно
+// blocks_per_iter для nwarps=1, то есть все 32 потока заняты. При nwarps=2
+// активны только 8 из 64 потоков (блока больше нет).
+extern "C" __global__ void __launch_bounds__(32, 1) mul_mat_vec_q4_K_q8_1_cuda1_t1(
+    const void * vx, const void * vy, float * dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    mul_mat_vec_q<1, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 1>
+        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+
+// Turing MMVQ с настраиваемым числом warp'ов: при ncols_y=1 больше warp'ов
+// режут длину строки (2048) на более короткие куски — на sm75 это меняет
+// заполнение SM. Выбор делает хост (YTTRI_MMVQ_TURING_WARPS).
+extern "C" __global__ void __launch_bounds__(128, 1) mul_mat_vec_q4_K_q8_1_cuda1_t4(
+    const void * vx, const void * vy, float * dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    mul_mat_vec_q<1, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 4>
+        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 1) mul_mat_vec_q4_K_q8_1_cuda1_t8(
+    const void * vx, const void * vy, float * dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    mul_mat_vec_q<1, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 8>
+        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+
 // batch size = 2
 extern "C" __global__ void mul_mat_vec_q4_0_q8_1_cuda2(
     const void * vx, const void * vy, float * dst,

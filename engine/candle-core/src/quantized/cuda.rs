@@ -725,15 +725,26 @@ impl QCudaStorage {
             _ => crate::bail!("unsupported dtype for quantized matmul {:?}", self.dtype),
         };
         let turing = use_turing_q4k_mmvq(dev, self.dtype, b_size);
+        // Число warp'ов для turing-варианта (по умолчанию 2 — историческое
+        // значение; 4 и 8 замеряются через env).
+        let turing_warps = if turing {
+            std::env::var("YTTRI_MMVQ_TURING_WARPS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|w| [1u32, 2, 4, 8].contains(w))
+                .unwrap_or(2)
+        } else {
+            2
+        };
         let kernel_name = if turing {
-            format!("{kernel_name}{b_size}_t2")
+            format!("{kernel_name}{b_size}_t{turing_warps}")
         } else {
             format!("{kernel_name}{b_size}")
         };
         let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
         let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
         let (nblocks, nwarps) = if turing {
-            (nrows as u32, 2)
+            (nrows as u32, turing_warps)
         } else {
             match b_size {
                 1 => (nrows as u32, 4),
