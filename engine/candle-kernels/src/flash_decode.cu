@@ -394,9 +394,6 @@ extern "C" __global__ void flash_decode_paged_gqa_partial(
     for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
 
     __shared__ __align__(16) __half kv_sh[TILE * 256];
-    __shared__ float warp_partial[8][2 + 256];
-    __shared__ float block_max[8];
-    __shared__ float block_sum[8];
 
     const unsigned int vecs_per_row = hd / 8;
     const unsigned int tile_vecs = TILE * vecs_per_row;
@@ -462,48 +459,14 @@ extern "C" __global__ void flash_decode_paged_gqa_partial(
         __syncthreads();
     }
 
+    // Каждый warp считает отдельную Q-head. Сохраняем его partial напрямую:
+    // объединение warp'ов здесь смешало бы восемь независимых softmax.
     if (lane == 0) {
-        warp_partial[warp][0] = l_l > 0.0f ? m_l : -INFINITY;
-        warp_partial[warp][1] = l_l;
+        out[0] = l_l > 0.0f ? m_l : -INFINITY;
+        out[1] = l_l;
     }
     #pragma unroll
-    for (int i = 0; i < 8; ++i) warp_partial[warp][2 + d0 + i] = acc[i];
-    __syncthreads();
-
-    if (warp == 0 && lane < ngroups) {
-        float m = -INFINITY;
-        #pragma unroll
-        for (int w = 0; w < 8; ++w) m = fmaxf(m, warp_partial[w][0]);
-        float l = 0.0f;
-        #pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            if (warp_partial[w][1] > 0.0f)
-                l += warp_partial[w][1] * __expf(warp_partial[w][0] - m);
-        }
-        block_max[lane] = m;
-        block_sum[lane] = l;
-        const unsigned int ph = kvh * ngroups + lane;
-        float *po = partials +
-            (((size_t)b * params.n_head + ph) * params.splits + s) * (2 + hd);
-        po[0] = l > 0.0f ? m : -INFINITY;
-        po[1] = l;
-    }
-    __syncthreads();
-
-    for (unsigned int i = tid; i < ngroups * hd; i += blockDim.x) {
-        const unsigned int g = i / hd;
-        const unsigned int d = i % hd;
-        const unsigned int ph = kvh * ngroups + g;
-        float *po = partials +
-            (((size_t)b * params.n_head + ph) * params.splits + s) * (2 + hd);
-        float value = 0.0f;
-        #pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            if (warp_partial[w][1] > 0.0f)
-                value += warp_partial[w][2 + d] * __expf(warp_partial[w][0] - block_max[g]);
-        }
-        po[2 + d] = value;
-    }
+    for (int i = 0; i < 8; ++i) out[2 + d0 + i] = acc[i];
 }
 
 extern "C" __global__ void flash_decode_paged_combine(
