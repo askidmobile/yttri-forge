@@ -1327,10 +1327,20 @@ pub fn moe_forward_cpu(
             let mut acc_u = [0f32; 8];
             let gs = &g_blocks[j][r * bprow_g..(r + n) * bprow_g];
             let us = &u_blocks[j][r * bprow_u..(r + n) * bprow_u];
+            #[cfg(target_feature = "avx2")]
             if n == 8 {
                 candle_core::quantized::avx::vec_dot_q4k_q8k_x8(n_embd, gs, &x8, &mut acc_g);
                 candle_core::quantized::avx::vec_dot_q4k_q8k_x8(n_embd, us, &x8, &mut acc_u);
             } else {
+                for off in 0..n {
+                    acc_g[off] = BlockQ4K::vec_dot(
+                        n_embd, &gs[off * bprow_g..(off + 1) * bprow_g], &x8);
+                    acc_u[off] = BlockQ4K::vec_dot(
+                        n_embd, &us[off * bprow_u..(off + 1) * bprow_u], &x8);
+                }
+            }
+            #[cfg(not(target_feature = "avx2"))]
+            {
                 for off in 0..n {
                     acc_g[off] = BlockQ4K::vec_dot(
                         n_embd, &gs[off * bprow_g..(off + 1) * bprow_g], &x8);
