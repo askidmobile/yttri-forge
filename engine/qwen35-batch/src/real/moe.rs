@@ -515,9 +515,10 @@ impl Qwen35MoeBlock {
             trace.as_ref().map(|(rt, layer)| (rt.as_ref(), *layer)),
         )?;
 
-        // Shared input [tokens, 1, n_embd]. Indexed kernels reuse each token row
-        // across top-k routes; materializing [tokens, k, n_embd] wastes 8x memory.
-        let x3 = xs.to_dtype(DType::F32)?.unsqueeze(1)?.contiguous()?;
+        let make_x3 = || -> Result<Tensor> {
+            // Indexed kernels reuse each token row across top-k routes.
+            Ok(xs.to_dtype(DType::F32)?.unsqueeze(1)?.contiguous()?)
+        };
 
         // Взвешивание GPU-весами + редукция по topk.
         let weighted_sum = |down: Tensor, w_t: &Tensor| -> Result<Tensor> {
@@ -542,7 +543,7 @@ impl Qwen35MoeBlock {
                 let mut ids_buf = vec![0u32; k_topk];
                 let mut w_buf = vec![0f32; w_t.elem_count()];
                 let mut xs_buf = vec![0f32; n_embd_host];
-                {
+                let shared = {
                     let stream = cuda_dev.cuda_stream();
                     let ids_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&ids_t)?;
                     let w_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&w_t)?;
@@ -570,10 +571,18 @@ impl Qwen35MoeBlock {
                             stream.cu_stream(),
                         );
                     }
-                    stream
+                    // D2H must finish before CPU experts start. Shared expert is
+                    // independent, so launch it after the event and hide its GPU
+                    // work under routed CPU computation.
+                    let copy_done = stream
+                        .record_event(None)
+                        .map_err(candle_core::Error::wrap)?;
+                    let shared = self.shared.forward(xs)?;
+                    copy_done
                         .synchronize()
                         .map_err(candle_core::Error::wrap)?;
-                }
+                    shared
+                };
                 let ids_host = ids_buf;
                 let w_host = w_buf;
                 let xs_cpu = xs_buf;
@@ -587,9 +596,10 @@ impl Qwen35MoeBlock {
                     &Device::Cpu,
                 )?
                 .to_device(xs.device())?;
-                return add_shared(routed, xs);
+                return Ok(routed.broadcast_add(&shared)?);
             }
             (ExpertWeights::Store(store), ForwardMode::DecodeBatch) => {
+                let x3 = make_x3()?;
                 let store = store.lock().expect("expert layer store");
                 let (g_shape, d_shape) = store.shapes();
                 // gate+up одним dual GEMM; промахи ядро читает zero-copy.
@@ -615,6 +625,7 @@ impl Qwen35MoeBlock {
                 add_shared(weighted_sum(down, &w_t)?, xs)
             }
             (ExpertWeights::Store(store), ForwardMode::Prefill) => {
+                let x3 = make_x3()?;
                 let runtime = self.runtime.as_ref().ok_or_else(|| {
                     candle_core::Error::Msg("moe runtime отсутствует при выгрузке".to_string())
                 })?;
@@ -765,6 +776,7 @@ gate={:?} up={:?} down={:?} x={:?} n_out={}",
                 // против [n_experts, n_ff, n_embd] чтений весов.
                 // MOE_GROUPED читается на каждом MoE-слое на токен (41 раз). Значение
                 // неизменно в процессе — кэшируем.
+                let x3 = make_x3()?;
                 let grouped = {
                     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                     *G.get_or_init(|| std::env::var("MOE_GROUPED").map(|v| v != "0").unwrap_or(false))
