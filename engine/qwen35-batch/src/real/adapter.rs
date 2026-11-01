@@ -1461,7 +1461,11 @@ impl Qwen35BatchAdapter {
                 &positions,
                 greedy,
             );
-            if crate::scheduler::trace_on() {
+            // DEC_TIMING=1 — узкий таймер без полного TRACE (TRACE ломает граф):
+            // печатает before_step (обслуживание кэша экспертов) и время
+            // захваченного графа. Разница с реальным шагом — оверхед сэмплера
+            // и обвязки, который раньше нигде не учитывался.
+            if crate::scheduler::trace_on() || std::env::var("DEC_TIMING").as_deref() == Ok("1") {
                 static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n % 32 == 0 {
