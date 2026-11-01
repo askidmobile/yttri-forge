@@ -411,19 +411,30 @@ __device__ __forceinline__ void fd_load_pool_tile16(
 {
     constexpr int HD = 256;
     constexpr int COL_GROUPS = HD / 64;
-    constexpr int VECS_PER_ROW = HD / 8;
-    for (int v = lane; v < 16 * VECS_PER_ROW; v += 32) {
-        const int r = v / VECS_PER_ROW;
-        const int c = (v % VECS_PER_ROW) * 8;
+    const int c = lane * 8;
+    if (base >= k_end) {
+        int4 zero = make_int4(0, 0, 0, 0);
+        #pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            *reinterpret_cast<int4*>(&dst[fd_mma_smem_idx(r, c, COL_GROUPS)]) = zero;
+        }
+        return;
+    }
+    // chunk выровнен по page_size, поэтому все 16 строк tile принадлежат одной
+    // физической странице. Один lookup и развёрнутые чтения дают независимые
+    // memory requests вместо цепочки load -> lookup -> load на каждую строку.
+    const unsigned int page = bt[base / page_size];
+    const unsigned int phys_base = page * page_size + base % page_size;
+    const unsigned int rows = min(16u, k_end - base);
+    #pragma unroll
+    for (unsigned int r = 0; r < 16; ++r) {
         int4 val = make_int4(0, 0, 0, 0);
-        const unsigned int p = base + (unsigned int)r;
-        if (p < k_end) {
-            const unsigned int page = bt[p / page_size];
-            const unsigned int phys_row = page * page_size + p % page_size;
-            const __half* src = pool + ((size_t)phys_row * n_kv + kvh) * HD + c;
+        if (r < rows) {
+            const __half* src = pool
+                + ((size_t)(phys_base + r) * n_kv + kvh) * HD + c;
             val = *reinterpret_cast<const int4*>(src);
         }
-        *reinterpret_cast<int4*>(&dst[fd_mma_smem_idx(r, c, COL_GROUPS)]) = val;
+        *reinterpret_cast<int4*>(&dst[fd_mma_smem_idx((int)r, c, COL_GROUPS)]) = val;
     }
 }
 #endif
@@ -454,7 +465,9 @@ extern "C" __global__ void flash_decode_paged_gqa_mma_partial(
     const unsigned int t = lane & 3;
     const unsigned int kv_len = seqlens_k[b + 1] - seqlens_k[b];
     const unsigned int *bt = block_table + (size_t)b * params.block_table_stride;
-    const unsigned int chunk = (kv_len + params.splits - 1) / params.splits;
+    const unsigned int chunk_raw = (kv_len + params.splits - 1) / params.splits;
+    const unsigned int chunk = ((chunk_raw + params.page_size - 1) / params.page_size)
+        * params.page_size;
     const unsigned int p0 = s * chunk;
     const unsigned int p1 = min(p0 + chunk, kv_len);
 
