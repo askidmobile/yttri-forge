@@ -621,6 +621,103 @@ impl Qwen35MoeBlock {
         })
     }
 
+    #[cfg(feature = "cuda")]
+    fn forward_ptx_cuda_async(
+        &self,
+        cuda_dev: &candle_core::CudaDevice,
+        store: &SharedLayerStore,
+        xs: &Tensor,
+        ids_t: &Tensor,
+        w_t: &Tensor,
+        gpu_experts: usize,
+    ) -> Result<Tensor> {
+        if let Some(error) = async_cpu_error().lock().expect("async CPU error").take() {
+            candle_core::bail!("CPU-MoE async: {error}");
+        }
+        let (_, n_embd) = xs.dims2()?;
+        let k_topk = ids_t.elem_count();
+        let stage = async_cpu_stage(cuda_dev, self.layer_idx, k_topk, n_embd)?;
+        let ids_host = stage.ids.as_mut_ptr();
+        let weights_host = stage.weights.as_mut_ptr();
+        let xs_host = stage.xs.as_mut_ptr();
+        let ids_dev = crate::real::paged_kv_cuda::tensor_cuda_ptr(ids_t)?;
+        let weights_dev = crate::real::paged_kv_cuda::tensor_cuda_ptr(w_t)?;
+        let xs_dev = crate::real::paged_kv_cuda::tensor_cuda_ptr(xs)?;
+        let stream = cuda_dev.cuda_stream();
+        unsafe {
+            cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                ids_host.cast(),
+                ids_dev,
+                k_topk * std::mem::size_of::<u32>(),
+                stream.cu_stream(),
+            );
+            cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                weights_host.cast(),
+                weights_dev,
+                k_topk * std::mem::size_of::<f32>(),
+                stream.cu_stream(),
+            );
+            cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                xs_host.cast(),
+                xs_dev,
+                n_embd * std::mem::size_of::<f32>(),
+                stream.cu_stream(),
+            );
+        }
+        let copy_done = stream.record_event(None).map_err(candle_core::Error::wrap)?;
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        async_cpu_sender()
+            .send(AsyncCpuJob {
+                store: store.clone(),
+                copy_done,
+                ids: ids_host as usize,
+                weights: weights_host as usize,
+                xs: xs_host as usize,
+                out: stage.out.as_mut_ptr() as usize,
+                flag: stage.flag.ptr as usize,
+                seq,
+                k_topk,
+                n_embd,
+                gpu_experts,
+            })
+            .map_err(|_| candle_core::Error::Msg("CPU-MoE async worker unavailable".into()))?;
+
+        let (shared, gpu_routed) = self
+            .gpu_graph
+            .lock()
+            .expect("MoE GPU graph")
+            .as_mut()
+            .ok_or_else(|| candle_core::Error::Msg("MoE GPU graph missing".into()))?
+            .stage_and_launch(xs, ids_t, w_t)?;
+        let res = unsafe {
+            cudarc::driver::sys::cuStreamWaitValue32_v2(
+                stream.cu_stream(),
+                stage.flag.dev_ptr,
+                seq,
+                cudarc::driver::sys::CUstreamWaitValue_flags_enum::CU_STREAM_WAIT_VALUE_GEQ
+                    as u32,
+            )
+        };
+        if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            candle_core::bail!("cuStreamWaitValue32 (CPU-MoE) failed: {res:?}");
+        }
+        let routed = Tensor::zeros((1usize, 1usize, n_embd), DType::F32, xs.device())?;
+        let dst = crate::real::paged_kv_cuda::tensor_cuda_ptr(&routed)?;
+        let rc = unsafe {
+            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst,
+                stage.out.as_ptr() as *const _,
+                n_embd * std::mem::size_of::<f32>(),
+                stream.cu_stream(),
+            )
+        };
+        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            candle_core::bail!("CPU-MoE async H2D failed: {rc:?}");
+        }
+        routed.broadcast_add(&gpu_routed)?.broadcast_add(&shared)
+    }
+
     /// Forward: route → routed SwiGLU + shared expert → combine.
     ///
     /// `xs` shape: `[batch, seq_len, n_embd]` → output same shape.
@@ -723,6 +820,14 @@ impl Qwen35MoeBlock {
             (ExpertWeights::Store(store), ForwardMode::DecodeBatch)
                 if moe_cpu_enabled() && n_tokens == 1 =>
             {
+                if std::env::var("MOE_CPU_ASYNC").as_deref() == Ok("1")
+                    && self.gpu_graph.lock().expect("MoE GPU graph").is_some()
+                {
+                    return self.forward_ptx_cuda_async(
+                        cuda_dev, store, xs, &ids_t, &w_t,
+                        moe_cpu_gpu_experts().min(ids_t.elem_count().saturating_sub(1)),
+                    );
+                }
                 // CPU-путь: сырые Q4_K байты уже в host-памяти. Раньше здесь
                 // было ТРИ блокирующих D2H на слой (ids, веса маршрута, xs) —
                 // 120 синхронизаций на токен. Ставим все копирования в один
@@ -1558,7 +1663,11 @@ impl<T> CpuReadPinned<T> {
         })
     }
 
-    fn as_mut_ptr(&mut self) -> *mut T {
+    fn as_mut_ptr(&self) -> *mut T {
+        self.ptr
+    }
+
+    fn as_ptr(&self) -> *const T {
         self.ptr
     }
 
@@ -1575,6 +1684,190 @@ impl<T> Drop for CpuReadPinned<T> {
             let _ = cudarc::driver::result::free_host(self.ptr.cast());
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+struct MappedFlag {
+    ptr: *mut u32,
+    dev_ptr: cudarc::driver::sys::CUdeviceptr,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for MappedFlag {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for MappedFlag {}
+
+#[cfg(feature = "cuda")]
+impl MappedFlag {
+    fn alloc(ctx: &Arc<cudarc::driver::CudaContext>) -> Result<Self> {
+        let ptr = unsafe {
+            cudarc::driver::result::malloc_host(
+                4,
+                cudarc::driver::sys::CU_MEMHOSTALLOC_DEVICEMAP,
+            )
+        }
+        .map_err(candle_core::Error::wrap)? as *mut u32;
+        if ptr.is_null() {
+            candle_core::bail!("MoE async flag allocation returned null");
+        }
+        unsafe { *ptr = 0 };
+        let mut dev_ptr = 0;
+        let res = unsafe { cudarc::driver::sys::cuMemHostGetDevicePointer_v2(&mut dev_ptr, ptr.cast(), 0) };
+        if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            unsafe {
+                let _ = cudarc::driver::result::free_host(ptr.cast());
+            }
+            candle_core::bail!("MoE async flag mapping failed: {res:?}");
+        }
+        let _ = ctx;
+        Ok(Self { ptr, dev_ptr })
+    }
+
+    fn signal(&self, value: u32) {
+        unsafe {
+            std::sync::atomic::AtomicU32::from_ptr(self.ptr)
+                .store(value, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for MappedFlag {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = cudarc::driver::result::free_host(self.ptr.cast());
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct AsyncCpuStage {
+    ids: CpuReadPinned<u32>,
+    weights: CpuReadPinned<f32>,
+    xs: CpuReadPinned<f32>,
+    out: CpuReadPinned<f32>,
+    flag: MappedFlag,
+}
+
+#[cfg(feature = "cuda")]
+struct AsyncCpuJob {
+    store: SharedLayerStore,
+    copy_done: cudarc::driver::CudaEvent,
+    ids: usize,
+    weights: usize,
+    xs: usize,
+    out: usize,
+    flag: usize,
+    seq: u32,
+    k_topk: usize,
+    n_embd: usize,
+    gpu_experts: usize,
+}
+
+#[cfg(feature = "cuda")]
+fn async_cpu_error() -> &'static std::sync::Mutex<Option<String>> {
+    static ERROR: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+    ERROR.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(feature = "cuda")]
+fn async_cpu_sender() -> &'static std::sync::mpsc::Sender<AsyncCpuJob> {
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<AsyncCpuJob>> =
+        std::sync::OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<AsyncCpuJob>();
+        std::thread::Builder::new()
+            .name("moe-cpu-async".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        job.copy_done.synchronize().map_err(candle_core::Error::wrap)?;
+                        let ids = unsafe {
+                            std::slice::from_raw_parts(job.ids as *const u32, job.k_topk)
+                        };
+                        let weights = unsafe {
+                            std::slice::from_raw_parts(job.weights as *const f32, job.k_topk)
+                        };
+                        let xs = unsafe {
+                            std::slice::from_raw_parts(job.xs as *const f32, job.n_embd)
+                        };
+                        let store = job.store.lock().expect("expert layer store");
+                        moe_forward_cpu(
+                            &store,
+                            &ids[job.gpu_experts..],
+                            &weights[job.gpu_experts..],
+                            xs,
+                            job.n_embd,
+                        )
+                    }));
+                    match outcome {
+                        Ok(Ok(result)) => unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                result.as_ptr(),
+                                job.out as *mut f32,
+                                job.n_embd,
+                            );
+                        },
+                        Ok(Err(error)) => {
+                            *async_cpu_error().lock().expect("async CPU error") =
+                                Some(error.to_string());
+                        }
+                        Err(_) => {
+                            *async_cpu_error().lock().expect("async CPU error") =
+                                Some("CPU-MoE worker panicked".into());
+                        }
+                    }
+                    unsafe {
+                        std::sync::atomic::AtomicU32::from_ptr(job.flag as *mut u32)
+                            .store(job.seq, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            })
+            .expect("spawn CPU-MoE async worker");
+        tx
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn async_cpu_stage(
+    dev: &candle_core::CudaDevice,
+    layer: usize,
+    k: usize,
+    n_embd: usize,
+) -> Result<&'static AsyncCpuStage> {
+    static STAGES: std::sync::OnceLock<
+        std::sync::Mutex<Option<Vec<AsyncCpuStage>>>,
+    > = std::sync::OnceLock::new();
+    let mut guard = STAGES
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("async CPU stages");
+    if guard.is_none() {
+        let ctx = dev.cuda_stream().context().clone();
+        let mut stages = Vec::with_capacity(64);
+        for _ in 0..64 {
+            stages.push(AsyncCpuStage {
+                ids: CpuReadPinned::alloc(&ctx, k)?,
+                weights: CpuReadPinned::alloc(&ctx, k)?,
+                xs: CpuReadPinned::alloc(&ctx, n_embd)?,
+                out: CpuReadPinned::alloc(&ctx, n_embd)?,
+                flag: MappedFlag::alloc(&ctx)?,
+            });
+        }
+        *guard = Some(stages);
+    }
+    let stages = guard.as_ref().expect("async CPU stages initialized");
+    let stage = stages
+        .get(layer)
+        .ok_or_else(|| candle_core::Error::Msg(format!("MoE async layer {layer} out of range")))?;
+    if stage.ids.len() != k || stage.xs.len() != n_embd {
+        candle_core::bail!("MoE async stage shape changed");
+    }
+    let ptr = stage as *const AsyncCpuStage;
+    drop(guard);
+    // STAGES never changes or drops during process lifetime.
+    Ok(unsafe { &*ptr })
 }
 
 #[cfg(feature = "cuda")]
