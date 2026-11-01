@@ -105,8 +105,8 @@ pub(crate) enum HostBackend {
 }
 
 /// Host-память, отображённая в адресное пространство устройства. Основной
-/// путь — pinned DEVICEMAP (флаги выбраны воротами 0, 2026-09-04): DEVICEMAP
-/// без WRITECOMBINED — полоса та же, UVA dev_ptr == host ptr.
+/// путь — pinned DEVICEMAP|WRITECOMBINED: CPU использует отдельную RAM-копию,
+/// а GPU читает этот буфер через zero-copy; UVA dev_ptr == host ptr.
 ///
 /// Fallback (2026-10-30, стенд RTX 2080 Ti с `ulimit -l` = 8 МиБ):
 /// если pinned-выделение недоступно, используется managed ATTACH_HOST —
