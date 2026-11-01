@@ -3451,6 +3451,11 @@ impl Qwen35BatchAdapter {
         if !self.graphs_enabled {
             return Ok(None);
         }
+        // CPU-MoE does host work and stream synchronization inside each layer;
+        // prefill still uses paged graphs, but decode must run eager.
+        if crate::real::moe::moe_cpu_enabled() {
+            return Ok(None);
+        }
         // Батч больше гейта уходит на eager: многослотовый граф-путь не готов.
         if b > graph_max_b() {
             return Ok(None);
