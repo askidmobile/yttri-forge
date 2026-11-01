@@ -545,9 +545,9 @@ impl Qwen35MoeBlock {
                 let gpu_experts = moe_cpu_gpu_experts().min(k_topk.saturating_sub(1));
                 let mut stage = cpu_decode_stage(cuda_dev, k_topk, n_embd_host)?;
                 let stage = stage.as_mut().expect("CPU decode stage");
-                let ids_ptr_host = stage.ids.as_mut_ptr().map_err(candle_core::Error::wrap)?;
-                let w_ptr_host = stage.weights.as_mut_ptr().map_err(candle_core::Error::wrap)?;
-                let xs_ptr_host = stage.xs.as_mut_ptr().map_err(candle_core::Error::wrap)?;
+                let ids_ptr_host = stage.ids.as_mut_ptr();
+                let w_ptr_host = stage.weights.as_mut_ptr();
+                let xs_ptr_host = stage.xs.as_mut_ptr();
                 let stream = cuda_dev.cuda_stream();
                 let ids_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&ids_t)?;
                 let w_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&w_t)?;
@@ -1314,10 +1314,64 @@ fn moe_cpu_timing_enabled() -> bool {
 
 #[cfg(feature = "cuda")]
 struct CpuDecodeStage {
-    ids: cudarc::driver::PinnedHostSlice<u32>,
-    weights: cudarc::driver::PinnedHostSlice<f32>,
-    xs: cudarc::driver::PinnedHostSlice<f32>,
+    ids: CpuReadPinned<u32>,
+    weights: CpuReadPinned<f32>,
+    xs: CpuReadPinned<f32>,
     out: cudarc::driver::PinnedHostSlice<f32>,
+}
+
+/// Page-locked буфер без CU_MEMHOSTALLOC_WRITECOMBINED. cudarc alloc_pinned
+/// всегда включает WC; для D2H -> CPU такое чтение заметно медленнее.
+#[cfg(feature = "cuda")]
+struct CpuReadPinned<T> {
+    ptr: *mut T,
+    len: usize,
+    event: cudarc::driver::CudaEvent,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl<T> Send for CpuReadPinned<T> {}
+#[cfg(feature = "cuda")]
+unsafe impl<T> Sync for CpuReadPinned<T> {}
+
+#[cfg(feature = "cuda")]
+impl<T> CpuReadPinned<T> {
+    fn alloc(ctx: &Arc<cudarc::driver::CudaContext>, len: usize) -> Result<Self> {
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| candle_core::Error::Msg("CPU pinned size overflow".into()))?;
+        let raw = unsafe { cudarc::driver::result::malloc_host(bytes, 0) }
+            .map_err(candle_core::Error::wrap)?;
+        if raw.is_null() {
+            candle_core::bail!("CPU pinned allocation returned null for {bytes} bytes");
+        }
+        let event = ctx
+            .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC))
+            .map_err(candle_core::Error::wrap)?;
+        Ok(Self {
+            ptr: raw as *mut T,
+            len,
+            event,
+        })
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<T> Drop for CpuReadPinned<T> {
+    fn drop(&mut self) {
+        let _ = self.event.synchronize();
+        unsafe {
+            let _ = cudarc::driver::result::free_host(self.ptr.cast());
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1340,11 +1394,9 @@ fn cpu_decode_stage(
     if replace {
         let ctx = dev.cuda_stream().context().clone();
         *stage = Some(CpuDecodeStage {
-            ids: unsafe { ctx.alloc_pinned::<u32>(k) }.map_err(candle_core::Error::wrap)?,
-            weights: unsafe { ctx.alloc_pinned::<f32>(k) }
-                .map_err(candle_core::Error::wrap)?,
-            xs: unsafe { ctx.alloc_pinned::<f32>(n_embd) }
-                .map_err(candle_core::Error::wrap)?,
+            ids: CpuReadPinned::alloc(&ctx, k)?,
+            weights: CpuReadPinned::alloc(&ctx, k)?,
+            xs: CpuReadPinned::alloc(&ctx, n_embd)?,
             out: unsafe { ctx.alloc_pinned::<f32>(n_embd) }
                 .map_err(candle_core::Error::wrap)?,
         });
