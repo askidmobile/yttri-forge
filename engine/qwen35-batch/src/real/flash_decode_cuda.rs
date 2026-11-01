@@ -163,7 +163,7 @@ pub fn dispatch_flash_decode_paged(
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .map(|v| v.clamp(32, 256))
-            .unwrap_or_else(|| (capacity_tokens / 1024).clamp(32, 256))
+            .unwrap_or(if capacity_tokens > 131_072 { 256 } else { 64 })
     } else {
         (capacity_tokens / 4096).clamp(8, 64)
     } as u32;
