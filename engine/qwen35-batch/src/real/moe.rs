@@ -533,12 +533,50 @@ impl Qwen35MoeBlock {
             (ExpertWeights::Store(store), ForwardMode::DecodeBatch)
                 if moe_cpu_enabled() && n_tokens == 1 =>
             {
-                // CPU-путь: сырые Q4_K байты уже в host-памяти, никаких H2D
-                // на экспертные матрицы. Обмениваются только активации
-                // (8 КиБ вниз/вверх на слой) и ids/веса маршрута.
-                let ids_host = ids_t.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
-                let w_host = w_t.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
-                let xs_cpu = xs.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+                // CPU-путь: сырые Q4_K байты уже в host-памяти. Раньше здесь
+                // было ТРИ блокирующих D2H на слой (ids, веса маршрута, xs) —
+                // 120 синхронизаций на токен. Ставим все копирования в один
+                // поток и ждём ОДНО событие, затем читаем host-буферы.
+                let k_topk = ids_t.elem_count();
+                let n_embd_host = xs.dims2()?.1;
+                let mut ids_buf = vec![0u32; k_topk];
+                let mut w_buf = vec![0f32; w_t.elem_count()];
+                let mut xs_buf = vec![0f32; n_embd_host];
+                {
+                    let stream = cuda_dev.cuda_stream();
+                    let ids_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&ids_t)?;
+                    let w_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&w_t)?;
+                    let xs_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(xs)?;
+                    let ids_ptr = ids_ptr as cudarc::driver::sys::CUdeviceptr;
+                    let w_ptr = w_ptr as cudarc::driver::sys::CUdeviceptr;
+                    let xs_ptr = xs_ptr as cudarc::driver::sys::CUdeviceptr;
+                    unsafe {
+                        cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                            ids_buf.as_mut_ptr() as *mut _,
+                            ids_ptr,
+                            ids_buf.len() * std::mem::size_of::<u32>(),
+                            stream.cu_stream(),
+                        );
+                        cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                            w_buf.as_mut_ptr() as *mut _,
+                            w_ptr,
+                            w_buf.len() * std::mem::size_of::<f32>(),
+                            stream.cu_stream(),
+                        );
+                        cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                            xs_buf.as_mut_ptr() as *mut _,
+                            xs_ptr,
+                            xs_buf.len() * std::mem::size_of::<f32>(),
+                            stream.cu_stream(),
+                        );
+                    }
+                    stream
+                        .synchronize()
+                        .map_err(candle_core::Error::wrap)?;
+                }
+                let ids_host = ids_buf;
+                let w_host = w_buf;
+                let xs_cpu = xs_buf;
                 let routed_cpu = {
                     let store = store.lock().expect("expert layer store");
                     moe_forward_cpu(&store, &ids_host, &w_host, &xs_cpu, xs.dims2()?.1)?
