@@ -1268,18 +1268,26 @@ pub fn moe_forward_cpu(
             std::slice::from_raw_parts(sl.as_ptr() as *const BlockQ4K, n_ff * bprow_u)
         })
         .collect();
+    // Разбиение по СТРОКАМ, а не по экспертам: 8 экспертов давали максимум
+    // 8 параллельных задач, то есть 5–6 занятых ядер из 18. Строк 8×512=4096
+    // — rayon загружает все потоки.
+    let rows_per_task = 32usize;
     gate_all
-        .par_chunks_mut(n_ff)
-        .zip(up_all.par_chunks_mut(n_ff))
+        .par_chunks_mut(rows_per_task)
+        .zip(up_all.par_chunks_mut(rows_per_task))
         .enumerate()
-        .for_each(|(j, (grow, urow))| {
-            let gb = g_blocks[j];
-            let ub = u_blocks[j];
-            for r in 0..n_ff {
+        .for_each(|(t, (grow, urow))| {
+            let base = t * rows_per_task;
+            for off in 0..grow.len() {
+                let idx = base + off;
+                let j = idx / n_ff;
+                let r = idx % n_ff;
+                let gb = g_blocks[j];
+                let ub = u_blocks[j];
                 let gs = &gb[r * bprow_g..(r + 1) * bprow_g];
                 let us = &ub[r * bprow_u..(r + 1) * bprow_u];
-                grow[r] = BlockQ4K::vec_dot(n_embd, gs, &x8);
-                urow[r] = BlockQ4K::vec_dot(n_embd, us, &x8);
+                grow[off] = BlockQ4K::vec_dot(n_embd, gs, &x8);
+                urow[off] = BlockQ4K::vec_dot(n_embd, us, &x8);
             }
         });
     let _ = n_jobs;
@@ -1328,12 +1336,16 @@ pub fn moe_forward_cpu(
         })
         .collect();
     down_all
-        .par_chunks_mut(n_embd)
+        .par_chunks_mut(rows_per_task)
         .enumerate()
-        .for_each(|(j, row)| {
-            let a8 = &d8s[j];
-            for r in 0..n_embd {
-                row[r] = if let Some(dq4) = d_blocks_q4[j] {
+        .for_each(|(t, chunk)| {
+            let base = t * rows_per_task;
+            for off in 0..chunk.len() {
+                let idx = base + off;
+                let j = idx / n_embd;
+                let r = idx % n_embd;
+                let a8 = &d8s[j];
+                chunk[off] = if let Some(dq4) = d_blocks_q4[j] {
                     let sl = &dq4[r * bprow_d..(r + 1) * bprow_d];
                     BlockQ4K::vec_dot(n_ff, sl, a8)
                 } else if let Some(dq6) = d_blocks_q6[j] {
