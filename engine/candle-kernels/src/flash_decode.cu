@@ -330,6 +330,300 @@ extern "C" __global__ void flash_decode_paged_partial(
     }
 }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+// Компактный свизл для одно-warp decode-MMA. В отличие от prefill-ядра здесь
+// мало строк, поэтому номер 8x64-тайла не должен оставлять дыры по столбцам.
+__device__ __forceinline__ int fd_mma_smem_idx(int r, int c, int col_groups) {
+    return (((r >> 3) * col_groups + (c >> 6)) * 512)
+         + ((r & 7) << 6)
+         + ((c & 63) ^ ((r & 7) << 3));
+}
+
+__device__ __forceinline__ unsigned fd_mma_smem_u32(const void* p) {
+    return (unsigned)__cvta_generic_to_shared(p);
+}
+
+__device__ __forceinline__ void fd_mma_ldmatrix_x2(
+    unsigned& r0, unsigned& r1, unsigned addr)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                 : "=r"(r0), "=r"(r1) : "r"(addr));
+}
+
+__device__ __forceinline__ void fd_mma_ldmatrix_x1(
+    unsigned& r0, unsigned addr)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];"
+                 : "=r"(r0) : "r"(addr));
+}
+
+__device__ __forceinline__ void fd_mma_ldmatrix_x1_trans(
+    unsigned& r0, unsigned addr)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {%0}, [%1];"
+                 : "=r"(r0) : "r"(addr));
+}
+
+__device__ __forceinline__ void fd_mma_m16n8k8(
+    float& d0, float& d1, float& d2, float& d3,
+    unsigned a0, unsigned a1, unsigned b0,
+    float c0, float c1, float c2, float c3)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3},{%4,%5},{%6},{%7,%8,%9,%10};"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(b0),
+          "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+}
+
+__device__ __forceinline__ void fd_load_query_heads(
+    __half* __restrict__ dst,
+    const __half* __restrict__ q,
+    unsigned int b,
+    unsigned int qh0,
+    unsigned int n_head,
+    int lane)
+{
+    constexpr int HD = 256;
+    constexpr int COL_GROUPS = HD / 64;
+    constexpr int VECS_PER_HEAD = HD / 8;
+    for (int v = lane; v < 8 * VECS_PER_HEAD; v += 32) {
+        const int h = v / VECS_PER_HEAD;
+        const int c = (v % VECS_PER_HEAD) * 8;
+        const __half* src = q + ((size_t)b * n_head + qh0 + h) * HD + c;
+        int4* out = reinterpret_cast<int4*>(
+            &dst[fd_mma_smem_idx(h, c, COL_GROUPS)]);
+        *out = *reinterpret_cast<const int4*>(src);
+    }
+}
+
+__device__ __forceinline__ void fd_load_pool_tile16(
+    __half* __restrict__ dst,
+    const __half* __restrict__ pool,
+    const unsigned int* __restrict__ bt,
+    unsigned int n_kv,
+    unsigned int kvh,
+    unsigned int base,
+    unsigned int k_end,
+    unsigned int page_size,
+    int lane)
+{
+    constexpr int HD = 256;
+    constexpr int COL_GROUPS = HD / 64;
+    constexpr int VECS_PER_ROW = HD / 8;
+    for (int v = lane; v < 16 * VECS_PER_ROW; v += 32) {
+        const int r = v / VECS_PER_ROW;
+        const int c = (v % VECS_PER_ROW) * 8;
+        int4 val = make_int4(0, 0, 0, 0);
+        const unsigned int p = base + (unsigned int)r;
+        if (p < k_end) {
+            const unsigned int page = bt[p / page_size];
+            const unsigned int phys_row = page * page_size + p % page_size;
+            const __half* src = pool + ((size_t)phys_row * n_kv + kvh) * HD + c;
+            val = *reinterpret_cast<const int4*>(src);
+        }
+        *reinterpret_cast<int4*>(&dst[fd_mma_smem_idx(r, c, COL_GROUPS)]) = val;
+    }
+}
+#endif
+
+// Tensor-core partial для decode: один warp обслуживает все восемь Q-heads
+// одной KV-head. QK^T считается как K[16×256] × Q^T[256×8], затем P^T[16×16]
+// умножается на V[16×256]. Верхние восемь строк P содержат Q-heads, нижние
+// восемь нулевые: это цена Turing m16n8k8 при восьми реальных головах.
+extern "C" __global__ void flash_decode_paged_gqa_mma_partial(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k_pool,
+    const __half* __restrict__ v_pool,
+    const unsigned int* __restrict__ seqlens_k,
+    const unsigned int* __restrict__ block_table,
+    float* __restrict__ partials,
+    const PagedFlashDecodeParams params)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    constexpr unsigned int Q_GROUPS = 8;
+    constexpr unsigned int HD = 256;
+    constexpr unsigned int COL_GROUPS = HD / 64;
+
+    const unsigned int kvh = blockIdx.x;
+    const unsigned int s = blockIdx.y;
+    const unsigned int b = blockIdx.z;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int g = lane >> 2;
+    const unsigned int t = lane & 3;
+    const unsigned int kv_len = seqlens_k[b + 1] - seqlens_k[b];
+    const unsigned int *bt = block_table + (size_t)b * params.block_table_stride;
+    const unsigned int chunk = (kv_len + params.splits - 1) / params.splits;
+    const unsigned int p0 = s * chunk;
+    const unsigned int p1 = min(p0 + chunk, kv_len);
+
+    if (p0 >= kv_len) {
+        for (unsigned int i = lane; i < Q_GROUPS * (2 + HD); i += 32) {
+            const unsigned int h = i / (2 + HD);
+            const unsigned int d = i % (2 + HD);
+            float *po = partials
+                + (((size_t)b * params.n_head + kvh * Q_GROUPS + h)
+                    * params.splits + s) * (2 + HD);
+            po[d] = 0.0f;
+        }
+        __syncwarp();
+        if (g == 0) {
+            float *o0 = partials
+                + (((size_t)b * params.n_head + kvh * Q_GROUPS + 2 * t)
+                    * params.splits + s) * (2 + HD);
+            float *o1 = o0 + (size_t)params.splits * (2 + HD);
+            o0[0] = -INFINITY; o0[1] = 0.0f;
+            o1[0] = -INFINITY; o1[1] = 0.0f;
+        }
+        return;
+    }
+
+    __shared__ __align__(16) __half sQ[8 * HD];
+    __shared__ __align__(16) __half sKV[16 * HD];
+    // Свизл хранит каждый 8x64-тайл целиком, даже если реально нужны 16 колонок.
+    __shared__ __align__(16) __half sP[2 * 512];
+
+    fd_load_query_heads(sQ, q, b, kvh * Q_GROUPS, params.n_head, (int)lane);
+    for (unsigned int i = lane; i < 16 * 16; i += 32) {
+        const unsigned int r = i / 16;
+        const unsigned int c = i % 16;
+        sP[fd_mma_smem_idx((int)r, (int)c, 1)] = __float2half(0.0f);
+    }
+    __syncwarp();
+
+    float m0 = -INFINITY, m1 = -INFINITY;
+    float l0 = 0.0f, l1 = 0.0f;
+    float O[32][4];
+    #pragma unroll
+    for (int dc = 0; dc < 32; dc++) {
+        O[dc][0] = 0.0f; O[dc][1] = 0.0f;
+        O[dc][2] = 0.0f; O[dc][3] = 0.0f;
+    }
+
+    for (unsigned int base = p0; base < p1; base += 16) {
+        fd_load_pool_tile16(
+            sKV, k_pool, bt, params.n_kv, kvh, base, p1,
+            params.page_size, (int)lane);
+        __syncwarp();
+
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        #pragma unroll
+        for (int kc = 0; kc < 32; kc++) {
+            unsigned a0, a1, bq;
+            fd_mma_ldmatrix_x2(
+                a0, a1,
+                fd_mma_smem_u32(&sKV[fd_mma_smem_idx(
+                    (int)(lane & 15), 8 * kc, COL_GROUPS)]));
+            fd_mma_ldmatrix_x1(
+                bq,
+                fd_mma_smem_u32(&sQ[fd_mma_smem_idx(
+                    (int)(lane & 7), 8 * kc, COL_GROUPS)]));
+            float d0, d1, d2, d3;
+            fd_mma_m16n8k8(d0, d1, d2, d3, a0, a1, bq, s0, s1, s2, s3);
+            s0 = d0; s1 = d1; s2 = d2; s3 = d3;
+        }
+
+        const bool row0_valid = base + g < p1;
+        const bool row1_valid = base + g + 8 < p1;
+        s0 = row0_valid ? s0 * params.scale : -INFINITY;
+        s1 = row0_valid ? s1 * params.scale : -INFINITY;
+        s2 = row1_valid ? s2 * params.scale : -INFINITY;
+        s3 = row1_valid ? s3 * params.scale : -INFINITY;
+
+        float tile_m0 = fmaxf(s0, s2);
+        float tile_m1 = fmaxf(s1, s3);
+        #pragma unroll
+        for (int mask = 4; mask <= 16; mask <<= 1) {
+            tile_m0 = fmaxf(tile_m0, __shfl_xor_sync(0xffffffffu, tile_m0, mask));
+            tile_m1 = fmaxf(tile_m1, __shfl_xor_sync(0xffffffffu, tile_m1, mask));
+        }
+        const float mn0 = fmaxf(m0, tile_m0);
+        const float mn1 = fmaxf(m1, tile_m1);
+        const float corr0 = (m0 > -INFINITY) ? __expf(m0 - mn0) : 0.0f;
+        const float corr1 = (m1 > -INFINITY) ? __expf(m1 - mn1) : 0.0f;
+        m0 = mn0; m1 = mn1;
+
+        float p0v = (s0 > -INFINITY && mn0 > -INFINITY) ? __expf(s0 - mn0) : 0.0f;
+        float p1v = (s1 > -INFINITY && mn1 > -INFINITY) ? __expf(s1 - mn1) : 0.0f;
+        float p2v = (s2 > -INFINITY && mn0 > -INFINITY) ? __expf(s2 - mn0) : 0.0f;
+        float p3v = (s3 > -INFINITY && mn1 > -INFINITY) ? __expf(s3 - mn1) : 0.0f;
+        sP[fd_mma_smem_idx((int)(2 * t), (int)g, 1)] = __float2half_rn(p0v);
+        sP[fd_mma_smem_idx((int)(2 * t + 1), (int)g, 1)] = __float2half_rn(p1v);
+        sP[fd_mma_smem_idx((int)(2 * t), (int)g + 8, 1)] = __float2half_rn(p2v);
+        sP[fd_mma_smem_idx((int)(2 * t + 1), (int)g + 8, 1)] = __float2half_rn(p3v);
+
+        float sum0 = __half2float(__float2half_rn(p0v))
+                   + __half2float(__float2half_rn(p2v));
+        float sum1 = __half2float(__float2half_rn(p1v))
+                   + __half2float(__float2half_rn(p3v));
+        #pragma unroll
+        for (int mask = 4; mask <= 16; mask <<= 1) {
+            sum0 += __shfl_xor_sync(0xffffffffu, sum0, mask);
+            sum1 += __shfl_xor_sync(0xffffffffu, sum1, mask);
+        }
+        l0 = l0 * corr0 + sum0;
+        l1 = l1 * corr1 + sum1;
+
+        const float ce = __shfl_sync(0xffffffffu, corr0, (int)(g >> 1));
+        const float co = __shfl_sync(0xffffffffu, corr1, (int)(g >> 1));
+        const float corr_head = (g & 1) ? co : ce;
+        #pragma unroll
+        for (int dc = 0; dc < 32; dc++) {
+            O[dc][0] *= corr_head; O[dc][1] *= corr_head;
+            O[dc][2] *= corr_head; O[dc][3] *= corr_head;
+        }
+        __syncwarp();
+
+        fd_load_pool_tile16(
+            sKV, v_pool, bt, params.n_kv, kvh, base, p1,
+            params.page_size, (int)lane);
+        __syncwarp();
+
+        #pragma unroll
+        for (int kc = 0; kc < 2; kc++) {
+            unsigned pa0, pa1;
+            fd_mma_ldmatrix_x2(
+                pa0, pa1,
+                fd_mma_smem_u32(&sP[fd_mma_smem_idx(
+                    (int)(lane & 15), 8 * kc, 1)]));
+            #pragma unroll
+            for (int dc = 0; dc < 32; dc++) {
+                unsigned bv;
+                fd_mma_ldmatrix_x1_trans(
+                    bv,
+                    fd_mma_smem_u32(&sKV[fd_mma_smem_idx(
+                        (int)(8 * kc + (lane & 7)), 8 * dc, COL_GROUPS)]));
+                float d0, d1, d2, d3;
+                fd_mma_m16n8k8(
+                    d0, d1, d2, d3, pa0, pa1, bv,
+                    O[dc][0], O[dc][1], O[dc][2], O[dc][3]);
+                O[dc][0] = d0; O[dc][1] = d1;
+                O[dc][2] = d2; O[dc][3] = d3;
+            }
+        }
+        __syncwarp();
+    }
+
+    if (g == 0) {
+        float *o0 = partials
+            + (((size_t)b * params.n_head + kvh * Q_GROUPS + 2 * t)
+                * params.splits + s) * (2 + HD);
+        float *o1 = o0 + (size_t)params.splits * (2 + HD);
+        o0[0] = l0 > 0.0f ? m0 : -INFINITY; o0[1] = l0;
+        o1[0] = l1 > 0.0f ? m1 : -INFINITY; o1[1] = l1;
+    }
+    float *out = partials
+        + (((size_t)b * params.n_head + kvh * Q_GROUPS + g)
+            * params.splits + s) * (2 + HD);
+    #pragma unroll
+    for (int dc = 0; dc < 32; dc++) {
+        out[2 + 8 * dc + 2 * t] = O[dc][0];
+        out[2 + 8 * dc + 2 * t + 1] = O[dc][1];
+    }
+#endif
+}
+
 // GQA-свёрнутая варианта partial-ядра: один CTA обслуживает все Q-головы
 // одной KV-головы. K/V tile загружается в shared один раз и переиспользуется
 // восьмью warp'ами; partials сохраняют прежний layout [B, n_head, splits, 2+hd],

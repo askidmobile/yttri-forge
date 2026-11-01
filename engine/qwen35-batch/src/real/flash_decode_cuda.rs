@@ -158,12 +158,13 @@ pub fn dispatch_flash_decode_paged(
         && hd == 256
         && n_kv > 0
         && n_head / n_kv == 8;
+    let gqa_mma = gqa_fold && std::env::var("DECODE_GQA_MMA").as_deref() == Ok("1");
     let splits = if gqa_fold {
         std::env::var("DECODE_GQA_SPLITS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .map(|v| v.clamp(32, 256))
-            .unwrap_or(if capacity_tokens > 131_072 { 256 } else { 64 })
+            .unwrap_or(if gqa_mma { 128 } else if capacity_tokens > 131_072 { 256 } else { 64 })
     } else {
         (capacity_tokens / 4096).clamp(8, 64)
     } as u32;
@@ -191,7 +192,9 @@ pub fn dispatch_flash_decode_paged(
     let mut out = unsafe { dev.alloc::<half::f16>(b_sz * n_head * hd)? };
     {
         let func = dev.get_or_load_func(
-            if gqa_fold {
+            if gqa_mma {
+                "flash_decode_paged_gqa_mma_partial"
+            } else if gqa_fold {
                 "flash_decode_paged_gqa_partial"
             } else {
                 "flash_decode_paged_partial"
@@ -204,7 +207,7 @@ pub fn dispatch_flash_decode_paged(
                 splits,
                 b_sz as u32,
             ),
-            block_dim: (if gqa_fold { 256 } else { 128 }, 1, 1),
+            block_dim: (if gqa_mma { 32 } else if gqa_fold { 256 } else { 128 }, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut builder = func.builder();
