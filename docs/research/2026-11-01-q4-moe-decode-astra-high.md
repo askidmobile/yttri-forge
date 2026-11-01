@@ -60,3 +60,10 @@ GQA fold уже снял большую часть long-context attention overhe
   `/tmp/llama-256-final.json`.
 - Parity 505/512: до и после GQA/pinned — `1, 2, 3, 4, 5, 6, 7,`;
   итоговые long-context ответы связные.
+
+## Отклонено: GPU cache на целевом контексте
+
+`MOE_CPU=0`, `EXPERT_CACHE_MIB=4400`, `PREFILL_CHUNK=2048` дал short decode
+15.43 t/s (в пределах шума с CPU/pinned 15.37), но 128k prefill упал с
+`CUDA_ERROR_OUT_OF_MEMORY` в MoE `broadcast_mul` после первого чанка при
+остатке 64 MiB. Конфигурация отклонена: она не обслуживает одновременно 128k/256k.
