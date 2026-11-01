@@ -6718,17 +6718,24 @@ impl ModelWeights {
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .map(|mib| mib as u64 * 1024 * 1024);
-            let cache_bytes = match requested {
-                Some(req) if req > available => {
-                    candle_core::bail!(
-                        "EXPERT_CACHE_MIB={} > доступных {:.0} МиБ (free {:.0} − headroom − резерв графов) — fail-closed (FR-006)",
-                        req / 1024 / 1024,
-                        available as f64 / 1024.0 / 1024.0,
-                        free_vram as f64 / 1024.0 / 1024.0
-                    );
+            let cpu_moe = std::env::var("MOE_CPU").as_deref() == Ok("1");
+            let cache_bytes = if cpu_moe {
+                // Routed experts never enter the GPU cache in CPU decode mode.
+                // Keep the full VRAM headroom available for 128k/256k prefill.
+                0
+            } else {
+                match requested {
+                    Some(req) if req > available => {
+                        candle_core::bail!(
+                            "EXPERT_CACHE_MIB={} > доступных {:.0} МиБ (free {:.0} − headroom − резерв графов) — fail-closed (FR-006)",
+                            req / 1024 / 1024,
+                            available as f64 / 1024.0 / 1024.0,
+                            free_vram as f64 / 1024.0 / 1024.0
+                        );
+                    }
+                    Some(req) => req,
+                    None => available,
                 }
-                Some(req) => req,
-                None => available,
             };
             // Слотов на слой поровну (D-009): capacity = бюджет / Σ(3×слой),
             // кламп к числу экспертов (cache > 256 экспертов бессмыслен).
