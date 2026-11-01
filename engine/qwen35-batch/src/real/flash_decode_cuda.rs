@@ -154,7 +154,15 @@ pub fn dispatch_flash_decode_paged(
     }
 
     let capacity_tokens = pool_blocks * page_size;
-    let splits = (capacity_tokens / 4096).clamp(8, 64) as u32;
+    let gqa_fold = std::env::var("DECODE_GQA_FOLD").as_deref() != Ok("0")
+        && hd == 256
+        && n_kv > 0
+        && n_head / n_kv == 8;
+    let splits = if gqa_fold {
+        (capacity_tokens / 1024).clamp(32, 256)
+    } else {
+        (capacity_tokens / 4096).clamp(8, 64)
+    } as u32;
     let params = PagedFlashDecodeParams {
         n_head: n_head as u32,
         n_kv: n_kv as u32,
@@ -179,12 +187,20 @@ pub fn dispatch_flash_decode_paged(
     let mut out = unsafe { dev.alloc::<half::f16>(b_sz * n_head * hd)? };
     {
         let func = dev.get_or_load_func(
-            "flash_decode_paged_partial",
+            if gqa_fold {
+                "flash_decode_paged_gqa_partial"
+            } else {
+                "flash_decode_paged_partial"
+            },
             &candle_kernels::FLASH_DECODE,
         )?;
         let cfg = LaunchConfig {
-            grid_dim: (n_head as u32, splits, b_sz as u32),
-            block_dim: (128, 1, 1),
+            grid_dim: (
+                if gqa_fold { n_kv as u32 } else { n_head as u32 },
+                splits,
+                b_sz as u32,
+            ),
+            block_dim: (if gqa_fold { 256 } else { 128 }, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut builder = func.builder();

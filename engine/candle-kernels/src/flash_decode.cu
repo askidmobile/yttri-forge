@@ -330,6 +330,182 @@ extern "C" __global__ void flash_decode_paged_partial(
     }
 }
 
+// GQA-свёрнутая варианта partial-ядра: один CTA обслуживает все Q-головы
+// одной KV-головы. K/V tile загружается в shared один раз и переиспользуется
+// восьмью warp'ами; partials сохраняют прежний layout [B, n_head, splits, 2+hd],
+// поэтому существующий combine не меняется.
+extern "C" __global__ void flash_decode_paged_gqa_partial(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k_pool,
+    const __half* __restrict__ v_pool,
+    const unsigned int* __restrict__ seqlens_k,
+    const unsigned int* __restrict__ block_table,
+    float* __restrict__ partials,
+    const PagedFlashDecodeParams params
+) {
+    constexpr unsigned int TILE = 32;
+    const unsigned int kvh = blockIdx.x;
+    const unsigned int s = blockIdx.y;
+    const unsigned int b = blockIdx.z;
+    const unsigned int hd = params.hd;
+    const unsigned int n_kv = params.n_kv;
+    const unsigned int ngroups = params.n_head / n_kv;
+    const unsigned int kv_len = seqlens_k[b + 1] - seqlens_k[b];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31;
+    const unsigned int warp = tid >> 5;
+    const unsigned int *bt = block_table + (size_t)b * params.block_table_stride;
+
+    const unsigned int chunk = (kv_len + params.splits - 1) / params.splits;
+    const unsigned int p0 = s * chunk;
+    const unsigned int qh = kvh * ngroups + warp;
+    float *out = partials +
+        (((size_t)b * params.n_head + qh) * params.splits + s) * (2 + hd);
+    if (p0 >= kv_len) {
+        if (warp == 0 && lane < ngroups) {
+            const unsigned int ph = kvh * ngroups + lane;
+            float *po = partials +
+                (((size_t)b * params.n_head + ph) * params.splits + s) * (2 + hd);
+            po[0] = -INFINITY;
+            po[1] = 0.0f;
+        }
+        for (unsigned int i = tid; i < ngroups * hd; i += blockDim.x) {
+            const unsigned int g = i / hd;
+            const unsigned int d = i % hd;
+            const unsigned int ph = kvh * ngroups + g;
+            float *po = partials +
+                (((size_t)b * params.n_head + ph) * params.splits + s) * (2 + hd);
+            po[2 + d] = 0.0f;
+        }
+        return;
+    }
+
+    const unsigned int p1 = min(p0 + chunk, kv_len);
+    const unsigned int d0 = lane * 8;
+    const __half *qhead = q + ((size_t)b * params.n_head + qh) * hd;
+    float qreg[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) qreg[i] = __half2float(qhead[d0 + i]);
+
+    float m_l = -INFINITY;
+    float l_l = 0.0f;
+    float acc[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
+
+    __shared__ __align__(16) __half kv_sh[TILE * 256];
+    __shared__ float warp_partial[8][2 + 256];
+    __shared__ float block_max[8];
+    __shared__ float block_sum[8];
+
+    const unsigned int vecs_per_row = hd / 8;
+    const unsigned int tile_vecs = TILE * vecs_per_row;
+    for (unsigned int base = p0; base < p1; base += TILE) {
+        const unsigned int rows = min(TILE, p1 - base);
+        // K tile: int4 = 8 half.
+        for (unsigned int v = tid; v < tile_vecs; v += blockDim.x) {
+            const unsigned int r = v / vecs_per_row;
+            const unsigned int c = (v % vecs_per_row) * 8;
+            int4 val = make_int4(0, 0, 0, 0);
+            if (r < rows) {
+                const unsigned int p = base + r;
+                const unsigned int page = bt[p / params.page_size];
+                const unsigned int row = page * params.page_size + p % params.page_size;
+                const __half *src = k_pool + ((size_t)row * n_kv + kvh) * hd + c;
+                val = *reinterpret_cast<const int4*>(src);
+            }
+            *reinterpret_cast<int4*>(&kv_sh[r * 256 + c]) = val;
+        }
+        __syncthreads();
+
+        float pexp[TILE];
+        float corr[TILE];
+        for (unsigned int r = 0; r < rows; ++r) {
+            const __half *kp = &kv_sh[r * 256 + d0];
+            float part = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) part += qreg[i] * __half2float(kp[i]);
+            for (int o = 16; o > 0; o >>= 1)
+                part += __shfl_xor_sync(0xffffffff, part, o);
+            const float dot = part * params.scale;
+            const float m_new = fmaxf(m_l, dot);
+            const float cr = __expf(m_l - m_new);
+            const float pe = __expf(dot - m_new);
+            l_l = l_l * cr + pe;
+            m_l = m_new;
+            pexp[r] = pe;
+            corr[r] = cr;
+        }
+        __syncthreads();
+
+        // V tile переиспользует тот же shared.
+        for (unsigned int v = tid; v < tile_vecs; v += blockDim.x) {
+            const unsigned int r = v / vecs_per_row;
+            const unsigned int c = (v % vecs_per_row) * 8;
+            int4 val = make_int4(0, 0, 0, 0);
+            if (r < rows) {
+                const unsigned int p = base + r;
+                const unsigned int page = bt[p / params.page_size];
+                const unsigned int row = page * params.page_size + p % params.page_size;
+                const __half *src = v_pool + ((size_t)row * n_kv + kvh) * hd + c;
+                val = *reinterpret_cast<const int4*>(src);
+            }
+            *reinterpret_cast<int4*>(&kv_sh[r * 256 + c]) = val;
+        }
+        __syncthreads();
+        for (unsigned int r = 0; r < rows; ++r) {
+            const __half *vp = &kv_sh[r * 256 + d0];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                acc[i] = acc[i] * corr[r] + pexp[r] * __half2float(vp[i]);
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0) {
+        warp_partial[warp][0] = l_l > 0.0f ? m_l : -INFINITY;
+        warp_partial[warp][1] = l_l;
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) warp_partial[warp][2 + d0 + i] = acc[i];
+    __syncthreads();
+
+    if (warp == 0 && lane < ngroups) {
+        float m = -INFINITY;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) m = fmaxf(m, warp_partial[w][0]);
+        float l = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            if (warp_partial[w][1] > 0.0f)
+                l += warp_partial[w][1] * __expf(warp_partial[w][0] - m);
+        }
+        block_max[lane] = m;
+        block_sum[lane] = l;
+        const unsigned int ph = kvh * ngroups + lane;
+        float *po = partials +
+            (((size_t)b * params.n_head + ph) * params.splits + s) * (2 + hd);
+        po[0] = l > 0.0f ? m : -INFINITY;
+        po[1] = l;
+    }
+    __syncthreads();
+
+    for (unsigned int i = tid; i < ngroups * hd; i += blockDim.x) {
+        const unsigned int g = i / hd;
+        const unsigned int d = i % hd;
+        const unsigned int ph = kvh * ngroups + g;
+        float *po = partials +
+            (((size_t)b * params.n_head + ph) * params.splits + s) * (2 + hd);
+        float value = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            if (warp_partial[w][1] > 0.0f)
+                value += warp_partial[w][2 + d] * __expf(warp_partial[w][0] - block_max[g]);
+        }
+        po[2 + d] = value;
+    }
+}
+
 extern "C" __global__ void flash_decode_paged_combine(
     const float* __restrict__ partials,
     __half* __restrict__ out,
