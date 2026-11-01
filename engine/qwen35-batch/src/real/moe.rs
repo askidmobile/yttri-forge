@@ -548,94 +548,122 @@ impl Qwen35MoeBlock {
                 let ids_ptr_host = stage.ids.as_mut_ptr().map_err(candle_core::Error::wrap)?;
                 let w_ptr_host = stage.weights.as_mut_ptr().map_err(candle_core::Error::wrap)?;
                 let xs_ptr_host = stage.xs.as_mut_ptr().map_err(candle_core::Error::wrap)?;
-                let (shared, gpu_routed) = {
-                    let stream = cuda_dev.cuda_stream();
-                    let ids_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&ids_t)?;
-                    let w_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&w_t)?;
-                    let xs_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(xs)?;
-                    let ids_ptr = ids_ptr as cudarc::driver::sys::CUdeviceptr;
-                    let w_ptr = w_ptr as cudarc::driver::sys::CUdeviceptr;
-                    let xs_ptr = xs_ptr as cudarc::driver::sys::CUdeviceptr;
-                    unsafe {
-                        cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                            ids_ptr_host as *mut _,
-                            ids_ptr,
-                            k_topk * std::mem::size_of::<u32>(),
-                            stream.cu_stream(),
-                        );
-                        cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                            w_ptr_host as *mut _,
-                            w_ptr,
-                            k_topk * std::mem::size_of::<f32>(),
-                            stream.cu_stream(),
-                        );
-                        cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                            xs_ptr_host as *mut _,
-                            xs_ptr,
-                            n_embd_host * std::mem::size_of::<f32>(),
-                            stream.cu_stream(),
-                        );
-                    }
-                    // D2H must finish before CPU experts start. Shared expert is
-                    // independent, so launch it after the event and hide its GPU
-                    // work under routed CPU computation.
-                    let copy_done = stream
-                        .record_event(None)
-                        .map_err(candle_core::Error::wrap)?;
-                    let shared = self.shared.forward(xs)?;
-                    let gpu_routed = if gpu_experts > 0 {
-                        let ids_gpu = ids_t.narrow(1, 0, gpu_experts)?.contiguous()?;
-                        let weights_gpu = w_t.narrow(1, 0, gpu_experts)?.contiguous()?;
-                        let store = store.lock().expect("expert layer store");
-                        let (gate_shape, down_shape) = store.shapes();
-                        let (gate, up) = indexed_moe_forward_dual_table(
-                            cuda_dev,
-                            store.gate.dtype,
-                            gate_shape,
-                            store.gate.table(),
-                            store.up.table(),
-                            &make_x3()?,
-                            &ids_gpu,
+                let stream = cuda_dev.cuda_stream();
+                let ids_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&ids_t)?;
+                let w_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&w_t)?;
+                let xs_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(xs)?;
+                let ids_ptr = ids_ptr as cudarc::driver::sys::CUdeviceptr;
+                let w_ptr = w_ptr as cudarc::driver::sys::CUdeviceptr;
+                let xs_ptr = xs_ptr as cudarc::driver::sys::CUdeviceptr;
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                        ids_ptr_host as *mut _,
+                        ids_ptr,
+                        k_topk * std::mem::size_of::<u32>(),
+                        stream.cu_stream(),
+                    );
+                    cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                        w_ptr_host as *mut _,
+                        w_ptr,
+                        k_topk * std::mem::size_of::<f32>(),
+                        stream.cu_stream(),
+                    );
+                    cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                        xs_ptr_host as *mut _,
+                        xs_ptr,
+                        n_embd_host * std::mem::size_of::<f32>(),
+                        stream.cu_stream(),
+                    );
+                }
+                let copy_done = stream
+                    .record_event(None)
+                    .map_err(candle_core::Error::wrap)?;
+                // Держим единственный guard на слое, пока CPU-воркер читает те же
+                // immutable host weights. Указатель жив до завершения join.
+                let store_guard = store.lock().expect("expert layer store");
+                let store_addr = (&*store_guard as *const super::expert_store::ExpertLayerStore) as usize;
+                let ids_addr = ids_ptr_host as usize;
+                let weights_addr = w_ptr_host as usize;
+                let xs_addr = xs_ptr_host as usize;
+                let (gpu_job, cpu_job) = std::thread::scope(|scope| {
+                    let cpu_thread = scope.spawn(move || -> Result<(Vec<f32>, std::time::Duration, std::time::Duration)> {
+                        let t_wait = std::time::Instant::now();
+                        copy_done
+                            .synchronize()
+                            .map_err(candle_core::Error::wrap)?;
+                        let wait_elapsed = t_wait.elapsed();
+                        let ids_host = unsafe {
+                            std::slice::from_raw_parts(ids_addr as *const u32, k_topk)
+                        };
+                        let w_host = unsafe {
+                            std::slice::from_raw_parts(weights_addr as *const f32, k_topk)
+                        };
+                        let xs_cpu = unsafe {
+                            std::slice::from_raw_parts(xs_addr as *const f32, n_embd_host)
+                        };
+                        let st = unsafe {
+                            &*(store_addr as *const super::expert_store::ExpertLayerStore)
+                        };
+                        let t_cpu = std::time::Instant::now();
+                        let routed = moe_forward_cpu(
+                            st,
+                            &ids_host[gpu_experts..],
+                            &w_host[gpu_experts..],
+                            xs_cpu,
+                            n_embd_host,
                         )?;
-                        let act = gate.silu_mul_direct(&up)?.contiguous()?;
-                        let down = indexed_moe_forward_table(
-                            cuda_dev,
-                            store.down.dtype,
-                            down_shape,
-                            store.down.table(),
-                            &act,
-                            &ids_gpu,
-                        )?;
-                        weighted_sum(down, &weights_gpu)?
-                    } else {
-                        Tensor::zeros((1usize, 1usize, n_embd_host), DType::F32, xs.device())?
-                    };
-                    copy_done
-                        .synchronize()
-                        .map_err(candle_core::Error::wrap)?;
-                    (shared, gpu_routed)
-                };
+                        Ok((routed, wait_elapsed, t_cpu.elapsed()))
+                    });
+                    // CUDA-ветку обязательно ставим на вызывающем потоке; worker
+                    // только ждёт D2H event и считает CPU experts.
+                    let gpu_job = (|| -> Result<(Tensor, Tensor, std::time::Duration, Option<cudarc::driver::CudaEvent>)> {
+                        let st = unsafe {
+                            &*(store_addr as *const super::expert_store::ExpertLayerStore)
+                        };
+                        let shared = self.shared.forward(xs)?;
+                        let gpu_routed = if gpu_experts > 0 {
+                            let ids_gpu = ids_t.narrow(1, 0, gpu_experts)?.contiguous()?;
+                            let weights_gpu = w_t.narrow(1, 0, gpu_experts)?.contiguous()?;
+                            let (gate_shape, down_shape) = st.shapes();
+                            let (gate, up) = indexed_moe_forward_dual_table(
+                                cuda_dev,
+                                st.gate.dtype,
+                                gate_shape,
+                                st.gate.table(),
+                                st.up.table(),
+                                &make_x3()?,
+                                &ids_gpu,
+                            )?;
+                            let act = gate.silu_mul_direct(&up)?.contiguous()?;
+                            let down = indexed_moe_forward_table(
+                                cuda_dev,
+                                st.down.dtype,
+                                down_shape,
+                                st.down.table(),
+                                &act,
+                                &ids_gpu,
+                            )?;
+                            moe_reduce(down, &weights_gpu, gpu_experts, cuda_dev)?
+                        } else {
+                            Tensor::zeros((1usize, 1usize, n_embd_host), DType::F32, xs.device())?
+                        };
+                        let gpu_done = if timing {
+                            Some(stream.record_event(None).map_err(candle_core::Error::wrap)?)
+                        } else {
+                            None
+                        };
+                        Ok((shared, gpu_routed, t_layer.elapsed(), gpu_done))
+                    })();
+                    let cpu_job = cpu_thread
+                        .join()
+                        .map_err(|_| candle_core::Error::Msg("CPU-MoE worker panicked".into()))
+                        .and_then(|job| job);
+                    (gpu_job, cpu_job)
+                });
+                let (shared, gpu_routed, enqueue_elapsed, gpu_done) = gpu_job?;
+                let (routed_cpu, wait_elapsed, cpu_elapsed) = cpu_job?;
+                drop(store_guard);
                 let d2h_elapsed = t_layer.elapsed();
-                let t_cpu = std::time::Instant::now();
-                let ids_host = unsafe {
-                    std::slice::from_raw_parts(stage.ids.as_ptr().map_err(candle_core::Error::wrap)?, k_topk)
-                };
-                let w_host = unsafe {
-                    std::slice::from_raw_parts(stage.weights.as_ptr().map_err(candle_core::Error::wrap)?, k_topk)
-                };
-                let xs_cpu = unsafe {
-                    std::slice::from_raw_parts(stage.xs.as_ptr().map_err(candle_core::Error::wrap)?, n_embd_host)
-                };
-                let routed_cpu = {
-                    let store = store.lock().expect("expert layer store");
-                    moe_forward_cpu(
-                        &store,
-                        &ids_host[gpu_experts..],
-                        &w_host[gpu_experts..],
-                        xs_cpu,
-                        n_embd_host,
-                    )?
-                };
                 let out_host = stage.out.as_mut_ptr().map_err(candle_core::Error::wrap)?;
                 unsafe {
                     std::ptr::copy_nonoverlapping(routed_cpu.as_ptr(), out_host, n_embd_host);
@@ -655,19 +683,32 @@ impl Qwen35MoeBlock {
                     candle_core::bail!("CPU-MoE H2D: {rc:?}");
                 }
                 if timing {
-                    let cpu_elapsed = t_cpu.elapsed();
                     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     static D2H: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     static CPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static ENQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static READY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let d2h_us = d2h_elapsed.as_micros() as u64;
                     let cpu_us = cpu_elapsed.as_micros() as u64;
+                    let enq_us = enqueue_elapsed.as_micros() as u64;
+                    let wait_us = wait_elapsed.as_micros() as u64;
+                    let ready = gpu_done.as_ref().is_some_and(|event| event.is_complete());
                     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     D2H.fetch_add(d2h_us, std::sync::atomic::Ordering::Relaxed);
                     CPU.fetch_add(cpu_us, std::sync::atomic::Ordering::Relaxed);
+                    ENQ.fetch_add(enq_us, std::sync::atomic::Ordering::Relaxed);
+                    WAIT.fetch_add(wait_us, std::sync::atomic::Ordering::Relaxed);
+                    READY.fetch_add(ready as u64, std::sync::atomic::Ordering::Relaxed);
                     if n % 41 == 0 {
                         let d = D2H.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 41.0;
                         let c = CPU.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 41.0;
-                        eprintln!("[moe-cpu] d2h={d:.1}us cpu={c:.1}us");
+                        let e = ENQ.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 41.0;
+                        let w = WAIT.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 41.0;
+                        let r = READY.swap(0, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!(
+                            "[moe-cpu] d2h={d:.1}us enqueue={e:.1}us wait={w:.1}us cpu={c:.1}us gpu_ready={r}/41"
+                        );
                     }
                 }
                 return Ok(routed.broadcast_add(&gpu_routed)?.broadcast_add(&shared)?);
@@ -1434,8 +1475,7 @@ pub fn moe_forward_cpu(
 
     // Один плоский parallel по (эксперт × строка): без вложенного rayon.
     let n_jobs = sel.len() * n_ff;
-    let mut gate_all = vec![0f32; n_jobs];
-    let mut up_all = vec![0f32; n_jobs];
+    let mut acts = vec![0f32; n_jobs];
     let bprow_g = n_embd / QK_K;
     let bprow_u = n_embd / QK_K;
     if g_dtype != GgmlDType::Q4K || u_dtype != GgmlDType::Q4K {
@@ -1461,15 +1501,14 @@ pub fn moe_forward_cpu(
     // раз на 8 строк вместо восьми (то, что llama.cpp получает через repack
     // в block_q4_Kx8). 8·bprow блоков подряд — это 8 последовательных строк.
     let rows8 = 8usize;
-    gate_all
+    acts
         .par_chunks_mut(rows8)
-        .zip(up_all.par_chunks_mut(rows8))
         .enumerate()
-        .for_each(|(t, (g8, u8))| {
+        .for_each(|(t, a8)| {
             let base = t * rows8;
             let j = base / n_ff;
             let r = base % n_ff;
-            let n = g8.len();
+            let n = a8.len();
             let mut acc_g = [0f32; 8];
             let mut acc_u = [0f32; 8];
             let gs = &g_blocks[j][r * bprow_g..(r + n) * bprow_g];
@@ -1495,20 +1534,11 @@ pub fn moe_forward_cpu(
                         n_embd, &us[off * bprow_u..(off + 1) * bprow_u], &x8);
                 }
             }
-            g8.copy_from_slice(&acc_g[..n]);
-            u8.copy_from_slice(&acc_u[..n]);
+            for off in 0..n {
+                let gv = acc_g[off];
+                a8[off] = (gv / (1.0 + (-gv).exp())) * acc_u[off];
+            }
         });
-    let _ = n_jobs;
-    let acts: Vec<Vec<f32>> = gate_all
-        .chunks(n_ff)
-        .zip(up_all.chunks(n_ff))
-        .map(|(g, u)| {
-            g.iter()
-                .zip(u.iter())
-                .map(|(&gv, &uv)| (gv / (1.0 + (-gv).exp())) * uv)
-                .collect()
-        })
-        .collect();
 
     // Проход 2: down для всех выбранных экспертов + взвешенная сумма.
     let down_slices: Vec<&[u8]> = sel.iter().map(|(e, _)| st.down.expert_host_slice(*e)).collect();
@@ -1522,7 +1552,7 @@ pub fn moe_forward_cpu(
     let bprow_d = n_ff / QK_K;
     // down-матрицы: Q6_K или Q4_K — приводим к enum внутри задачи.
     let d8s: Vec<Vec<BlockQ8K>> = acts
-        .par_iter()
+        .par_chunks(n_ff)
         .map(|a| {
             let mut a8 = vec![BlockQ8K::zeros(); bprow_d];
             BlockQ8K::from_float(a, &mut a8);
