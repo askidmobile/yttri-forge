@@ -21,12 +21,12 @@ fn main() -> anyhow::Result<()> {
         let table = Tensor::from_vec(table, (1, blocks), &dev)?;
         let lens = Tensor::from_vec(vec![0u32, kv_len as u32], (2,), &dev)?;
         dispatch_flash_decode_paged(&cuda, &q, &k, &v, &lens, &table, 0.0625)?;
-        cuda.cuda_stream().synchronize()?;
+        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
         let t = std::time::Instant::now();
         for _ in 0..iters {
             dispatch_flash_decode_paged(&cuda, &q, &k, &v, &lens, &table, 0.0625)?;
         }
-        cuda.cuda_stream().synchronize()?;
+        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
         eprintln!(
             "kv={kv_len} iters={iters} splits={} ms={:.3}",
             std::env::var("DECODE_GQA_SPLITS").unwrap_or_else(|_| "auto".into()),
