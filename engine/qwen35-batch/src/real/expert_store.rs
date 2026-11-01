@@ -149,11 +149,14 @@ impl HostBuf {
     fn try_pinned(bytes: usize) -> Result<Self> {
         use cudarc::driver::sys;
         let raw = unsafe {
-            cudarc::driver::result::malloc_host(bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP)
+            cudarc::driver::result::malloc_host(
+                bytes,
+                sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_WRITECOMBINED,
+            )
         }
             .map_err(|e| {
                 candle_core::Error::Msg(format!(
-                    "malloc_host({bytes} байт, DEVICEMAP): {e:?}"
+                    "malloc_host({bytes} байт, DEVICEMAP|WRITECOMBINED): {e:?}"
                 ))
             })?;
         if raw.is_null() {
