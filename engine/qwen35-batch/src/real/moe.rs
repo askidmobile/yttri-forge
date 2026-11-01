@@ -542,12 +542,13 @@ impl Qwen35MoeBlock {
                 let t_layer = std::time::Instant::now();
                 let k_topk = ids_t.elem_count();
                 let n_embd_host = xs.dims2()?.1;
+                let gpu_experts = moe_cpu_gpu_experts().min(k_topk.saturating_sub(1));
                 let mut stage = cpu_decode_stage(cuda_dev, k_topk, n_embd_host)?;
                 let stage = stage.as_mut().expect("CPU decode stage");
                 let ids_ptr_host = stage.ids.as_mut_ptr().map_err(candle_core::Error::wrap)?;
                 let w_ptr_host = stage.weights.as_mut_ptr().map_err(candle_core::Error::wrap)?;
                 let xs_ptr_host = stage.xs.as_mut_ptr().map_err(candle_core::Error::wrap)?;
-                let shared = {
+                let (shared, gpu_routed) = {
                     let stream = cuda_dev.cuda_stream();
                     let ids_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&ids_t)?;
                     let w_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&w_t)?;
@@ -582,10 +583,37 @@ impl Qwen35MoeBlock {
                         .record_event(None)
                         .map_err(candle_core::Error::wrap)?;
                     let shared = self.shared.forward(xs)?;
+                    let gpu_routed = if gpu_experts > 0 {
+                        let ids_gpu = ids_t.narrow(1, 0, gpu_experts)?.contiguous()?;
+                        let weights_gpu = w_t.narrow(1, 0, gpu_experts)?.contiguous()?;
+                        let store = store.lock().expect("expert layer store");
+                        let (gate_shape, down_shape) = store.shapes();
+                        let (gate, up) = indexed_moe_forward_dual_table(
+                            cuda_dev,
+                            store.gate.dtype,
+                            gate_shape,
+                            store.gate.table(),
+                            store.up.table(),
+                            &make_x3()?,
+                            &ids_gpu,
+                        )?;
+                        let act = gate.silu_mul_direct(&up)?.contiguous()?;
+                        let down = indexed_moe_forward_table(
+                            cuda_dev,
+                            store.down.dtype,
+                            down_shape,
+                            store.down.table(),
+                            &act,
+                            &ids_gpu,
+                        )?;
+                        weighted_sum(down, &weights_gpu)?
+                    } else {
+                        Tensor::zeros((1usize, 1usize, n_embd_host), DType::F32, xs.device())?
+                    };
                     copy_done
                         .synchronize()
                         .map_err(candle_core::Error::wrap)?;
-                    shared
+                    (shared, gpu_routed)
                 };
                 let d2h_elapsed = t_layer.elapsed();
                 let t_cpu = std::time::Instant::now();
@@ -600,7 +628,13 @@ impl Qwen35MoeBlock {
                 };
                 let routed_cpu = {
                     let store = store.lock().expect("expert layer store");
-                    moe_forward_cpu(&store, ids_host, w_host, xs_cpu, n_embd_host)?
+                    moe_forward_cpu(
+                        &store,
+                        &ids_host[gpu_experts..],
+                        &w_host[gpu_experts..],
+                        xs_cpu,
+                        n_embd_host,
+                    )?
                 };
                 let out_host = stage.out.as_mut_ptr().map_err(candle_core::Error::wrap)?;
                 unsafe {
@@ -636,7 +670,7 @@ impl Qwen35MoeBlock {
                         eprintln!("[moe-cpu] d2h={d:.1}us cpu={c:.1}us");
                     }
                 }
-                return Ok(routed.broadcast_add(&shared)?);
+                return Ok(routed.broadcast_add(&gpu_routed)?.broadcast_add(&shared)?);
             }
             (ExpertWeights::Store(store), ForwardMode::DecodeBatch) => {
                 let x3 = make_x3()?;
@@ -1221,6 +1255,17 @@ pub fn moe_cpu_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
+fn moe_cpu_gpu_experts() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("MOE_CPU_GPU_EXPERTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+#[cfg(feature = "cuda")]
 fn moe_cpu_timing_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MOE_CPU_TIMING").is_some())
@@ -1329,7 +1374,12 @@ mod cpu_moe {
             candle_core::bail!("quantize_activation: длина {} не кратна {QK_K}", x.len());
         }
         let mut out = vec![BlockQ8K::zeros(); x.len() / QK_K];
-        BlockQ8K::from_float(x, &mut out);
+        out.par_iter_mut().enumerate().for_each(|(i, block)| {
+            BlockQ8K::from_float(
+                &x[i * QK_K..(i + 1) * QK_K],
+                std::slice::from_mut(block),
+            );
+        });
         Ok(out)
     }
 }
@@ -1358,8 +1408,7 @@ pub fn moe_forward_cpu(
     let n_ff = g_shape.1;
     let n_experts = st.gate.n_experts;
 
-    let mut x8 = vec![BlockQ8K::zeros(); n_embd / QK_K];
-    BlockQ8K::from_float(xs_cpu, &mut x8);
+    let x8 = cpu_moe::quantize_activation(xs_cpu)?;
 
     let sel: Vec<(usize, f32)> = ids
         .iter()
@@ -1472,12 +1521,14 @@ pub fn moe_forward_cpu(
     }
     let bprow_d = n_ff / QK_K;
     // down-матрицы: Q6_K или Q4_K — приводим к enum внутри задачи.
-    let mut d8s: Vec<Vec<BlockQ8K>> = Vec::with_capacity(sel.len());
-    for a in &acts {
-        let mut a8 = vec![BlockQ8K::zeros(); bprow_d];
-        BlockQ8K::from_float(a, &mut a8);
-        d8s.push(a8);
-    }
+    let d8s: Vec<Vec<BlockQ8K>> = acts
+        .par_iter()
+        .map(|a| {
+            let mut a8 = vec![BlockQ8K::zeros(); bprow_d];
+            BlockQ8K::from_float(a, &mut a8);
+            a8
+        })
+        .collect();
     let d_blocks_q4: Vec<Option<&[BlockQ4K]>> = down_slices
         .iter()
         .map(|sl| {
