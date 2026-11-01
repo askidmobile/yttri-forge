@@ -215,6 +215,11 @@ impl HostBuf {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.bytes) }
     }
 
+    /// Полный неизменяемый срез host-памяти.
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.bytes) }
+    }
+
     /// Срез одного эксперта (для подъёма в стейджинг/кэш).
     pub fn expert_slice(&self, expert: usize, expert_bytes: usize) -> &[u8] {
         assert!(
@@ -649,16 +654,33 @@ fn copy_union_to_staging(
             buf.len()
         );
     }
-    for &e in union {
-        if e >= matrix.n_experts {
-            candle_core::bail!("union: эксперт {e} вне 0..{}", matrix.n_experts);
+    let host = matrix.host.as_slice();
+    for (first, end) in adjacent_runs(union) {
+        if first >= matrix.n_experts {
+            candle_core::bail!("union: эксперт {first} вне 0..{}", matrix.n_experts);
         }
-        let src = matrix.host.expert_slice(e, matrix.expert_bytes);
-        let start = e * matrix.expert_bytes;
-        let mut dst = buf.slice_mut(start..start + matrix.expert_bytes);
-        dev.memcpy_htod(src, &mut dst)?;
+        let lo = first * matrix.expert_bytes;
+        let hi = end * matrix.expert_bytes;
+        let mut dst = buf.slice_mut(lo..hi);
+        dev.memcpy_htod(&host[lo..hi], &mut dst)?;
     }
     Ok(())
+}
+
+fn adjacent_runs(ids: &[usize]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < ids.len() {
+        let first = ids[i];
+        let mut end = first + 1;
+        while i + 1 < ids.len() && ids[i + 1] == end {
+            end += 1;
+            i += 1;
+        }
+        runs.push((first, end));
+        i += 1;
+    }
+    runs
 }
 
 // ─── Рантайм модели (одно на модель) ─────────────────────────────────────────
@@ -1241,6 +1263,9 @@ impl CacheSystem {
                     to_staging.push(e);
                 }
             }
+            // Стейджинг размечен по id эксперта: сортировка не меняет адреса,
+            // но позволяет скопировать соседние диапазоны одним H2D.
+            to_staging.sort_unstable();
             // Статистика окна: объём подъёмов в слоты.
             let mib = (slot_assign.len() as u64
                 * (gate_bytes + up_bytes + down_bytes) as u64)
@@ -1285,22 +1310,20 @@ impl CacheSystem {
             // см. staging_table_entries), поэтому копия обязана лечь по e·bytes.
             // Копия по смещению 0 для всех e давала ядрам незаписанную память —
             // мусор в KV с первого чанка и петля «每天都有分享» на любой длине.
-            for &e in &to_staging {
-                main.memcpy_htod(
-                    st.gate.expert_host_slice(e),
-                    &mut sg.slice_mut(e * gate_bytes..(e + 1) * gate_bytes),
-                )
-                .map_err(candle_core::Error::wrap)?;
-                main.memcpy_htod(
-                    st.up.expert_host_slice(e),
-                    &mut su.slice_mut(e * up_bytes..(e + 1) * up_bytes),
-                )
-                .map_err(candle_core::Error::wrap)?;
-                main.memcpy_htod(
-                    st.down.expert_host_slice(e),
-                    &mut sd.slice_mut(e * down_bytes..(e + 1) * down_bytes),
-                )
-                .map_err(candle_core::Error::wrap)?;
+            for (first, end) in adjacent_runs(&to_staging) {
+                for (matrix, buf, bytes) in [
+                    (&st.gate, &mut sg, gate_bytes),
+                    (&st.up, &mut su, up_bytes),
+                    (&st.down, &mut sd, down_bytes),
+                ] {
+                    let lo = first * bytes;
+                    let hi = end * bytes;
+                    main.memcpy_htod(
+                        &matrix.host.as_slice()[lo..hi],
+                        &mut buf.slice_mut(lo..hi),
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+                }
             }
             drop(sg);
             drop(su);
@@ -1387,22 +1410,14 @@ impl CacheSystem {
         staging_experts: &[usize],
     ) -> Result<()> {
         let mut st = store.lock().expect("expert store");
-        for &e in staging_experts {
-            let g = st.gate.host_entry(e);
-            {
-                let mut tg = st.gate.table_mut();
-                dev.memcpy_htod(&[g], &mut tg.slice_mut(e..e + 1))?;
-            }
-            let u = st.up.host_entry(e);
-            {
-                let mut tu = st.up.table_mut();
-                dev.memcpy_htod(&[u], &mut tu.slice_mut(e..e + 1))?;
-            }
-            let d = st.down.host_entry(e);
-            {
-                let mut td = st.down.table_mut();
-                dev.memcpy_htod(&[d], &mut td.slice_mut(e..e + 1))?;
-            }
+        let n = st.gate.n_experts;
+        let g = host_table_entries(st.gate.host_entry(0), n, st.gate.expert_bytes);
+        let u = host_table_entries(st.up.host_entry(0), n, st.up.expert_bytes);
+        let d = host_table_entries(st.down.host_entry(0), n, st.down.expert_bytes);
+        for (first, end) in adjacent_runs(staging_experts) {
+            dev.memcpy_htod(&g[first..end], &mut st.gate.table_mut().slice_mut(first..end))?;
+            dev.memcpy_htod(&u[first..end], &mut st.up.table_mut().slice_mut(first..end))?;
+            dev.memcpy_htod(&d[first..end], &mut st.down.table_mut().slice_mut(first..end))?;
         }
         Ok(())
     }
@@ -1458,3 +1473,18 @@ pub struct MoeRuntimeSummary {
 /// Таблицы слоя меняются на префиле (подготовка → ядра → возврат), декод
 /// читает их по &self — Mutex достаточен (форварды одно-поточны).
 pub type SharedLayerStore = Arc<std::sync::Mutex<ExpertLayerStore>>;
+
+#[cfg(test)]
+mod adjacent_runs_tests {
+    use super::adjacent_runs;
+
+    #[test]
+    fn merges_only_adjacent_ids() {
+        assert_eq!(adjacent_runs(&[]), vec![]);
+        assert_eq!(adjacent_runs(&[7]), vec![(7, 8)]);
+        assert_eq!(
+            adjacent_runs(&[0, 1, 2, 4, 5, 9]),
+            vec![(0, 3), (4, 6), (9, 10)]
+        );
+    }
+}
