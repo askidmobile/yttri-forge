@@ -130,6 +130,17 @@ Warm-freeze cache также проверен: динамический прог
 во время capture; без graph короткий decode составил `18.86 t/s` и оказался
 хуже no-cache варианта. Cache закрыт.
 
+Native packed Q4_Kx8 также проверен отдельно: parity с raw Q4_K зелёный,
+микробенч GEMV `1.33×`, но E2E на `4/4` составил `21.68 t/s`, на `3/5` —
+`19.43` против `22.01` без packed. Дополнительные 18.6 GiB RAM не окупились.
+Раскладка удалена.
+
+Существующий Q8 KV path несовместим с текущим Turing runtime: профиль
+остаётся F16 даже при `KV_POOL_Q8=1`, а `YTTRI_LEGACY_PAGED_DECODE=1`
+падает на защите `FlashAttention called from a cuda-turing build`.
+Полноценная поддержка Q8 требует отдельного MMA load/dequant kernel и
+пока не считается измеренным вариантом.
+
 ## Отклонено в ходе интеграции
 
 - Dynamic expert cache 2 GiB с отдельным copy stream: hit 64–71%, но decode
