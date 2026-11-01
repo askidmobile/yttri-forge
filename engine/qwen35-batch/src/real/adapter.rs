@@ -3451,9 +3451,9 @@ impl Qwen35BatchAdapter {
         if !self.graphs_enabled {
             return Ok(None);
         }
-        // CPU-MoE does host work and stream synchronization inside each layer;
-        // prefill still uses paged graphs, but decode must run eager.
-        if crate::real::moe::moe_cpu_enabled() {
+        // CPU-MoE синхронизирует host внутри каждого слоя: paged-путь сохраняем,
+        // но capture ниже пропускаем. Для нескольких слотов остаётся dense fallback.
+        if b > 1 && crate::real::moe::moe_cpu_enabled() {
             return Ok(None);
         }
         // Батч больше гейта уходит на eager: многослотовый граф-путь не готов.
@@ -3626,6 +3626,11 @@ impl Qwen35BatchAdapter {
                 return Err(anyhow!("graphed logits length mismatch"));
             }
             let out = rows_from_flat(&flat, vocab, greedy);
+            // CPU-MoE нельзя захватить, но paged forward уже посчитал шаг.
+            // Оставляем paged KV авторитетным и не делаем rehydrate.
+            if crate::real::moe::moe_cpu_enabled() {
+                return Ok(Some(out));
+            }
             let mut tokens_out = unsafe { cuda_dev.alloc::<u32>(b)? };
             launch_decode_argmax(&logits, &mut tokens_out, b, self.vocab)?;
             // Пул полон — не захватываем (вытеснение роняло следующий шаг).
