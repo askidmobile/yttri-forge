@@ -1247,32 +1247,109 @@ pub fn moe_forward_cpu(
 
     let _ = (gate_bytes, up_bytes);
 
-    let acts: Vec<Vec<f32>> = (0..sel.len())
-        .into_par_iter()
-        .map(|j| -> Result<Vec<f32>> {
-            let g = cpu_gemv(gate_slices[j], g_dtype, &x8, n_ff, n_embd)?;
-            let u = cpu_gemv(up_slices[j], u_dtype, &x8, n_ff, n_embd)?;
-            Ok(g.iter()
+    // Один плоский parallel по (эксперт × строка): без вложенного rayon.
+    let n_jobs = sel.len() * n_ff;
+    let mut gate_all = vec![0f32; n_jobs];
+    let mut up_all = vec![0f32; n_jobs];
+    let bprow_g = n_embd / QK_K;
+    let bprow_u = n_embd / QK_K;
+    if g_dtype != GgmlDType::Q4K || u_dtype != GgmlDType::Q4K {
+        candle_core::bail!("cpu moe: ожидался Q4K для gate/up, got {g_dtype:?}/{u_dtype:?}");
+    }
+    let g_blocks: Vec<&[BlockQ4K]> = gate_slices
+        .iter()
+        .map(|sl| unsafe {
+            std::slice::from_raw_parts(sl.as_ptr() as *const BlockQ4K, n_ff * bprow_g)
+        })
+        .collect();
+    let u_blocks: Vec<&[BlockQ4K]> = up_slices
+        .iter()
+        .map(|sl| unsafe {
+            std::slice::from_raw_parts(sl.as_ptr() as *const BlockQ4K, n_ff * bprow_u)
+        })
+        .collect();
+    gate_all
+        .par_chunks_mut(n_ff)
+        .zip(up_all.par_chunks_mut(n_ff))
+        .enumerate()
+        .for_each(|(j, (grow, urow))| {
+            let gb = g_blocks[j];
+            let ub = u_blocks[j];
+            for r in 0..n_ff {
+                let gs = &gb[r * bprow_g..(r + 1) * bprow_g];
+                let us = &ub[r * bprow_u..(r + 1) * bprow_u];
+                grow[r] = BlockQ4K::vec_dot(n_embd, gs, &x8);
+                urow[r] = BlockQ4K::vec_dot(n_embd, us, &x8);
+            }
+        });
+    let _ = n_jobs;
+    let acts: Vec<Vec<f32>> = gate_all
+        .chunks(n_ff)
+        .zip(up_all.chunks(n_ff))
+        .map(|(g, u)| {
+            g.iter()
                 .zip(u.iter())
                 .map(|(&gv, &uv)| (gv / (1.0 + (-gv).exp())) * uv)
-                .collect())
+                .collect()
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
 
     // Проход 2: down для всех выбранных экспертов + взвешенная сумма.
     let down_slices: Vec<&[u8]> = sel.iter().map(|(e, _)| st.down.expert_host_slice(*e)).collect();
     let d_dtype = st.down.dtype;
     let _ = down_bytes;
 
-    let partials: Vec<(f32, Vec<f32>)> = (0..sel.len())
-        .into_par_iter()
-        .map(|j| -> Result<(f32, Vec<f32>)> {
-            let mut a8 = vec![BlockQ8K::zeros(); n_ff / QK_K];
-            BlockQ8K::from_float(&acts[j], &mut a8);
-            let d = cpu_gemv(down_slices[j], d_dtype, &a8, n_embd, n_ff)?;
-            Ok((sel[j].1, d))
+    let mut down_all = vec![0f32; sel.len() * n_embd];
+    if d_dtype != GgmlDType::Q4K && d_dtype != GgmlDType::Q6K {
+        candle_core::bail!("cpu moe: down dtype {d_dtype:?} не поддержан");
+    }
+    let bprow_d = n_ff / QK_K;
+    // down-матрицы: Q6_K или Q4_K — приводим к enum внутри задачи.
+    let mut d8s: Vec<Vec<BlockQ8K>> = Vec::with_capacity(sel.len());
+    for a in &acts {
+        let mut a8 = vec![BlockQ8K::zeros(); bprow_d];
+        BlockQ8K::from_float(a, &mut a8);
+        d8s.push(a8);
+    }
+    let d_blocks_q4: Vec<Option<&[BlockQ4K]>> = down_slices
+        .iter()
+        .map(|sl| {
+            (d_dtype == GgmlDType::Q4K).then(|| unsafe {
+                std::slice::from_raw_parts(sl.as_ptr() as *const BlockQ4K, n_embd * bprow_d)
+            })
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
+    let d_blocks_q6: Vec<Option<&[BlockQ6K]>> = down_slices
+        .iter()
+        .map(|sl| {
+            (d_dtype == GgmlDType::Q6K).then(|| unsafe {
+                std::slice::from_raw_parts(sl.as_ptr() as *const BlockQ6K, n_embd * bprow_d)
+            })
+        })
+        .collect();
+    down_all
+        .par_chunks_mut(n_embd)
+        .enumerate()
+        .for_each(|(j, row)| {
+            let a8 = &d8s[j];
+            for r in 0..n_embd {
+                row[r] = if let Some(dq4) = d_blocks_q4[j] {
+                    let sl = &dq4[r * bprow_d..(r + 1) * bprow_d];
+                    BlockQ4K::vec_dot(n_ff, sl, a8)
+                } else if let Some(dq6) = d_blocks_q6[j] {
+                    let sl = &dq6[r * bprow_d..(r + 1) * bprow_d];
+                    BlockQ6K::vec_dot(n_ff, sl, a8)
+                } else {
+                    0.0
+                };
+            }
+        });
+    let partials: Vec<(f32, Vec<f32>)> = sel
+        .iter()
+        .map(|(_, w)| *w)
+        .zip(down_all.chunks(n_embd))
+        .map(|(w, d)| (w, d.to_vec()))
+        .collect();
 
     let mut acc = vec![0f32; n_embd];
     for (w, d) in partials {
@@ -1294,7 +1371,6 @@ pub fn cpu_gemv(
 ) -> Result<Vec<f32>> {
     use candle_core::quantized::k_quants::{BlockQ4K, BlockQ6K, QK_K};
     use candle_core::quantized::{GgmlDType, GgmlType};
-    use rayon::prelude::*;
 
     let blocks_per_row = k / QK_K;
     match dtype {
@@ -1307,7 +1383,6 @@ pub fn cpu_gemv(
             let wb: &[BlockQ4K] =
                 unsafe { std::slice::from_raw_parts(w.as_ptr() as *const BlockQ4K, need) };
             Ok((0..n_rows)
-                .into_par_iter()
                 .map(|r| BlockQ4K::vec_dot(k, &wb[r * blocks_per_row..(r + 1) * blocks_per_row], x8))
                 .collect())
         }
@@ -1320,7 +1395,6 @@ pub fn cpu_gemv(
             let wb: &[BlockQ6K] =
                 unsafe { std::slice::from_raw_parts(w.as_ptr() as *const BlockQ6K, need) };
             Ok((0..n_rows)
-                .into_par_iter()
                 .map(|r| BlockQ6K::vec_dot(k, &wb[r * blocks_per_row..(r + 1) * blocks_per_row], x8))
                 .collect())
         }
