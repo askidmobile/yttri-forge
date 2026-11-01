@@ -538,6 +538,8 @@ impl Qwen35MoeBlock {
                 // было ТРИ блокирующих D2H на слой (ids, веса маршрута, xs) —
                 // 120 синхронизаций на токен. Ставим все копирования в один
                 // поток и ждём ОДНО событие, затем читаем host-буферы.
+                let timing = moe_cpu_timing_enabled();
+                let t_layer = std::time::Instant::now();
                 let k_topk = ids_t.elem_count();
                 let n_embd_host = xs.dims2()?.1;
                 let mut ids_buf = vec![0u32; k_topk];
@@ -583,6 +585,8 @@ impl Qwen35MoeBlock {
                         .map_err(candle_core::Error::wrap)?;
                     shared
                 };
+                let d2h_elapsed = t_layer.elapsed();
+                let t_cpu = std::time::Instant::now();
                 let ids_host = ids_buf;
                 let w_host = w_buf;
                 let xs_cpu = xs_buf;
@@ -596,6 +600,22 @@ impl Qwen35MoeBlock {
                     &Device::Cpu,
                 )?
                 .to_device(xs.device())?;
+                if timing {
+                    let cpu_elapsed = t_cpu.elapsed();
+                    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static D2H: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static CPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let d2h_us = d2h_elapsed.as_micros() as u64;
+                    let cpu_us = cpu_elapsed.as_micros() as u64;
+                    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    D2H.fetch_add(d2h_us, std::sync::atomic::Ordering::Relaxed);
+                    CPU.fetch_add(cpu_us, std::sync::atomic::Ordering::Relaxed);
+                    if n % 41 == 0 {
+                        let d = D2H.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 41.0;
+                        let c = CPU.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 41.0;
+                        eprintln!("[moe-cpu] d2h={d:.1}us cpu={c:.1}us");
+                    }
+                }
                 return Ok(routed.broadcast_add(&shared)?);
             }
             (ExpertWeights::Store(store), ForwardMode::DecodeBatch) => {
@@ -1178,6 +1198,12 @@ mod cuda_router_tests {
 pub fn moe_cpu_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("MOE_CPU").as_deref() == Ok("1"))
+}
+
+#[cfg(feature = "cuda")]
+fn moe_cpu_timing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MOE_CPU_TIMING").is_some())
 }
 
 #[cfg(feature = "cuda")]
