@@ -524,6 +524,94 @@ pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32
     }
 }
 
+/// GEMV сразу для 8 строк Q4_K при ОДНОЙ загрузке активации Q8_K.
+///
+/// Ключевая разница с `vec_dot_q4k_q8k` по строкам: блок активации `y`
+/// читается и распаковывается один раз, а не восемь. llama.cpp получает тот
+/// же эффект через repack в `block_q4_Kx8`; здесь переупаковка не нужна —
+/// 8 обычных блоков обрабатываются в одном проходе.
+///
+/// `xs` — 8 подряд идущих строк весов по `n/QK_K` блоков Q4_K каждая.
+/// Возвращает 8 скалярных произведений.
+#[inline(always)]
+pub fn vec_dot_q4k_q8k_x8(
+    n: usize,
+    xs: &[BlockQ4K],
+    ys: &[BlockQ8K],
+    out: &mut [f32; 8],
+) {
+    debug_assert!(n.is_multiple_of(QK_K));
+    debug_assert!(xs.len() >= 8 * (n / QK_K));
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+    let nb = n / QK_K;
+    unsafe {
+        let m4 = _mm256_set1_epi8(0xF);
+        let mut acc = [_mm256_setzero_ps(); 8];
+        let mut acc_m = [_mm_setzero_ps(); 8];
+        for l in 0..nb {
+            let y = &ys[l];
+            // Общая часть: активация и её сумма по группам.
+            let q8sums = _mm256_loadu_si256(y.bsums.as_ptr() as *const __m256i);
+            let q8s = _mm_hadd_epi16(
+                _mm256_extracti128_si256(q8sums, 0),
+                _mm256_extracti128_si256(q8sums, 1),
+            );
+            for r in 0..8 {
+                let x = &xs[r * nb + l];
+                let d = y.d * x.d.to_f32();
+                let dmin = -y.d * x.dmin.to_f32();
+                let mut utmp = [0u32; 4];
+                LittleEndian::read_u32_into(&x.scales, &mut utmp[0..3]);
+                utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+                let uaux = utmp[1] & KMASK1;
+                utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+                utmp[2] = uaux;
+                utmp[0] &= KMASK1;
+                let mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(
+                    utmp[3] as i32,
+                    utmp[2] as i32,
+                    utmp[1] as i32,
+                    utmp[0] as i32,
+                ));
+                let prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+                acc_m[r] = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m[r]);
+                let sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+                let scales = mm256_set_m128i(sc128, sc128);
+                let mut sumi = _mm256_setzero_si256();
+                let mut q4 = x.qs.as_ptr();
+                let mut q8 = y.qs.as_ptr();
+                for j in 0..QK_K / 64 {
+                    let scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j));
+                    let scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 1));
+                    let q4bits = _mm256_loadu_si256(q4 as *const __m256i);
+                    q4 = q4.add(32);
+                    let q4l = _mm256_and_si256(q4bits, m4);
+                    let q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+                    let q8l = _mm256_loadu_si256(q8 as *const __m256i);
+                    q8 = q8.add(32);
+                    let p16l = _mm256_madd_epi16(
+                        scale_l, _mm256_maddubs_epi16(q4l, q8l));
+                    sumi = _mm256_add_epi32(sumi, p16l);
+                    let q8h = _mm256_loadu_si256(q8 as *const __m256i);
+                    q8 = q8.add(32);
+                    let p16h = _mm256_madd_epi16(
+                        scale_h, _mm256_maddubs_epi16(q4h, q8h));
+                    sumi = _mm256_add_epi32(sumi, p16h);
+                }
+                acc[r] = _mm256_fmadd_ps(
+                    _mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc[r]);
+            }
+        }
+        for r in 0..8 {
+            let m = _mm_add_ps(acc_m[r], _mm_movehl_ps(acc_m[r], acc_m[r]));
+            let m = _mm_add_ss(m, _mm_movehdup_ps(m));
+            out[r] = hsum_float_8(acc[r]) + _mm_cvtss_f32(m);
+        }
+    }
+}
+
 #[inline(always)]
 pub(crate) fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
     debug_assert!(

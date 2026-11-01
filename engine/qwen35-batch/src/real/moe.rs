@@ -1272,23 +1272,36 @@ pub fn moe_forward_cpu(
     // 8 параллельных задач, то есть 5–6 занятых ядер из 18. Строк 8×512=4096
     // — rayon загружает все потоки.
     let rows_per_task = 32usize;
+    // По 8 строк за раз: активация Q8_K загружается и распаковывается один
+    // раз на 8 строк вместо восьми (то, что llama.cpp получает через repack
+    // в block_q4_Kx8). 8·bprow блоков подряд — это 8 последовательных строк.
+    let rows8 = 8usize;
     gate_all
-        .par_chunks_mut(rows_per_task)
-        .zip(up_all.par_chunks_mut(rows_per_task))
+        .par_chunks_mut(rows8)
+        .zip(up_all.par_chunks_mut(rows8))
         .enumerate()
-        .for_each(|(t, (grow, urow))| {
-            let base = t * rows_per_task;
-            for off in 0..grow.len() {
-                let idx = base + off;
-                let j = idx / n_ff;
-                let r = idx % n_ff;
-                let gb = g_blocks[j];
-                let ub = u_blocks[j];
-                let gs = &gb[r * bprow_g..(r + 1) * bprow_g];
-                let us = &ub[r * bprow_u..(r + 1) * bprow_u];
-                grow[off] = BlockQ4K::vec_dot(n_embd, gs, &x8);
-                urow[off] = BlockQ4K::vec_dot(n_embd, us, &x8);
+        .for_each(|(t, (g8, u8))| {
+            let base = t * rows8;
+            let j = base / n_ff;
+            let r = base % n_ff;
+            let n = g8.len();
+            let mut acc_g = [0f32; 8];
+            let mut acc_u = [0f32; 8];
+            let gs = &g_blocks[j][r * bprow_g..(r + n) * bprow_g];
+            let us = &u_blocks[j][r * bprow_u..(r + n) * bprow_u];
+            if n == 8 {
+                candle_core::quantized::avx::vec_dot_q4k_q8k_x8(n_embd, gs, &x8, &mut acc_g);
+                candle_core::quantized::avx::vec_dot_q4k_q8k_x8(n_embd, us, &x8, &mut acc_u);
+            } else {
+                for off in 0..n {
+                    acc_g[off] = BlockQ4K::vec_dot(
+                        n_embd, &gs[off * bprow_g..(off + 1) * bprow_g], &x8);
+                    acc_u[off] = BlockQ4K::vec_dot(
+                        n_embd, &us[off * bprow_u..(off + 1) * bprow_u], &x8);
+                }
             }
+            g8.copy_from_slice(&acc_g[..n]);
+            u8.copy_from_slice(&acc_u[..n]);
         });
     let _ = n_jobs;
     let acts: Vec<Vec<f32>> = gate_all
