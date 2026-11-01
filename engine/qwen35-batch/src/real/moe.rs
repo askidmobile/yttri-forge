@@ -542,9 +542,11 @@ impl Qwen35MoeBlock {
                 let t_layer = std::time::Instant::now();
                 let k_topk = ids_t.elem_count();
                 let n_embd_host = xs.dims2()?.1;
-                let mut ids_buf = vec![0u32; k_topk];
-                let mut w_buf = vec![0f32; w_t.elem_count()];
-                let mut xs_buf = vec![0f32; n_embd_host];
+                let mut stage = cpu_decode_stage(cuda_dev, k_topk, n_embd_host)?;
+                let stage = stage.as_mut().expect("CPU decode stage");
+                let ids_ptr_host = stage.ids.as_mut_ptr().map_err(candle_core::Error::wrap)?;
+                let w_ptr_host = stage.weights.as_mut_ptr().map_err(candle_core::Error::wrap)?;
+                let xs_ptr_host = stage.xs.as_mut_ptr().map_err(candle_core::Error::wrap)?;
                 let shared = {
                     let stream = cuda_dev.cuda_stream();
                     let ids_ptr = crate::real::paged_kv_cuda::tensor_cuda_ptr(&ids_t)?;
@@ -555,21 +557,21 @@ impl Qwen35MoeBlock {
                     let xs_ptr = xs_ptr as cudarc::driver::sys::CUdeviceptr;
                     unsafe {
                         cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                            ids_buf.as_mut_ptr() as *mut _,
+                            ids_ptr_host as *mut _,
                             ids_ptr,
-                            ids_buf.len() * std::mem::size_of::<u32>(),
+                            k_topk * std::mem::size_of::<u32>(),
                             stream.cu_stream(),
                         );
                         cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                            w_buf.as_mut_ptr() as *mut _,
+                            w_ptr_host as *mut _,
                             w_ptr,
-                            w_buf.len() * std::mem::size_of::<f32>(),
+                            k_topk * std::mem::size_of::<f32>(),
                             stream.cu_stream(),
                         );
                         cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                            xs_buf.as_mut_ptr() as *mut _,
+                            xs_ptr_host as *mut _,
                             xs_ptr,
-                            xs_buf.len() * std::mem::size_of::<f32>(),
+                            n_embd_host * std::mem::size_of::<f32>(),
                             stream.cu_stream(),
                         );
                     }
@@ -587,19 +589,37 @@ impl Qwen35MoeBlock {
                 };
                 let d2h_elapsed = t_layer.elapsed();
                 let t_cpu = std::time::Instant::now();
-                let ids_host = ids_buf;
-                let w_host = w_buf;
-                let xs_cpu = xs_buf;
+                let ids_host = unsafe {
+                    std::slice::from_raw_parts(stage.ids.as_ptr().map_err(candle_core::Error::wrap)?, k_topk)
+                };
+                let w_host = unsafe {
+                    std::slice::from_raw_parts(stage.weights.as_ptr().map_err(candle_core::Error::wrap)?, k_topk)
+                };
+                let xs_cpu = unsafe {
+                    std::slice::from_raw_parts(stage.xs.as_ptr().map_err(candle_core::Error::wrap)?, n_embd_host)
+                };
                 let routed_cpu = {
                     let store = store.lock().expect("expert layer store");
-                    moe_forward_cpu(&store, &ids_host, &w_host, &xs_cpu, xs.dims2()?.1)?
+                    moe_forward_cpu(&store, ids_host, w_host, xs_cpu, n_embd_host)?
                 };
-                let routed = Tensor::from_vec(
-                    routed_cpu,
-                    (1usize, 1usize, xs.dims2()?.1),
-                    &Device::Cpu,
-                )?
-                .to_device(xs.device())?;
+                let out_host = stage.out.as_mut_ptr().map_err(candle_core::Error::wrap)?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(routed_cpu.as_ptr(), out_host, n_embd_host);
+                }
+                let routed = Tensor::zeros((1usize, 1usize, n_embd_host), DType::F32, xs.device())?;
+                let dst = crate::real::paged_kv_cuda::tensor_cuda_ptr(&routed)?;
+                let out_src = stage.out.as_ptr().map_err(candle_core::Error::wrap)?;
+                let rc = unsafe {
+                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        dst,
+                        out_src as *const _,
+                        n_embd_host * std::mem::size_of::<f32>(),
+                        cuda_dev.cuda_stream().cu_stream(),
+                    )
+                };
+                if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    candle_core::bail!("CPU-MoE H2D: {rc:?}");
+                }
                 if timing {
                     let cpu_elapsed = t_cpu.elapsed();
                     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1204,6 +1224,46 @@ pub fn moe_cpu_enabled() -> bool {
 fn moe_cpu_timing_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MOE_CPU_TIMING").is_some())
+}
+
+#[cfg(feature = "cuda")]
+struct CpuDecodeStage {
+    ids: cudarc::driver::PinnedHostSlice<u32>,
+    weights: cudarc::driver::PinnedHostSlice<f32>,
+    xs: cudarc::driver::PinnedHostSlice<f32>,
+    out: cudarc::driver::PinnedHostSlice<f32>,
+}
+
+#[cfg(feature = "cuda")]
+static CPU_DECODE_STAGE: std::sync::OnceLock<
+    std::sync::Mutex<Option<CpuDecodeStage>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "cuda")]
+fn cpu_decode_stage(
+    dev: &candle_core::CudaDevice,
+    k: usize,
+    n_embd: usize,
+) -> Result<std::sync::MutexGuard<'static, Option<CpuDecodeStage>>> {
+    let slot = CPU_DECODE_STAGE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut stage = slot.lock().expect("CPU decode stage");
+    let replace = stage
+        .as_ref()
+        .map(|s| s.ids.len() != k || s.xs.len() != n_embd)
+        .unwrap_or(true);
+    if replace {
+        let ctx = dev.cuda_stream().context().clone();
+        *stage = Some(CpuDecodeStage {
+            ids: unsafe { ctx.alloc_pinned::<u32>(k) }.map_err(candle_core::Error::wrap)?,
+            weights: unsafe { ctx.alloc_pinned::<f32>(k) }
+                .map_err(candle_core::Error::wrap)?,
+            xs: unsafe { ctx.alloc_pinned::<f32>(n_embd) }
+                .map_err(candle_core::Error::wrap)?,
+            out: unsafe { ctx.alloc_pinned::<f32>(n_embd) }
+                .map_err(candle_core::Error::wrap)?,
+        });
+    }
+    Ok(stage)
 }
 
 #[cfg(feature = "cuda")]
