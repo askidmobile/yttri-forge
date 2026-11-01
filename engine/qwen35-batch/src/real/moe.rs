@@ -1198,8 +1198,13 @@ mod cpu_moe {
     }
 }
 
-/// Полный CPU-проход MoE для одного слота: 8 экспертов × (gate,up,down),
-/// затем взвешенная сумма. `xs_cpu` — [n_embd] f32.
+/// Полный CPU-проход MoE для одного слота, батчированный по экспертам.
+///
+/// Раньше на слой приходилось 24 rayon-вызова (8 экспертов × 3 матрицы), то
+/// есть 960 fork/join на токен — накладные расходы съедали всё. Здесь два
+/// rayon-прохода на слой: (1) gate+up для всех экспертов сразу, (2) down для
+/// всех экспертов сразу. Замер масштабирования: 1 поток 1.81 т/с, 18 потоков
+/// 7.87 т/с, 72 (HT) 3.37 т/с — HT только вредит.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn moe_forward_cpu(
@@ -1209,36 +1214,116 @@ pub fn moe_forward_cpu(
     xs_cpu: &[f32],
     n_embd: usize,
 ) -> Result<Vec<f32>> {
+    use candle_core::quantized::k_quants::{BlockQ4K, BlockQ6K, BlockQ8K, QK_K};
+    use candle_core::quantized::{GgmlDType, GgmlType};
+    use rayon::prelude::*;
+
     let (g_shape, _d_shape) = st.shapes();
-    // g_shape = (n_experts, n_ff, n_embd); d_shape = (n_experts, n_embd, n_ff).
     let n_ff = g_shape.1;
-    if g_shape.2 != n_embd {
-        candle_core::bail!(
-            "moe_forward_cpu: n_embd {} != gate.k {}",
-            n_embd,
-            g_shape.2
-        );
+    let n_experts = st.gate.n_experts;
+
+    let mut x8 = vec![BlockQ8K::zeros(); n_embd / QK_K];
+    BlockQ8K::from_float(xs_cpu, &mut x8);
+
+    let sel: Vec<(usize, f32)> = ids
+        .iter()
+        .zip(weights.iter())
+        .map(|(&e, &w)| (e as usize, w))
+        .filter(|(e, _)| *e < n_experts)
+        .collect();
+    if sel.is_empty() {
+        return Ok(vec![0f32; n_embd]);
     }
-    let x8 = cpu_moe::quantize_activation(xs_cpu)?;
+
+    // Проход 1: gate+up для всех выбранных экспертов одним parallel_iter.
+    let gate_bytes = st.gate.expert_bytes;
+    let up_bytes = st.up.expert_bytes;
+    let down_bytes = st.down.expert_bytes;
+    let g_dtype = st.gate.dtype;
+    let u_dtype = st.up.dtype;
+
+    let gate_slices: Vec<&[u8]> = sel.iter().map(|(e, _)| st.gate.expert_host_slice(*e)).collect();
+    let up_slices: Vec<&[u8]> = sel.iter().map(|(e, _)| st.up.expert_host_slice(*e)).collect();
+
+    let _ = (gate_bytes, up_bytes);
+
+    let acts: Vec<Vec<f32>> = (0..sel.len())
+        .into_par_iter()
+        .map(|j| -> Result<Vec<f32>> {
+            let g = cpu_gemv(gate_slices[j], g_dtype, &x8, n_ff, n_embd)?;
+            let u = cpu_gemv(up_slices[j], u_dtype, &x8, n_ff, n_embd)?;
+            Ok(g.iter()
+                .zip(u.iter())
+                .map(|(&gv, &uv)| (gv / (1.0 + (-gv).exp())) * uv)
+                .collect())
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Проход 2: down для всех выбранных экспертов + взвешенная сумма.
+    let down_slices: Vec<&[u8]> = sel.iter().map(|(e, _)| st.down.expert_host_slice(*e)).collect();
+    let d_dtype = st.down.dtype;
+    let _ = down_bytes;
+
+    let partials: Vec<(f32, Vec<f32>)> = (0..sel.len())
+        .into_par_iter()
+        .map(|j| -> Result<(f32, Vec<f32>)> {
+            let mut a8 = vec![BlockQ8K::zeros(); n_ff / QK_K];
+            BlockQ8K::from_float(&acts[j], &mut a8);
+            let d = cpu_gemv(down_slices[j], d_dtype, &a8, n_embd, n_ff)?;
+            Ok((sel[j].1, d))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let mut acc = vec![0f32; n_embd];
-    for (&e, &w) in ids.iter().zip(weights.iter()) {
-        let e = e as usize;
-        if e >= st.gate.n_experts {
-            continue;
-        }
-        let gate = cpu_moe::gemv(
-            st.gate.expert_host_slice(e), st.gate.dtype, &x8, n_ff, n_embd)?;
-        let up = cpu_moe::gemv(
-            st.up.expert_host_slice(e), st.up.dtype, &x8, n_ff, n_embd)?;
-        let act: Vec<f32> = gate.iter().zip(up.iter())
-            .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
-            .collect();
-        let act8 = cpu_moe::quantize_activation(&act)?;
-        let out = cpu_moe::gemv(
-            st.down.expert_host_slice(e), st.down.dtype, &act8, n_embd, n_ff)?;
-        for (a, v) in acc.iter_mut().zip(out.iter()) {
+    for (w, d) in partials {
+        for (a, v) in acc.iter_mut().zip(d.iter()) {
             *a += w * v;
         }
     }
     Ok(acc)
+}
+
+/// GEMV по сырым байтам Q4_K / Q6_K. Строки идут параллельно.
+#[cfg(feature = "cuda")]
+pub fn cpu_gemv(
+    w: &[u8],
+    dtype: candle_core::quantized::GgmlDType,
+    x8: &[candle_core::quantized::k_quants::BlockQ8K],
+    n_rows: usize,
+    k: usize,
+) -> Result<Vec<f32>> {
+    use candle_core::quantized::k_quants::{BlockQ4K, BlockQ6K, QK_K};
+    use candle_core::quantized::{GgmlDType, GgmlType};
+    use rayon::prelude::*;
+
+    let blocks_per_row = k / QK_K;
+    match dtype {
+        GgmlDType::Q4K => {
+            let need = n_rows * blocks_per_row;
+            let bs = std::mem::size_of::<BlockQ4K>();
+            if w.len() < need * bs {
+                candle_core::bail!("cpu_gemv q4k: {} байт мало для {n_rows}×{k}", w.len());
+            }
+            let wb: &[BlockQ4K] =
+                unsafe { std::slice::from_raw_parts(w.as_ptr() as *const BlockQ4K, need) };
+            Ok((0..n_rows)
+                .into_par_iter()
+                .map(|r| BlockQ4K::vec_dot(k, &wb[r * blocks_per_row..(r + 1) * blocks_per_row], x8))
+                .collect())
+        }
+        GgmlDType::Q6K => {
+            let need = n_rows * blocks_per_row;
+            let bs = std::mem::size_of::<BlockQ6K>();
+            if w.len() < need * bs {
+                candle_core::bail!("cpu_gemv q6k: {} байт мало для {n_rows}×{k}", w.len());
+            }
+            let wb: &[BlockQ6K] =
+                unsafe { std::slice::from_raw_parts(w.as_ptr() as *const BlockQ6K, need) };
+            Ok((0..n_rows)
+                .into_par_iter()
+                .map(|r| BlockQ6K::vec_dot(k, &wb[r * blocks_per_row..(r + 1) * blocks_per_row], x8))
+                .collect())
+        }
+        other => candle_core::bail!("cpu_gemv: dtype {other:?} не поддержан"),
+    }
 }
