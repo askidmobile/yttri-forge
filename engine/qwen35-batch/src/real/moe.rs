@@ -387,6 +387,59 @@ pub struct Qwen35MoeBlock {
     /// Общий рантайм MoE модели (след + стейджинг) — только при выгрузке.
     #[cfg(feature = "cuda")]
     runtime: Option<Arc<MoeRuntime>>,
+    /// Capture только чистого GPU-подграфа shared + routed experts. CPU-MoE
+    /// остаётся снаружи и перекрывается с replay.
+    #[cfg(feature = "cuda")]
+    gpu_graph: std::sync::Mutex<Option<MoeGpuGraphState>>,
+    #[cfg(feature = "cuda")]
+    gpu_graph_failed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "cuda")]
+struct MoeGpuGraphState {
+    exec: cudarc::driver::sys::CUgraphExec,
+    cu_graph: cudarc::driver::sys::CUgraph,
+    stream: Arc<cudarc::driver::CudaStream>,
+    x: Tensor,
+    ids: Tensor,
+    weights: Tensor,
+    shared: Tensor,
+    routed: Tensor,
+    gpu_experts: usize,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for MoeGpuGraphState {}
+
+#[cfg(feature = "cuda")]
+impl MoeGpuGraphState {
+    fn stage_and_launch(
+        &mut self,
+        xs: &Tensor,
+        ids: &Tensor,
+        weights: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let ids = ids.narrow(1, 0, self.gpu_experts)?.contiguous()?;
+        let weights = weights.narrow(1, 0, self.gpu_experts)?.contiguous()?;
+        self.x.slice_set(xs, 0, 0)?;
+        self.ids.slice_set(&ids, 0, 0)?;
+        self.weights.slice_set(&weights, 0, 0)?;
+        let res = unsafe { cudarc::driver::sys::cuGraphLaunch(self.exec, self.stream.cu_stream()) };
+        if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            candle_core::bail!("cuGraphLaunch (MoE GPU) failed: {res:?}");
+        }
+        Ok((self.shared.clone(), self.routed.clone()))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for MoeGpuGraphState {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = cudarc::driver::sys::cuGraphExecDestroy(self.exec);
+            let _ = cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
+        }
+    }
 }
 
 impl Qwen35MoeBlock {
@@ -406,6 +459,10 @@ impl Qwen35MoeBlock {
             layer_idx: usize::MAX,
             #[cfg(feature = "cuda")]
             runtime: None,
+            #[cfg(feature = "cuda")]
+            gpu_graph: std::sync::Mutex::new(None),
+            #[cfg(feature = "cuda")]
+            gpu_graph_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -429,7 +486,139 @@ impl Qwen35MoeBlock {
             cfg,
             layer_idx,
             runtime,
+            gpu_graph: std::sync::Mutex::new(None),
+            gpu_graph_failed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn gpu_graph_enabled() -> bool {
+        std::env::var("MOE_GPU_GRAPH").as_deref() == Ok("1")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn forward_gpu_routed(
+        &self,
+        cuda_dev: &candle_core::CudaDevice,
+        st: &super::expert_store::ExpertLayerStore,
+        xs: &Tensor,
+        ids_t: &Tensor,
+        w_t: &Tensor,
+        gpu_experts: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let shared = self.shared.forward(xs)?;
+        let routed = if gpu_experts > 0 {
+            let ids_gpu = ids_t.narrow(1, 0, gpu_experts)?.contiguous()?;
+            let weights_gpu = w_t.narrow(1, 0, gpu_experts)?.contiguous()?;
+            let x3 = xs.to_dtype(DType::F32)?.unsqueeze(1)?.contiguous()?;
+            let (gate_shape, down_shape) = st.shapes();
+            let (gate, up) = candle_core::quantized::indexed_moe_forward_dual_table(
+                cuda_dev,
+                st.gate.dtype,
+                gate_shape,
+                st.gate.table(),
+                st.up.table(),
+                &x3,
+                &ids_gpu,
+            )?;
+            let act = gate.silu_mul_direct(&up)?.contiguous()?;
+            let down = candle_core::quantized::indexed_moe_forward_table(
+                cuda_dev,
+                st.down.dtype,
+                down_shape,
+                st.down.table(),
+                &act,
+                &ids_gpu,
+            )?;
+            moe_reduce(down, &weights_gpu, gpu_experts, cuda_dev)?
+        } else {
+            Tensor::zeros((1usize, 1usize, xs.dims2()?.1), DType::F32, xs.device())?
+        };
+        Ok((shared, routed))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn capture_gpu_graph(
+        &self,
+        cuda_dev: &candle_core::CudaDevice,
+        st: &super::expert_store::ExpertLayerStore,
+        xs: &Tensor,
+        ids_t: &Tensor,
+        w_t: &Tensor,
+        gpu_experts: usize,
+    ) -> Result<MoeGpuGraphState> {
+        let (_, hidden) = xs.dims2()?;
+        let x = Tensor::zeros((1usize, hidden), DType::F32, xs.device())?;
+        let ids = Tensor::zeros((1usize, gpu_experts), DType::U32, xs.device())?;
+        let weights = Tensor::zeros((1usize, gpu_experts), DType::F32, xs.device())?;
+        let shared_out = Tensor::zeros((1usize, hidden), DType::F32, xs.device())?;
+        let routed_out = Tensor::zeros((1usize, hidden), DType::F32, xs.device())?;
+        x.slice_set(xs, 0, 0)?;
+        ids.slice_set(&ids_t.narrow(1, 0, gpu_experts)?.contiguous()?, 0, 0)?;
+        weights.slice_set(&w_t.narrow(1, 0, gpu_experts)?.contiguous()?, 0, 0)?;
+
+        let stream = cuda_dev.cuda_stream();
+        let _htod_guard = cuda_dev.enable_cuda_graph_htod_cache();
+        unsafe {
+            cudarc::driver::result::stream::begin_capture(
+                stream.cu_stream(),
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+            )
+        }
+        .map_err(candle_core::Error::wrap)?;
+        let (shared, routed) = match self.forward_gpu_routed(
+            cuda_dev, st, &x, &ids, &weights, gpu_experts,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = unsafe {
+                    cudarc::driver::result::stream::end_capture(stream.cu_stream())
+                };
+                return Err(error);
+            }
+        };
+        if let Err(error) = shared_out.slice_set(&shared, 0, 0) {
+            let _ = unsafe {
+                cudarc::driver::result::stream::end_capture(stream.cu_stream())
+            };
+            return Err(error);
+        }
+        if let Err(error) = routed_out.slice_set(&routed, 0, 0) {
+            let _ = unsafe {
+                cudarc::driver::result::stream::end_capture(stream.cu_stream())
+            };
+            return Err(error);
+        }
+        drop(shared);
+        drop(routed);
+        let cu_graph = unsafe {
+            cudarc::driver::result::stream::end_capture(stream.cu_stream())
+        }
+        .map_err(candle_core::Error::wrap)?;
+        if cu_graph.is_null() {
+            candle_core::bail!("MoE GPU graph capture returned null graph");
+        }
+        let mut exec: cudarc::driver::sys::CUgraphExec = std::ptr::null_mut();
+        let res = unsafe {
+            cudarc::driver::sys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0)
+        };
+        if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS || exec.is_null() {
+            unsafe {
+                let _ = cudarc::driver::sys::cuGraphDestroy(cu_graph);
+            }
+            candle_core::bail!("MoE GPU graph instantiate failed: {res:?}");
+        }
+        Ok(MoeGpuGraphState {
+            exec,
+            cu_graph,
+            stream,
+            x,
+            ids,
+            weights,
+            shared: shared_out,
+            routed: routed_out,
+            gpu_experts,
+        })
     }
 
     /// Forward: route → routed SwiGLU + shared expert → combine.
@@ -585,6 +774,7 @@ impl Qwen35MoeBlock {
                 let ids_addr = ids_ptr_host as usize;
                 let weights_addr = w_ptr_host as usize;
                 let xs_addr = xs_ptr_host as usize;
+                let graph_enabled = Self::gpu_graph_enabled() && gpu_experts > 0;
                 let (gpu_job, cpu_job) = std::thread::scope(|scope| {
                     let cpu_thread = scope.spawn(move || -> Result<(Vec<f32>, std::time::Duration, std::time::Duration)> {
                         let t_wait = std::time::Instant::now();
@@ -616,43 +806,39 @@ impl Qwen35MoeBlock {
                     });
                     // CUDA-ветку обязательно ставим на вызывающем потоке; worker
                     // только ждёт D2H event и считает CPU experts.
-                    let gpu_job = (|| -> Result<(Tensor, Tensor, std::time::Duration, Option<cudarc::driver::CudaEvent>)> {
+                    let gpu_job = (|| -> Result<(Tensor, Tensor, std::time::Duration, Option<cudarc::driver::CudaEvent>, bool)> {
                         let st = unsafe {
                             &*(store_addr as *const super::expert_store::ExpertLayerStore)
                         };
-                        let shared = self.shared.forward(xs)?;
-                        let gpu_routed = if gpu_experts > 0 {
-                            let ids_gpu = ids_t.narrow(1, 0, gpu_experts)?.contiguous()?;
-                            let weights_gpu = w_t.narrow(1, 0, gpu_experts)?.contiguous()?;
-                            let (gate_shape, down_shape) = st.shapes();
-                            let (gate, up) = indexed_moe_forward_dual_table(
-                                cuda_dev,
-                                st.gate.dtype,
-                                gate_shape,
-                                st.gate.table(),
-                                st.up.table(),
-                                &make_x3()?,
-                                &ids_gpu,
-                            )?;
-                            let act = gate.silu_mul_direct(&up)?.contiguous()?;
-                            let down = indexed_moe_forward_table(
-                                cuda_dev,
-                                st.down.dtype,
-                                down_shape,
-                                st.down.table(),
-                                &act,
-                                &ids_gpu,
-                            )?;
-                            moe_reduce(down, &weights_gpu, gpu_experts, cuda_dev)?
+                        let replayed = if graph_enabled {
+                            self.gpu_graph
+                                .lock()
+                                .expect("MoE GPU graph")
+                                .as_mut()
+                                .map(|state| state.stage_and_launch(xs, &ids_t, &w_t))
+                                .transpose()?
                         } else {
-                            Tensor::zeros((1usize, 1usize, n_embd_host), DType::F32, xs.device())?
+                            None
+                        };
+                        let (shared, gpu_routed, capture) = match replayed {
+                            Some((shared, routed)) => (shared, routed, false),
+                            None => {
+                                let (shared, routed) = self.forward_gpu_routed(
+                                    cuda_dev, st, xs, &ids_t, &w_t, gpu_experts,
+                                )?;
+                                let capture = graph_enabled
+                                    && !self
+                                        .gpu_graph_failed
+                                        .load(std::sync::atomic::Ordering::Acquire);
+                                (shared, routed, capture)
+                            }
                         };
                         let gpu_done = if timing {
                             Some(stream.record_event(None).map_err(candle_core::Error::wrap)?)
                         } else {
                             None
                         };
-                        Ok((shared, gpu_routed, t_layer.elapsed(), gpu_done))
+                        Ok((shared, gpu_routed, t_layer.elapsed(), gpu_done, capture))
                     })();
                     let cpu_job = cpu_thread
                         .join()
@@ -660,8 +846,25 @@ impl Qwen35MoeBlock {
                         .and_then(|job| job);
                     (gpu_job, cpu_job)
                 });
-                let (shared, gpu_routed, enqueue_elapsed, gpu_done) = gpu_job?;
+                let (shared, gpu_routed, enqueue_elapsed, gpu_done, capture) = gpu_job?;
                 let (routed_cpu, wait_elapsed, cpu_elapsed) = cpu_job?;
+                if capture {
+                    stream.synchronize().map_err(candle_core::Error::wrap)?;
+                    let st = &*store_guard;
+                    match self.capture_gpu_graph(
+                        cuda_dev, st, xs, &ids_t, &w_t, gpu_experts,
+                    ) {
+                        Ok(state) => {
+                            *self.gpu_graph.lock().expect("MoE GPU graph") = Some(state);
+                            eprintln!("[moe-graph] captured layer {}", self.layer_idx);
+                        }
+                        Err(error) => {
+                            self.gpu_graph_failed
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            eprintln!("[moe-graph] layer {} capture failed: {error}", self.layer_idx);
+                        }
+                    }
+                }
                 drop(store_guard);
                 let d2h_elapsed = t_layer.elapsed();
                 let out_host = stage.out.as_mut_ptr().map_err(candle_core::Error::wrap)?;

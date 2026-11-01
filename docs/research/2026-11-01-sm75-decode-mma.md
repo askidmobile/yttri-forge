@@ -107,6 +107,17 @@ Prefill выигран на обоих контекстах. Decode ускоре
 изменений нужен CUDA graph/async pipeline GPU-сегментов; дальнейший перебор
 CPU-ядер и raw layout не окупился.
 
+## CUDA graph GPU-подфазы MoE
+
+`MOE_GPU_GRAPH=1` захватывает только чистый GPU-подграф одного MoE-слоя:
+shared expert, gate/up GPU-экспертов, SwiGLU, down и weighted reduction.
+CPU-эксперты, D2H/H2D и merge остаются снаружи. Стабильные device-буферы
+`x/ids/weights` обновляются D2D перед replay.
+
+На коротком запросе все слои захватились, parity сохранился, decode вырос
+`20.80 → 22.01 t/s` (+5.8%). Длинные 128k/256k с graph ещё должны быть
+пересняты; до этого результат считается opt-in.
+
 ## Отклонено в ходе интеграции
 
 - Dynamic expert cache 2 GiB с отдельным copy stream: hit 64–71%, но decode
