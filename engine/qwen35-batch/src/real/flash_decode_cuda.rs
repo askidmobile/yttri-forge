@@ -159,7 +159,11 @@ pub fn dispatch_flash_decode_paged(
         && n_kv > 0
         && n_head / n_kv == 8;
     let splits = if gqa_fold {
-        (capacity_tokens / 1024).clamp(32, 256)
+        std::env::var("DECODE_GQA_SPLITS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(32, 256))
+            .unwrap_or_else(|| (capacity_tokens / 1024).clamp(32, 256))
     } else {
         (capacity_tokens / 4096).clamp(8, 64)
     } as u32;

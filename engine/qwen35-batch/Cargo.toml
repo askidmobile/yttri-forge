@@ -149,6 +149,11 @@ path = "src/bin/fa_prefill_probe.rs"
 required-features = ["real-model", "cuda"]
 
 [[bin]]
+name = "decode_gqa_probe"
+path = "src/bin/decode_gqa_probe.rs"
+required-features = ["cuda"]
+
+[[bin]]
 name = "fa_decode_probe"
 path = "src/bin/fa_decode_probe.rs"
 required-features = ["real-model", "cuda"]
