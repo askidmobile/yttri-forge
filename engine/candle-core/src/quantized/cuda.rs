@@ -951,7 +951,7 @@ fn mul_mat_via_q8_1(
             ceil_div(y_cols, mmq_x) as u32,
             1,
         ),
-        block_dim: (WARP_SIZE as u32, if w2 { 2 } else { 4 }, 1),
+        block_dim: (WARP_SIZE as u32, 4, 1),
         shared_mem_bytes: 0,
     };
 
@@ -1310,7 +1310,7 @@ fn indexed_moe_forward_dual_dispatch(
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (n as u32, batch as u32, topk as u32),
-        block_dim: (WARP_SIZE as u32, 4, 1),
+        block_dim: (WARP_SIZE as u32, if w2 { 2 } else { 4 }, 1),
         shared_mem_bytes: 0,
     };
     let mut b = func.builder();
