@@ -7322,8 +7322,7 @@ IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_q8_0_q8_1, QK8_0, QI8_0, block_q8
 // экономия: 1 launch + 1 q8_1-quantize на MoE блок на шаг.
 // ═══════════════════════════════════════════════════════════════
 
-template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
-template <int NWARPS>
+template <int NWARPS, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 __device__ void indexed_moe_forward_dual(
     const void * const * __restrict__ w1_ptrs,
     const void * const * __restrict__ w2_ptrs,
