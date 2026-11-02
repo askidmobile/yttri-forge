@@ -6971,7 +6971,7 @@ __device__ void indexed_moe_forward(
 
     //fixed for inner compute
     constexpr int ncols_y = 1;
-    constexpr int nwarps = NWARPS;
+    constexpr int nwarps = 4;
     constexpr int rows_per_cuda_block = 1;
 
     const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
