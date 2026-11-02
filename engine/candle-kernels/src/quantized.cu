@@ -6971,7 +6971,7 @@ __device__ void indexed_moe_forward(
 
     //fixed for inner compute
     constexpr int ncols_y = 1;
-    constexpr int nwarps = 4;
+    constexpr int nwarps = NWARPS;
     constexpr int rows_per_cuda_block = 1;
 
     const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
@@ -7323,6 +7323,7 @@ IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_q8_0_q8_1, QK8_0, QI8_0, block_q8
 // ═══════════════════════════════════════════════════════════════
 
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+template <int NWARPS>
 __device__ void indexed_moe_forward_dual(
     const void * const * __restrict__ w1_ptrs,
     const void * const * __restrict__ w2_ptrs,
@@ -7403,7 +7404,17 @@ extern "C" __global__ void name( \
     const void * const * w1, const void * const * w2, const void * inp, const unsigned int * ids, \
     float * out1, float * out2, \
     const int n, const int k, const int batch, const int topk, const int k_padded, const int input_dim1) { \
-    indexed_moe_forward_dual<QK_, QI_, BLOCK_, VDR_, DOT_>(w1, w2, inp, ids, out1, out2, n, k, batch, topk, k_padded, input_dim1); \
+    indexed_moe_forward_dual<4, QK_, QI_, BLOCK_, VDR_, DOT_>(w1, w2, inp, ids, out1, out2, n, k, batch, topk, k_padded, input_dim1); \
+}
+
+// Вариант на два варпа: при Q4_K (qi=16, vdr=2) ровно 64 потока нужны
+// на строку, поэтому блок из 128 потоков наполовину простаивал.
+#define DUAL_MOE_EXTERN_W2(name, QK_, QI_, BLOCK_, VDR_, DOT_) \
+extern "C" __global__ void name( \
+    const void * const * w1, const void * const * w2, const void * inp, const unsigned int * ids, \
+    float * out1, float * out2, \
+    const int n, const int k, const int batch, const int topk, const int k_padded, const int input_dim1) { \
+    indexed_moe_forward_dual<2, QK_, QI_, BLOCK_, VDR_, DOT_>(w1, w2, inp, ids, out1, out2, n, k, batch, topk, k_padded, input_dim1); \
 }
 
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_iq2_xxs_q8_1, QK_K,  QI2_XXS, block_iq2_xxs, VDR_IQ2_XXS_Q8_1_MMVQ, vec_dot_iq2_xxs_q8_1)
@@ -7415,6 +7426,7 @@ DUAL_MOE_EXTERN(indexed_moe_forward_dual_iq4_xs_q8_1,  QK_K,  QI4_XS,  block_iq4
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q8_0_q8_1, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1)
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q3k_q8_1,  QK_K,  QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1)
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q4k_q8_1,  QK_K,  QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
+DUAL_MOE_EXTERN_W2(indexed_moe_forward_dual_q4k_q8_1_w2, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q5k_q8_1,  QK_K,  QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q6k_q8_1,  QK_K,  QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q2k_q8_1,  QK_K,  QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1)

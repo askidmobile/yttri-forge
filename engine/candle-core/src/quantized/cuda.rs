@@ -951,7 +951,7 @@ fn mul_mat_via_q8_1(
             ceil_div(y_cols, mmq_x) as u32,
             1,
         ),
-        block_dim: (WARP_SIZE as u32, 4, 1),
+        block_dim: (WARP_SIZE as u32, if w2 { 2 } else { 4 }, 1),
         shared_mem_bytes: 0,
     };
 
@@ -1267,7 +1267,12 @@ fn indexed_moe_forward_dual_dispatch(
     idx_shape: &crate::Shape, //[batch, topk]
     dev: &CudaDevice,
 ) -> Result<(CudaStorage, CudaStorage, crate::Shape)> {
-    let kernel_name = match w_dtype {
+    // Q4_K на два варпа: 64 потока ровно покрывают строку, блок не простаивает.
+    let w2 = std::env::var("MOE_GPU_WARPS").as_deref() == Ok("2")
+        && matches!(w_dtype, GgmlDType::Q4K);
+    let kernel_name = if w2 {
+        "indexed_moe_forward_dual_q4k_q8_1_w2"
+    } else { match w_dtype {
         GgmlDType::IQ2XXS => "indexed_moe_forward_dual_iq2_xxs_q8_1",
         GgmlDType::IQ2XS => "indexed_moe_forward_dual_iq2_xs_q8_1",
         GgmlDType::IQ2S => "indexed_moe_forward_dual_iq2_s_q8_1",
@@ -1281,7 +1286,7 @@ fn indexed_moe_forward_dual_dispatch(
         GgmlDType::Q5K => "indexed_moe_forward_dual_q5k_q8_1",
         GgmlDType::Q6K => "indexed_moe_forward_dual_q6k_q8_1",
         _ => crate::bail!("unsupported dtype for dual indexed moe {w_dtype:?}"),
-    };
+    } };
     let (n, k) = (w_shape.dims3()?.1, w_shape.dims3()?.2);
     let batch = in_shape.dims()[0];
     let topk = idx_shape.dims()[1];
