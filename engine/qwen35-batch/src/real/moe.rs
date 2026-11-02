@@ -726,7 +726,16 @@ impl Qwen35MoeBlock {
         if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             candle_core::bail!("cuStreamWaitValue32 (CPU-MoE) failed: {res:?}");
         }
-        let routed = Tensor::zeros((1usize, 1usize, n_embd), DType::F32, xs.device())?;
+        // Без memset: и mapped-ядро, и H2D полностью перезаписывают буфер,
+        // а `zeros` добавлял отдельный kernel launch на каждый из 41 слоёв.
+        let routed = {
+            let buf = unsafe { cuda_dev.alloc::<f32>(n_embd)? };
+            let storage = candle_core::CudaStorage::wrap_cuda_slice(buf, cuda_dev.clone());
+            Tensor::from((
+                candle_core::Storage::Cuda(storage),
+                (1usize, 1usize, n_embd),
+            ))
+        };
         if mapped {
             let dst = crate::real::paged_kv_cuda::tensor_cuda_ptr(&routed)?;
             let gpu = crate::real::paged_kv_cuda::tensor_cuda_ptr(&gpu_routed)?;
