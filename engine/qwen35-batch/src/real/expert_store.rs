@@ -110,23 +110,42 @@ fn numa_dup_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("MOE_CPU_NUMA_DUP").as_deref() == Ok("1"))
 }
 
+/// `mbind` не входит в экспорт libc-крейта для glibc — объявляем сами.
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+unsafe extern "C" {
+    fn mbind(
+        addr: *mut core::ffi::c_void,
+        len: usize,
+        mode: core::ffi::c_int,
+        nodemask: *const u64,
+        maxnode: u64,
+        flags: u32,
+    ) -> core::ffi::c_int;
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+const MPOL_BIND: core::ffi::c_int = 2;
+
 /// Привязать буфер к узлу до первого касания страниц.
 #[cfg(feature = "cuda")]
 fn bind_node(buf: &mut [u8], node: usize) {
     if buf.is_empty() || node >= 64 {
         return;
     }
-    let mut mask = [0usize; 16];
-    mask[node / 64] |= 1usize << (node % 64);
-    unsafe {
-        libc::mbind(
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len(),
-            libc::MPOL_BIND,
-            mask.as_ptr() as *const libc::c_ulong,
-            1024,
-            0,
-        );
+    #[cfg(target_os = "linux")]
+    {
+        let mut mask = [0u64; 16];
+        mask[node / 64] |= 1u64 << (node % 64);
+        unsafe {
+            mbind(
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                buf.len(),
+                MPOL_BIND,
+                mask.as_ptr(),
+                1024,
+                0,
+            );
+        }
     }
 }
 
