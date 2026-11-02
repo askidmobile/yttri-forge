@@ -692,6 +692,7 @@ impl Qwen35MoeBlock {
         async_cpu_sender()
             .send(AsyncCpuJob {
                 store: store.clone(),
+                layer: self.layer_idx,
                 copy_done,
                 export_flag,
                 ids: ids_host as usize,
@@ -1979,6 +1980,7 @@ struct AsyncCpuStage {
 #[cfg(feature = "cuda")]
 struct AsyncCpuJob {
     store: SharedLayerStore,
+    layer: usize,
     copy_done: Option<cudarc::driver::CudaEvent>,
     export_flag: usize,
     ids: usize,
@@ -2043,6 +2045,22 @@ fn async_cpu_sender() -> &'static std::sync::mpsc::Sender<AsyncCpuJob> {
                         let ids = unsafe {
                             std::slice::from_raw_parts(job.ids as *const u32, job.k_topk)
                         };
+                        if std::env::var("MOE_TRACE_IDS").as_deref() == Ok("1") {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("/tmp/moe_ids.csv")
+                            {
+                                let mut line = format!("{}", job.layer);
+                                for id in ids {
+                                    line.push(',');
+                                    line.push_str(&id.to_string());
+                                }
+                                line.push('\n');
+                                let _ = f.write_all(line.as_bytes());
+                            }
+                        }
                         let weights = unsafe {
                             std::slice::from_raw_parts(job.weights as *const f32, job.k_topk)
                         };
