@@ -7978,6 +7978,10 @@ impl ModelWeights {
                                 if layer == Some(layer_idx) {
                                     let experts: Vec<usize> =
                                         it.filter_map(|v| v.trim().parse().ok()).collect();
+                                    log::info!(
+                                        "[moe] hot: layer {layer_idx}, слотов {}",
+                                        experts.len()
+                                    );
                                     store
                                         .lock()
                                         .expect("expert layer store")
