@@ -104,6 +104,24 @@ pub(crate) enum HostBackend {
     Managed,
 }
 
+/// Подсказка ядру: отдавать эти страницы под THP. Вызывается до первой
+/// записи, иначе страницы уже размечены как 4K и ждут khugepaged.
+#[cfg(feature = "cuda")]
+fn advise_hugepage(buf: &mut [u8]) {
+    if buf.is_empty() {
+        return;
+    }
+    let page = 4096usize;
+    let lo = buf.as_ptr() as usize;
+    let start = (lo + page - 1) & !(page - 1);
+    let end = (lo + buf.len()) & !(page - 1);
+    if end > start {
+        unsafe {
+            libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE);
+        }
+    }
+}
+
 /// Host-память, отображённая в адресное пространство устройства. Основной
 /// путь — pinned DEVICEMAP|WRITECOMBINED: CPU использует отдельную RAM-копию,
 /// а GPU читает этот буфер через zero-copy; UVA dev_ptr == host ptr.
@@ -329,9 +347,14 @@ impl ExpertMatrix {
         let mut host = HostBuf::alloc(bytes)?;
         host.as_slice_mut().copy_from_slice(&data[start..start + size]);
         // MOE_CPU=1: обычная RAM-копия, иначе CPU-GEMV читал бы managed
-        // память, чьи страницы держит GPU.
+        // память, чьи страницы держит GPU. Huge pages включаются ДО первого
+        // касания: токен читает 8 случайных экспертов на 41 слое, это ~3.3k
+        // страниц 4K на токен против ~7 страниц по 2 МиБ.
         let cpu_data = if std::env::var("MOE_CPU").as_deref() == Ok("1") {
-            Some(data[start..start + size].to_vec())
+            let mut buf = vec![0u8; size];
+            advise_hugepage(&mut buf);
+            buf.copy_from_slice(&data[start..start + size]);
+            Some(buf)
         } else {
             None
         };
