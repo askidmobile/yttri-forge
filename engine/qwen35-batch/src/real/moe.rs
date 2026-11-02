@@ -2317,42 +2317,52 @@ pub fn moe_forward_cpu(
     // раз на 8 строк вместо восьми (то, что llama.cpp получает через repack
     // в block_q4_Kx8). 8·bprow блоков подряд — это 8 последовательных строк.
     let rows8 = 8usize;
+    // Каждому потоку — непрерывный диапазон строк. При мелких перемешанных
+    // задачах 28 потоков держали ~56 независимых DRAM-потоков и теряли
+    // локальность; здесь поток идёт по одному участку подряд.
+    let threads = rayon::current_num_threads().max(1);
+    let chunk = (n_jobs.div_ceil(threads)).div_ceil(rows8) * rows8;
     acts
-        .par_chunks_mut(rows8)
+        .par_chunks_mut(chunk)
         .enumerate()
-        .for_each(|(t, a8)| {
-            let base = t * rows8;
-            let j = base / n_ff;
-            let r = base % n_ff;
-            let n = a8.len();
-            let mut acc_g = [0f32; 8];
-            let mut acc_u = [0f32; 8];
-            let gs = &g_blocks[j][r * bprow_g..(r + n) * bprow_g];
-            let us = &u_blocks[j][r * bprow_u..(r + n) * bprow_u];
-            #[cfg(target_feature = "avx2")]
-            if n == 8 {
-                candle_core::quantized::avx::vec_dot_q4k_q8k_x8(n_embd, gs, &x8, &mut acc_g);
-                candle_core::quantized::avx::vec_dot_q4k_q8k_x8(n_embd, us, &x8, &mut acc_u);
-            } else {
-                for off in 0..n {
-                    acc_g[off] = BlockQ4K::vec_dot(
-                        n_embd, &gs[off * bprow_g..(off + 1) * bprow_g], &x8);
-                    acc_u[off] = BlockQ4K::vec_dot(
-                        n_embd, &us[off * bprow_u..(off + 1) * bprow_u], &x8);
+        .for_each(|(t, block)| {
+            let mut pos = 0usize;
+            while pos < block.len() {
+                let base = t * chunk + pos;
+                let j = base / n_ff;
+                let r = base % n_ff;
+                let n = (block.len() - pos).min(rows8).min(n_ff - r);
+                let a8 = &mut block[pos..pos + n];
+                let mut acc_g = [0f32; 8];
+                let mut acc_u = [0f32; 8];
+                let gs = &g_blocks[j][r * bprow_g..(r + n) * bprow_g];
+                let us = &u_blocks[j][r * bprow_u..(r + n) * bprow_u];
+                #[cfg(target_feature = "avx2")]
+                if n == 8 {
+                    candle_core::quantized::avx::vec_dot_q4k_q8k_x8(n_embd, gs, &x8, &mut acc_g);
+                    candle_core::quantized::avx::vec_dot_q4k_q8k_x8(n_embd, us, &x8, &mut acc_u);
+                } else {
+                    for k in 0..n {
+                        acc_g[k] = BlockQ4K::vec_dot(
+                            n_embd, &gs[k * bprow_g..(k + 1) * bprow_g], &x8);
+                        acc_u[k] = BlockQ4K::vec_dot(
+                            n_embd, &us[k * bprow_u..(k + 1) * bprow_u], &x8);
+                    }
                 }
-            }
-            #[cfg(not(target_feature = "avx2"))]
-            {
-                for off in 0..n {
-                    acc_g[off] = BlockQ4K::vec_dot(
-                        n_embd, &gs[off * bprow_g..(off + 1) * bprow_g], &x8);
-                    acc_u[off] = BlockQ4K::vec_dot(
-                        n_embd, &us[off * bprow_u..(off + 1) * bprow_u], &x8);
+                #[cfg(not(target_feature = "avx2"))]
+                {
+                    for k in 0..n {
+                        acc_g[k] = BlockQ4K::vec_dot(
+                            n_embd, &gs[k * bprow_g..(k + 1) * bprow_g], &x8);
+                        acc_u[k] = BlockQ4K::vec_dot(
+                            n_embd, &us[k * bprow_u..(k + 1) * bprow_u], &x8);
+                    }
                 }
-            }
-            for off in 0..n {
-                let gv = acc_g[off];
-                a8[off] = (gv / (1.0 + (-gv).exp())) * acc_u[off];
+                for k in 0..n {
+                    let gv = acc_g[k];
+                    a8[k] = (gv / (1.0 + (-gv).exp())) * acc_u[k];
+                }
+                pos += n;
             }
         });
 
