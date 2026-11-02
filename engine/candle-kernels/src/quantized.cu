@@ -6990,9 +6990,10 @@ __device__ void indexed_moe_forward(
     const block_q_t * w = (const block_q_t *) current_weight_ptr;
     const block_q8_1 * x = (const block_q8_1 *) current_input_ptr;
 
-    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    constexpr int blocks_per_iter_row = vdr * threads_per_row / qi;
+    for (int kbx = lid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter_row) {
         const int kby = kbx * (qk / QK8_1);
-        const int kqs = vdr * (tid % (qi / vdr));
+        const int kqs = vdr * (lid % (qi / vdr));
         tmp += vec_dot_q_cuda(&w[kbx + row0 * blocks_per_row_x], &x[kby], kqs);
     }
 
@@ -7355,9 +7356,14 @@ __device__ void indexed_moe_forward_dual(
     float * out2 = out2_all + task_id * n;
 
     constexpr int nwarps = 4;
-    constexpr int rows_per_cuda_block = 1;
+    // Две строки на блок: при одной 64 из 128 потоков простаивали, потому что
+    // строка Q4_K (8 блоков × 8 дорожек) занимает ровно половину блока.
+    constexpr int rows_per_cuda_block = 2;
+    constexpr int threads_per_row = (nwarps * WARP_SIZE) / rows_per_cuda_block;
     const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
-    const int row0 = rows_per_cuda_block * blockIdx.x;
+    const int row_local = tid / threads_per_row;
+    const int lid = tid % threads_per_row;
+    const int row0 = rows_per_cuda_block * blockIdx.x + row_local;
     if (row0 >= n) return;
 
     const int blocks_per_row_x = k / qk;
@@ -7377,18 +7383,14 @@ __device__ void indexed_moe_forward_dual(
     }
     (void)blocks_per_col_y;
 
-    __shared__ float sh1[nwarps - 1][WARP_SIZE];
-    __shared__ float sh2[nwarps - 1][WARP_SIZE];
-    if (threadIdx.y > 0) {
-        sh1[threadIdx.y - 1][threadIdx.x] = tmp1;
-        sh2[threadIdx.y - 1][threadIdx.x] = tmp2;
-    }
+    __shared__ float sh1[rows_per_cuda_block][nwarps][WARP_SIZE];
+    __shared__ float sh2[rows_per_cuda_block][nwarps][WARP_SIZE];
+    sh1[row_local][threadIdx.y][threadIdx.x] = tmp1;
+    sh2[row_local][threadIdx.y][threadIdx.x] = tmp2;
     __syncthreads();
-    if (threadIdx.y == 0) {
-        for (int l = 0; l < nwarps - 1; ++l) {
-            tmp1 += sh1[l][threadIdx.x];
-            tmp2 += sh2[l][threadIdx.x];
-        }
+    if (threadIdx.y % 2 == 0) {
+        tmp1 += sh1[row_local][threadIdx.y + 1][threadIdx.x];
+        tmp2 += sh2[row_local][threadIdx.y + 1][threadIdx.x];
         tmp1 = warp_reduce_sum(tmp1);
         tmp2 = warp_reduce_sum(tmp2);
         if (threadIdx.x == 0) {

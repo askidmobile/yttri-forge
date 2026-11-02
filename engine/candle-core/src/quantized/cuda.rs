@@ -1304,7 +1304,7 @@ fn indexed_moe_forward_dual_dispatch(
 
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
     let cfg = cudarc::driver::LaunchConfig {
-        grid_dim: (n as u32, batch as u32, topk as u32),
+        grid_dim: (((n + 1) / 2) as u32, batch as u32, topk as u32),
         block_dim: (WARP_SIZE as u32, 4, 1),
         shared_mem_bytes: 0,
     };
