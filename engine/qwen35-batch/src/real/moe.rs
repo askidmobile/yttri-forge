@@ -2455,25 +2455,7 @@ pub fn moe_forward_cpu(
         .enumerate()
         .for_each(|(t, chunk)| {
             let base = t * rows_per_task;
-            let mut off = 0usize;
-            // Q4_K down идёт тем же x8-путём, что gate/up: одна активация
-            // Q8_K на восемь строк. Границы задач кратны 8 и не пересекают
-            // эксперта (n_embd и rows_per_task делятся на 8).
-            #[cfg(target_feature = "avx2")]
-            while off + 8 <= chunk.len() {
-                let idx = base + off;
-                let j = idx / n_embd;
-                let r = idx % n_embd;
-                if r + 8 > n_embd { break; }
-                let Some(dq4) = d_blocks_q4[j] else { break };
-                let sl = &dq4[r * bprow_d..(r + 8) * bprow_d];
-                let mut acc = [0f32; 8];
-                candle_core::quantized::avx::vec_dot_q4k_q8k_x8(
-                    n_ff, sl, &d8s[j], &mut acc);
-                chunk[off..off + 8].copy_from_slice(&acc);
-                off += 8;
-            }
-            for off in off..chunk.len() {
+            for off in 0..chunk.len() {
                 let idx = base + off;
                 let j = idx / n_embd;
                 let r = idx % n_embd;
