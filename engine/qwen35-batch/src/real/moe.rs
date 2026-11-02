@@ -707,18 +707,13 @@ impl Qwen35MoeBlock {
             })
             .map_err(|_| candle_core::Error::Msg("CPU-MoE async worker unavailable".into()))?;
 
-        let profile_this = moe_prof::on() && self.layer_idx == 0;
-        let (shared, gpu_routed) = {
-            let mut guard = self.gpu_graph.lock().expect("MoE GPU graph");
-            let graph = guard
-                .as_mut()
-                .ok_or_else(|| candle_core::Error::Msg("MoE GPU graph missing".into()))?;
-            if profile_this {
-                moe_prof::time_gpu(cuda_dev, || graph.stage_and_launch(xs, ids_t, w_t))?
-            } else {
-                graph.stage_and_launch(xs, ids_t, w_t)?
-            }
-        };
+        let (shared, gpu_routed) = self
+            .gpu_graph
+            .lock()
+            .expect("MoE GPU graph")
+            .as_mut()
+            .ok_or_else(|| candle_core::Error::Msg("MoE GPU graph missing".into()))?
+            .stage_and_launch(xs, ids_t, w_t)?;
         let res = unsafe {
             cudarc::driver::sys::cuStreamWaitValue32_v2(
                 stream.cu_stream(),
@@ -2032,24 +2027,6 @@ mod moe_prof {
     pub fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("YF_MOE_PROF").as_deref() == Ok("1"))
-    }
-
-    /// Время GPU-ветки одного слоя (shared + GPU-эксперты) по CUDA-событиям.
-    pub fn time_gpu<T, F>(dev: &candle_core::CudaDevice, f: F) -> candle_core::Result<T>
-    where
-        F: FnOnce() -> candle_core::Result<T>,
-    {
-        if !on() {
-            return f();
-        }
-        let stream = dev.cuda_stream();
-        let start = stream.record_event(None).map_err(candle_core::Error::wrap)?;
-        let out = f()?;
-        let stop = stream.record_event(None).map_err(candle_core::Error::wrap)?;
-        stop.synchronize().map_err(candle_core::Error::wrap)?;
-        let ms = start.elapsed_ms(&stop).map_err(candle_core::Error::wrap)?;
-        eprintln!("[moe-prof] gpu_branch_layer={ms:.3}ms");
-        Ok(out)
     }
 
     pub fn record_worker(elapsed_ns: u64) {
