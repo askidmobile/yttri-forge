@@ -6990,10 +6990,9 @@ __device__ void indexed_moe_forward(
     const block_q_t * w = (const block_q_t *) current_weight_ptr;
     const block_q8_1 * x = (const block_q8_1 *) current_input_ptr;
 
-    constexpr int blocks_per_iter_row = vdr * threads_per_row / qi;
-    for (int kbx = lid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter_row) {
+    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk / QK8_1);
-        const int kqs = vdr * (lid % (qi / vdr));
+        const int kqs = vdr * (tid % (qi / vdr));
         tmp += vec_dot_q_cuda(&w[kbx + row0 * blocks_per_row_x], &x[kby], kqs);
     }
 
@@ -7375,9 +7374,10 @@ __device__ void indexed_moe_forward_dual(
     const block_q_t * w2 = (const block_q_t *) w2_ptr;
     const block_q8_1 * x = (const block_q8_1 *) x_ptr;
 
-    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    constexpr int blocks_per_iter_row = vdr * threads_per_row / qi;
+    for (int kbx = lid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter_row) {
         const int kby = kbx * (qk / QK8_1);
-        const int kqs = vdr * (tid % (qi / vdr));
+        const int kqs = vdr * (lid % (qi / vdr));
         tmp1 += vec_dot_q_cuda(&w1[kbx + row0 * blocks_per_row_x], &x[kby], kqs);
         tmp2 += vec_dot_q_cuda(&w2[kbx + row0 * blocks_per_row_x], &x[kby], kqs);
     }
