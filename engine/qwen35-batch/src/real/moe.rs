@@ -2297,16 +2297,42 @@ pub fn moe_forward_cpu(
     if g_dtype != GgmlDType::Q4K || u_dtype != GgmlDType::Q4K {
         candle_core::bail!("cpu moe: ожидался Q4K для gate/up, got {g_dtype:?}/{u_dtype:?}");
     }
-    let g_blocks: Vec<&[BlockQ4K]> = gate_slices
+    // Две копии весов по NUMA-узлам: задача берёт ту, которая локальна
+    // для CPU, исполняющего поток.
+    let g_blocks_n0: Vec<&[BlockQ4K]> = sel
         .iter()
-        .map(|sl| unsafe {
-            std::slice::from_raw_parts(sl.as_ptr() as *const BlockQ4K, n_ff * bprow_g)
+        .map(|(e, _)| unsafe {
+            std::slice::from_raw_parts(
+                st.gate.expert_host_slice_on(*e, 0).as_ptr() as *const BlockQ4K,
+                n_ff * bprow_g,
+            )
         })
         .collect();
-    let u_blocks: Vec<&[BlockQ4K]> = up_slices
+    let g_blocks_n1: Vec<&[BlockQ4K]> = sel
         .iter()
-        .map(|sl| unsafe {
-            std::slice::from_raw_parts(sl.as_ptr() as *const BlockQ4K, n_ff * bprow_u)
+        .map(|(e, _)| unsafe {
+            std::slice::from_raw_parts(
+                st.gate.expert_host_slice_on(*e, 1).as_ptr() as *const BlockQ4K,
+                n_ff * bprow_g,
+            )
+        })
+        .collect();
+    let u_blocks_n0: Vec<&[BlockQ4K]> = sel
+        .iter()
+        .map(|(e, _)| unsafe {
+            std::slice::from_raw_parts(
+                st.up.expert_host_slice_on(*e, 0).as_ptr() as *const BlockQ4K,
+                n_ff * bprow_u,
+            )
+        })
+        .collect();
+    let u_blocks_n1: Vec<&[BlockQ4K]> = sel
+        .iter()
+        .map(|(e, _)| unsafe {
+            std::slice::from_raw_parts(
+                st.up.expert_host_slice_on(*e, 1).as_ptr() as *const BlockQ4K,
+                n_ff * bprow_u,
+            )
         })
         .collect();
     // Разбиение по СТРОКАМ, а не по экспертам: 8 экспертов давали максимум
@@ -2327,8 +2353,14 @@ pub fn moe_forward_cpu(
             let n = a8.len();
             let mut acc_g = [0f32; 8];
             let mut acc_u = [0f32; 8];
-            let gs = &g_blocks[j][r * bprow_g..(r + n) * bprow_g];
-            let us = &u_blocks[j][r * bprow_u..(r + n) * bprow_u];
+            let node = super::expert_store::current_numa_node();
+            let (gb, ub) = if node == 0 {
+                (&g_blocks_n0[j], &u_blocks_n0[j])
+            } else {
+                (&g_blocks_n1[j], &u_blocks_n1[j])
+            };
+            let gs = &gb[r * bprow_g..(r + n) * bprow_g];
+            let us = &ub[r * bprow_u..(r + n) * bprow_u];
             #[cfg(target_feature = "avx2")]
             if n == 8 {
                 candle_core::quantized::avx::vec_dot_q4k_q8k_x8(n_embd, gs, &x8, &mut acc_g);
@@ -2358,6 +2390,8 @@ pub fn moe_forward_cpu(
 
     // Проход 2: down для всех выбранных экспертов + взвешенная сумма.
     let down_slices: Vec<&[u8]> = sel.iter().map(|(e, _)| st.down.expert_host_slice(*e)).collect();
+    let down_slices_n0: Vec<&[u8]> =
+        sel.iter().map(|(e, _)| st.down.expert_host_slice_on(*e, 0)).collect();
     let d_dtype = st.down.dtype;
     let _ = down_bytes;
 
@@ -2373,6 +2407,22 @@ pub fn moe_forward_cpu(
             let mut a8 = vec![BlockQ8K::zeros(); bprow_d];
             BlockQ8K::from_float(a, &mut a8);
             a8
+        })
+        .collect();
+    let d_blocks_q4_n0: Vec<Option<&[BlockQ4K]>> = down_slices_n0
+        .iter()
+        .map(|sl| {
+            (d_dtype == GgmlDType::Q4K).then(|| unsafe {
+                std::slice::from_raw_parts(sl.as_ptr() as *const BlockQ4K, n_embd * bprow_d)
+            })
+        })
+        .collect();
+    let d_blocks_q6_n0: Vec<Option<&[BlockQ6K]>> = down_slices_n0
+        .iter()
+        .map(|sl| {
+            (d_dtype == GgmlDType::Q6K).then(|| unsafe {
+                std::slice::from_raw_parts(sl.as_ptr() as *const BlockQ6K, n_embd * bprow_d)
+            })
         })
         .collect();
     let d_blocks_q4: Vec<Option<&[BlockQ4K]>> = down_slices
@@ -2401,10 +2451,13 @@ pub fn moe_forward_cpu(
                 let j = idx / n_embd;
                 let r = idx % n_embd;
                 let a8 = &d8s[j];
-                chunk[off] = if let Some(dq4) = d_blocks_q4[j] {
+                let n0 = super::expert_store::current_numa_node() == 0;
+                let q4 = if n0 { d_blocks_q4_n0[j] } else { d_blocks_q4[j] };
+                let q6 = if n0 { d_blocks_q6_n0[j] } else { d_blocks_q6[j] };
+                chunk[off] = if let Some(dq4) = q4 {
                     let sl = &dq4[r * bprow_d..(r + 1) * bprow_d];
                     BlockQ4K::vec_dot(n_ff, sl, a8)
-                } else if let Some(dq6) = d_blocks_q6[j] {
+                } else if let Some(dq6) = q6 {
                     let sl = &dq6[r * bprow_d..(r + 1) * bprow_d];
                     BlockQ6K::vec_dot(n_ff, sl, a8)
                 } else {

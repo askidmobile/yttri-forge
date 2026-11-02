@@ -104,6 +104,64 @@ pub(crate) enum HostBackend {
     Managed,
 }
 
+#[cfg(feature = "cuda")]
+fn numa_dup_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MOE_CPU_NUMA_DUP").as_deref() == Ok("1"))
+}
+
+/// Привязать буфер к узлу до первого касания страниц.
+#[cfg(feature = "cuda")]
+fn bind_node(buf: &mut [u8], node: usize) {
+    if buf.is_empty() || node >= 64 {
+        return;
+    }
+    let mut mask = [0usize; 16];
+    mask[node / 64] |= 1usize << (node % 64);
+    unsafe {
+        libc::mbind(
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            libc::MPOL_BIND,
+            mask.as_ptr() as *const libc::c_ulong,
+            1024,
+            0,
+        );
+    }
+}
+
+/// NUMA-узел CPU, на котором сейчас исполняется поток.
+#[cfg(feature = "cuda")]
+pub fn current_numa_node() -> usize {
+    static MAP: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        let mut m = vec![0usize; 1024];
+        for node in 0..8usize {
+            let path = format!("/sys/devices/system/node/node{node}/cpulist");
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            for part in text.trim().split(',') {
+                let (lo, hi) = match part.split_once('-') {
+                    Some((a, b)) => (a.parse().unwrap_or(0), b.parse().unwrap_or(0)),
+                    None => {
+                        let v = part.parse().unwrap_or(0);
+                        (v, v)
+                    }
+                };
+                for cpu in lo..=hi.min(1023) {
+                    m[cpu] = node;
+                }
+            }
+        }
+        m
+    });
+    let cpu = unsafe { libc::sched_getcpu() };
+    if cpu >= 0 && (cpu as usize) < map.len() {
+        map[cpu as usize]
+    } else {
+        1
+    }
+}
+
 /// Host-память, отображённая в адресное пространство устройства. Основной
 /// путь — pinned DEVICEMAP|WRITECOMBINED: CPU использует отдельную RAM-копию,
 /// а GPU читает этот буфер через zero-copy; UVA dev_ptr == host ptr.
@@ -268,6 +326,8 @@ pub struct ExpertMatrix {
     /// Managed-память из HostBuf для CPU-чтения плоха: страницы под GPU.
     /// 18.6 ГиБ дублируются только когда ядро реально считает на CPU.
     cpu_data: Option<Vec<u8>>,
+    /// Вторая RAM-копия для второго NUMA-узла: каждый сокет читает свою.
+    cpu_data_alt: Option<Vec<u8>>,
     table: cudarc::driver::CudaSlice<u64>,
 }
 
@@ -330,10 +390,23 @@ impl ExpertMatrix {
         host.as_slice_mut().copy_from_slice(&data[start..start + size]);
         // MOE_CPU=1: обычная RAM-копия, иначе CPU-GEMV читал бы managed
         // память, чьи страницы держит GPU.
-        let cpu_data = if std::env::var("MOE_CPU").as_deref() == Ok("1") {
-            Some(data[start..start + size].to_vec())
+        let (cpu_data, cpu_data_alt) = if std::env::var("MOE_CPU").as_deref() == Ok("1") {
+            let mut buf = vec![0u8; size];
+            bind_node(&mut buf, 1);
+            buf.copy_from_slice(&data[start..start + size]);
+            // Дубликат для второго сокета: без него все ядра читают память
+            // NUMA-узла 1, и второй узел простаивает.
+            let alt = if numa_dup_enabled() {
+                let mut second = vec![0u8; size];
+                bind_node(&mut second, 0);
+                second.copy_from_slice(&data[start..start + size]);
+                Some(second)
+            } else {
+                None
+            };
+            (Some(buf), alt)
         } else {
-            None
+            (None, None)
         };
         let table = alloc_host_table(dev, host.dev_ptr(), n_experts, expert_bytes)?;
         log::info!(
@@ -352,6 +425,7 @@ impl ExpertMatrix {
             expert_bytes,
             host,
             cpu_data,
+            cpu_data_alt,
             table,
         })
     }
@@ -367,6 +441,18 @@ impl ExpertMatrix {
     /// Байты эксперта: RAM-копия при MOE_CPU=1, иначе host-буфер CUDA.
     pub fn expert_host_slice(&self, expert: usize) -> &[u8] {
         match &self.cpu_data {
+            Some(d) => &d[expert * self.expert_bytes..(expert + 1) * self.expert_bytes],
+            None => self.host.expert_slice(expert, self.expert_bytes),
+        }
+    }
+
+    /// Копия из памяти узла текущего CPU: 0 — дубликат, иначе основная.
+    pub fn expert_host_slice_on(&self, expert: usize, node: usize) -> &[u8] {
+        let data = match (node, &self.cpu_data_alt) {
+            (0, Some(alt)) => Some(alt),
+            _ => self.cpu_data.as_ref(),
+        };
+        match data {
             Some(d) => &d[expert * self.expert_bytes..(expert + 1) * self.expert_bytes],
             None => self.host.expert_slice(expert, self.expert_bytes),
         }
