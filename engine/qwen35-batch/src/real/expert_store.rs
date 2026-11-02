@@ -268,6 +268,9 @@ pub struct ExpertMatrix {
     /// Managed-память из HostBuf для CPU-чтения плоха: страницы под GPU.
     /// 18.6 ГиБ дублируются только когда ядро реально считает на CPU.
     cpu_data: Option<Vec<u8>>,
+    /// VRAM-пул горячих экспертов и маска резидентов для router.
+    hot_pool: Option<cudarc::driver::CudaSlice<u8>>,
+    hot_mask: Option<cudarc::driver::CudaSlice<u8>>,
     table: cudarc::driver::CudaSlice<u64>,
 }
 
@@ -352,6 +355,8 @@ impl ExpertMatrix {
             expert_bytes,
             host,
             cpu_data,
+            hot_pool: None,
+            hot_mask: None,
             table,
         })
     }
@@ -369,6 +374,49 @@ impl ExpertMatrix {
         match &self.cpu_data {
             Some(d) => &d[expert * self.expert_bytes..(expert + 1) * self.expert_bytes],
             None => self.host.expert_slice(expert, self.expert_bytes),
+        }
+    }
+
+    /// Поднять выбранных экспертов в VRAM и переключить на них таблицу.
+    ///
+    /// Таблица указателей косвенная, поэтому граф перезахватывать не нужно:
+    /// ядро читает адрес эксперта из таблицы при каждом запуске.
+    pub fn enable_hot(
+        &mut self,
+        dev: &candle_core::CudaDevice,
+        experts: &[usize],
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        if experts.is_empty() || self.cpu_data.is_none() {
+            return Ok(());
+        }
+        let slots = experts.len();
+        let mut pool = unsafe { dev.alloc::<u8>(slots * self.expert_bytes)? };
+        let mut mask = vec![0u8; self.n_experts];
+        for (slot, &e) in experts.iter().enumerate() {
+            if e >= self.n_experts {
+                continue;
+            }
+            let src = self.expert_host_slice(e);
+            dev.memcpy_htod(
+                src,
+                &mut pool.slice_mut(slot * self.expert_bytes..(slot + 1) * self.expert_bytes),
+            )?;
+            mask[e] = 1;
+            let ptr = pool.device_ptr() + (slot * self.expert_bytes) as u64;
+            dev.memcpy_htod(&[ptr], &mut self.table.slice_mut(e..e + 1))?;
+        }
+        self.hot_mask = Some(dev.htod_copy(mask)?);
+        self.hot_pool = Some(pool);
+        Ok(())
+    }
+
+    /// Указатель на маску резидентов (0 — кэш выключен).
+    pub fn hot_mask_ptr(&self) -> cudarc::driver::sys::CUdeviceptr {
+        use cudarc::driver::DevicePtr;
+        match &self.hot_mask {
+            Some(m) => m.device_ptr(),
+            None => 0,
         }
     }
 
@@ -589,6 +637,22 @@ impl ExpertLayerStore {
         let g = (self.gate.n_experts, self.gate.n, self.gate.k);
         let d = (self.down.n_experts, self.down.n, self.down.k);
         (g, d)
+    }
+
+    /// Поднять горячие эксперты слоя в VRAM (все три матрицы).
+    pub fn enable_hot(
+        &mut self,
+        dev: &candle_core::CudaDevice,
+        experts: &[usize],
+    ) -> Result<()> {
+        self.gate.enable_hot(dev, experts)?;
+        self.up.enable_hot(dev, experts)?;
+        self.down.enable_hot(dev, experts)?;
+        Ok(())
+    }
+
+    pub fn hot_mask_ptr(&self) -> cudarc::driver::sys::CUdeviceptr {
+        self.gate.hot_mask_ptr()
     }
 
     pub fn pinned_bytes(&self) -> u64 {

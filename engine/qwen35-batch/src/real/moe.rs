@@ -860,6 +860,13 @@ impl Qwen35MoeBlock {
         };
         let trace_view = trace.as_ref().map(|(rt, layer)| (rt.as_ref(), *layer));
         let (ids_t, w_t) = if let Some((stage, seq)) = prepared {
+            let mask_ptr = match &self.routed {
+                ExpertWeights::Store(store) => store
+                    .lock()
+                    .expect("expert layer store")
+                    .hot_mask_ptr(),
+                _ => 0,
+            };
             gpu_softmax_topk_mapped(
                 cuda_dev,
                 &logits,
@@ -870,6 +877,7 @@ impl Qwen35MoeBlock {
                 xs,
                 stage,
                 seq,
+                mask_ptr,
             )?
         } else {
             gpu_softmax_topk(
@@ -1534,6 +1542,7 @@ fn gpu_softmax_topk_mapped(
     xs: &Tensor,
     stage: &'static AsyncCpuStage,
     seq: u32,
+    mask_ptr: cudarc::driver::sys::CUdeviceptr,
 ) -> Result<(Tensor, Tensor)> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     let (n_tokens, _) = logits.dims2()?;
@@ -1576,6 +1585,7 @@ fn gpu_softmax_topk_mapped(
     builder.arg(&host_weights);
     builder.arg(&host_xs);
     builder.arg(&export_flag);
+    builder.arg(&mask_ptr);
     builder.arg(&n_experts_i);
     builder.arg(&topk_i);
     builder.arg(&norm_i);

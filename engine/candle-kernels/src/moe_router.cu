@@ -564,6 +564,7 @@ extern "C" __global__ void moe_softmax_topk_warp_export_kernel(
     float* __restrict__ host_weights,
     float* __restrict__ host_xs,
     unsigned int* __restrict__ export_flag,
+    const unsigned char* __restrict__ resident_mask,
     int n_experts,
     int topk,
     int norm_topk_prob,
@@ -625,6 +626,29 @@ extern "C" __global__ void moe_softmax_topk_warp_export_kernel(
             sel_w[k] = best;
             sel_e[k] = best_e;
             selected_sum += best;
+        }
+
+        // Резиденты VRAM идут первыми: GPU берёт голову списка, CPU — хвост.
+        if (resident_mask != nullptr) {
+            float pw[WRT_EPT];
+            int pe[WRT_EPT];
+            int n_out = 0;
+            #pragma unroll
+            for (int k = 0; k < WRT_EPT; k++) {
+                if (k >= topk) break;
+                if (resident_mask[sel_e[k]]) { pw[n_out] = sel_w[k]; pe[n_out] = sel_e[k]; n_out++; }
+            }
+            #pragma unroll
+            for (int k = 0; k < WRT_EPT; k++) {
+                if (k >= topk) break;
+                if (!resident_mask[sel_e[k]]) { pw[n_out] = sel_w[k]; pe[n_out] = sel_e[k]; n_out++; }
+            }
+            #pragma unroll
+            for (int k = 0; k < WRT_EPT; k++) {
+                if (k >= topk) break;
+                sel_w[k] = pw[k];
+                sel_e[k] = pe[k];
+            }
         }
 
         const float inv_sel =

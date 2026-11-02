@@ -7968,6 +7968,25 @@ impl ModelWeights {
                             )?,
                         },
                     ));
+                    // Статический набор горячих экспертов: файл вида
+                    // "layer,e1,e2,..." по строке на слой.
+                    if let Ok(path) = std::env::var("MOE_HOT_SET") {
+                        if let Ok(text) = std::fs::read_to_string(&path) {
+                            for line in text.lines() {
+                                let mut it = line.split(',');
+                                let layer = it.next().and_then(|v| v.trim().parse::<usize>().ok());
+                                if layer == Some(layer_idx) {
+                                    let experts: Vec<usize> =
+                                        it.filter_map(|v| v.trim().parse().ok()).collect();
+                                    store
+                                        .lock()
+                                        .expect("expert layer store")
+                                        .enable_hot(cuda_dev, &experts)?;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     let runtime = match moe_runtime_once.get() {
                         Some(rt) => rt.clone(),
                         None => {
