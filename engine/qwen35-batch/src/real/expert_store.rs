@@ -393,8 +393,6 @@ impl ExpertMatrix {
         let slots = experts.len();
         let mut pool = unsafe { dev.alloc::<u8>(slots * self.expert_bytes)? };
         let mut mask = vec![0u8; self.n_experts];
-        let stream = dev.cuda_stream();
-        let (base, _guard) = pool.device_ptr(&stream);
         for (slot, &e) in experts.iter().enumerate() {
             if e >= self.n_experts {
                 continue;
@@ -405,6 +403,13 @@ impl ExpertMatrix {
                 &mut pool.slice_mut(slot * self.expert_bytes..(slot + 1) * self.expert_bytes),
             )?;
             mask[e] = 1;
+        }
+        let stream = dev.cuda_stream();
+        let (base, _guard) = pool.device_ptr(&stream);
+        for (slot, &e) in experts.iter().enumerate() {
+            if e >= self.n_experts {
+                continue;
+            }
             let ptr = base + (slot * self.expert_bytes) as u64;
             dev.memcpy_htod(&[ptr], &mut self.table.slice_mut(e..e + 1))?;
         }
@@ -416,11 +421,11 @@ impl ExpertMatrix {
     }
 
     /// Указатель на маску резидентов (0 — кэш выключен).
-    pub fn hot_mask_ptr(&self) -> cudarc::driver::sys::CUdeviceptr {
+    pub fn hot_mask_ptr(&self, dev: &candle_core::CudaDevice) -> cudarc::driver::sys::CUdeviceptr {
         use cudarc::driver::DevicePtr;
         match &self.hot_mask {
             Some(m) => {
-                let stream = m.device().cuda_stream();
+                let stream = dev.cuda_stream();
                 let (ptr, _guard) = m.device_ptr(&stream);
                 ptr
             }
@@ -659,8 +664,8 @@ impl ExpertLayerStore {
         Ok(())
     }
 
-    pub fn hot_mask_ptr(&self) -> cudarc::driver::sys::CUdeviceptr {
-        self.gate.hot_mask_ptr()
+    pub fn hot_mask_ptr(&self, dev: &candle_core::CudaDevice) -> cudarc::driver::sys::CUdeviceptr {
+        self.gate.hot_mask_ptr(dev)
     }
 
     pub fn pinned_bytes(&self) -> u64 {

@@ -864,7 +864,7 @@ impl Qwen35MoeBlock {
                 ExpertWeights::Store(store) => store
                     .lock()
                     .expect("expert layer store")
-                    .hot_mask_ptr(),
+                    .hot_mask_ptr(cuda_dev),
                 _ => 0,
             };
             gpu_softmax_topk_mapped(
