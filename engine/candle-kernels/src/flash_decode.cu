@@ -881,54 +881,6 @@ extern "C" __global__ void flash_decode_paged_gqa_mma_partial_q8(
 #endif
 }
 
-// Q8-вариант загрузчика: те же 16 строк и тот же layout shared, но из
-// int8-пула. На строку приходится один масштаб (page_row, kv_head), поэтому
-// трафик ровно вдвое меньше, чем у F16: 128 байт на строку вместо 256.
-__device__ __forceinline__ void fd_load_pool_tile16_q8(
-    __half* __restrict__ dst,
-    const signed char* __restrict__ pool,
-    const __half* __restrict__ scales,
-    const unsigned int* __restrict__ bt,
-    unsigned int n_kv,
-    unsigned int kvh,
-    unsigned int base,
-    unsigned int k_end,
-    unsigned int page_size,
-    int lane)
-{
-    constexpr int HD = 256;
-    constexpr int COL_GROUPS = HD / 64;
-    const int c = lane * 8;
-    if (base >= k_end) {
-        int4 zero = make_int4(0, 0, 0, 0);
-        #pragma unroll
-        for (int r = 0; r < 16; ++r) {
-            *reinterpret_cast<int4*>(&dst[fd_mma_smem_idx(r, c, COL_GROUPS)]) = zero;
-        }
-        return;
-    }
-    const unsigned int page = bt[base / page_size];
-    const unsigned int phys_base = page * page_size + base % page_size;
-    const unsigned int rows = min(16u, k_end - base);
-    #pragma unroll
-    for (unsigned int r = 0; r < 16; ++r) {
-        __half* d = &dst[fd_mma_smem_idx((int)r, c, COL_GROUPS)];
-        if (r < rows) {
-            const size_t row = (size_t)(phys_base + r);
-            const float sc = __half2float(scales[row * n_kv + kvh]);
-            const signed char* src = pool + (row * n_kv + kvh) * (size_t)HD + c;
-            __half tmp[8];
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                tmp[i] = __float2half_rn((float)src[i] * sc);
-            }
-            *reinterpret_cast<int4*>(d) = *reinterpret_cast<int4*>(tmp);
-        } else {
-            *reinterpret_cast<int4*>(d) = make_int4(0, 0, 0, 0);
-        }
-    }
-}
-
 // GQA-свёрнутая варианта partial-ядра: один CTA обслуживает все Q-головы
 // одной KV-головы. K/V tile загружается в shared один раз и переиспользуется
 // восьмью warp'ами; partials сохраняют прежний layout [B, n_head, splits, 2+hd],
