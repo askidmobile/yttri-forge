@@ -4389,11 +4389,13 @@ impl GatedAttentionLayer {
             out
         } else {
             let _ = &seqlens_q;
-            crate::real::flash_decode_cuda::dispatch_flash_decode_paged(
+            crate::real::flash_decode_cuda::dispatch_flash_decode_paged_scaled(
                 q_f16.device().as_cuda_device()?,
                 &q_f16,
                 &pool.k_pool,
                 &pool.v_pool,
+                pool.k_scale.as_ref(),
+                pool.v_scale.as_ref(),
                 &seqlens_k,
                 &block_table,
                 scale,
@@ -4608,11 +4610,13 @@ impl GatedAttentionLayer {
                 let bt = block_table
                     .broadcast_as((seq_len, ctx.max_blocks))?
                     .contiguous()?;
-                crate::real::flash_decode_cuda::dispatch_flash_decode_paged(
+                crate::real::flash_decode_cuda::dispatch_flash_decode_paged_scaled(
                     q_f16.device().as_cuda_device()?,
                     &q_f16,
                     &pool.k_pool,
                     &pool.v_pool,
+                    pool.k_scale.as_ref(),
+                    pool.v_scale.as_ref(),
                     &seqlens_k,
                     &bt,
                     scale,
@@ -4808,11 +4812,13 @@ impl GatedAttentionLayer {
         } else if turing_prefill {
             let seqlens_k = ctx.seqlens_k_for_verify(seq_len)?;
             let block_table = block_table.broadcast_as((seq_len, ctx.max_blocks))?.contiguous()?;
-            let row_out = crate::real::flash_decode_cuda::dispatch_flash_decode_paged(
+            let row_out = crate::real::flash_decode_cuda::dispatch_flash_decode_paged_scaled(
                 q_f16.device().as_cuda_device()?,
                 &q_f16,
                 &pool.k_pool,
                 &pool.v_pool,
+                pool.k_scale.as_ref(),
+                pool.v_scale.as_ref(),
                 &seqlens_k,
                 &block_table,
                 scale,

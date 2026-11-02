@@ -56,8 +56,17 @@ pub fn dispatch_flash_decode(
     let (k_st, k_lay) = k16.storage_and_layout();
     let (v_st, v_lay) = v16.storage_and_layout();
     let q_v = view_f16(&q_st, q_lay.start_offset())?;
-    let k_v = view_f16(&k_st, k_lay.start_offset())?;
-    let v_v = view_f16(&v_st, v_lay.start_offset())?;
+    let (k_v, v_v) = if q8 {
+        (
+            view_u8(&k_st, k_lay.start_offset())?,
+            view_u8(&v_st, v_lay.start_offset())?,
+        )
+    } else {
+        (
+            view_f16(&k_st, k_lay.start_offset())?,
+            view_f16(&v_st, v_lay.start_offset())?,
+        )
+    };
 
     // S: ~1024 токена на чанк, в рамках [8, 64].
     let splits = (kv_len as u32).div_ceil(1024).clamp(8, 64);
@@ -126,16 +135,37 @@ pub fn dispatch_flash_decode_paged(
     block_table: &Tensor,
     scale: f32,
 ) -> Result<Tensor> {
+    dispatch_flash_decode_paged_scaled(
+        dev, q, k_pool, v_pool, None, None, seqlens_k, block_table, scale,
+    )
+}
+
+/// Q8-вариант: пулы хранят int8, масштабы — по строке на (page_row, kv_head).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_flash_decode_paged_scaled(
+    dev: &CudaDevice,
+    q: &Tensor,
+    k_pool: &Tensor,
+    v_pool: &Tensor,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+    seqlens_k: &Tensor,
+    block_table: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let q8 = k_scale.is_some() && v_scale.is_some();
     use super::paged_kv_cuda::{tensor_cuda_ptr, PAGE_SIZE};
 
     let (b_sz, n_head, hd) = q.dims3()?;
     let (pool_blocks, page_size, n_kv, pool_hd) = k_pool.dims4()?;
     let (table_rows, table_stride) = block_table.dims2()?;
     if q.dtype() != candle_core::DType::F16
-        || k_pool.dtype() != candle_core::DType::F16
-        || v_pool.dtype() != candle_core::DType::F16
+        || (!q8 && (k_pool.dtype() != candle_core::DType::F16
+            || v_pool.dtype() != candle_core::DType::F16))
+        || (q8 && (k_pool.dtype() != candle_core::DType::U8
+            || v_pool.dtype() != candle_core::DType::U8))
     {
-        candle_core::bail!("paged flash-decode requires F16 q/k/v");
+        candle_core::bail!("paged flash-decode: неподходящие dtype q/k/v (q8={q8})");
     }
     if b_sz == 0 || table_rows < b_sz || seqlens_k.elem_count() < b_sz + 1 {
         candle_core::bail!("paged flash-decode batch/layout mismatch");
@@ -192,7 +222,9 @@ pub fn dispatch_flash_decode_paged(
     let mut out = unsafe { dev.alloc::<half::f16>(b_sz * n_head * hd)? };
     {
         let func = dev.get_or_load_func(
-            if gqa_mma {
+            if gqa_mma && q8 {
+                "flash_decode_paged_gqa_mma_partial_q8"
+            } else if gqa_mma {
                 "flash_decode_paged_gqa_mma_partial"
             } else if gqa_fold {
                 "flash_decode_paged_gqa_partial"
@@ -214,6 +246,12 @@ pub fn dispatch_flash_decode_paged(
         builder.arg(&q_v);
         builder.arg(&k_v);
         builder.arg(&v_v);
+        if q8 {
+            let ks = view_f16_opt(k_scale)?;
+            let vs = view_f16_opt(v_scale)?;
+            builder.arg(&ks);
+            builder.arg(&vs);
+        }
         builder.arg(&seqlens_ptr);
         builder.arg(&block_table_ptr);
         builder.arg(&mut partials);
@@ -581,6 +619,25 @@ pub fn check_nonfinite_f32(dev: &CudaDevice, tag: &str, t: &Tensor) -> Result<()
     drop(st);
     eprintln!("[nancheck] call={call} tag={tag} n={}", host[0]);
     Ok(())
+}
+
+fn view_u8<'a>(
+    st: &'a candle_core::Storage,
+    offset: usize,
+) -> Result<cudarc::driver::CudaView<'a, u8>> {
+    match st {
+        Storage::Cuda(cs) => Ok(cs.as_cuda_slice::<u8>()?.slice(offset..)),
+        _ => candle_core::bail!("flash_decode: expected CUDA u8 storage"),
+    }
+}
+
+fn view_f16_opt(t: Option<&Tensor>) -> Result<cudarc::driver::CudaView<'_, half::f16>> {
+    let t = t.ok_or_else(|| candle_core::Error::Msg("нет тензора масштабов".into()))?;
+    let (st, lay) = t.storage_and_layout();
+    match &*st {
+        Storage::Cuda(cs) => Ok(cs.as_cuda_slice::<half::f16>()?.slice(lay.start_offset()..)),
+        _ => candle_core::bail!("flash_decode: expected CUDA f16 storage"),
+    }
 }
 
 fn view_f16<'a>(
