@@ -421,8 +421,10 @@ impl MoeGpuGraphState {
         ids: &Tensor,
         weights: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        let ids = ids.narrow(1, 0, self.gpu_experts)?.contiguous()?;
-        let weights = weights.narrow(1, 0, self.gpu_experts)?.contiguous()?;
+        // batch=1: первые gpu_experts элементов строки уже лежат подряд,
+        // поэтому contiguous() только добавлял аллокацию и копию на слой.
+        let ids = ids.narrow(1, 0, self.gpu_experts)?;
+        let weights = weights.narrow(1, 0, self.gpu_experts)?;
         self.x.slice_set(xs, 0, 0)?;
         self.ids.slice_set(&ids, 0, 0)?;
         self.weights.slice_set(&weights, 0, 0)?;
