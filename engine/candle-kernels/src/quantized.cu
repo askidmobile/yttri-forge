@@ -7354,7 +7354,7 @@ __device__ void indexed_moe_forward_dual(
     float * out1 = out1_all + task_id * n;
     float * out2 = out2_all + task_id * n;
 
-    constexpr int nwarps = 4;
+    constexpr int nwarps = NWARPS;
     constexpr int rows_per_cuda_block = 1;
     const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
     const int row0 = rows_per_cuda_block * blockIdx.x;
