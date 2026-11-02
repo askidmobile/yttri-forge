@@ -110,19 +110,7 @@ fn numa_dup_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("MOE_CPU_NUMA_DUP").as_deref() == Ok("1"))
 }
 
-/// `mbind` не входит в экспорт libc-крейта для glibc — объявляем сами.
-#[cfg(all(feature = "cuda", target_os = "linux"))]
-unsafe extern "C" {
-    fn mbind(
-        addr: *mut core::ffi::c_void,
-        len: usize,
-        mode: core::ffi::c_int,
-        nodemask: *const u64,
-        maxnode: u64,
-        flags: u32,
-    ) -> core::ffi::c_int;
-}
-
+/// `mbind` живёт в libnuma, а не в glibc — вызываем syscall напрямую.
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 const MPOL_BIND: core::ffi::c_int = 2;
 
@@ -137,13 +125,14 @@ fn bind_node(buf: &mut [u8], node: usize) {
         let mut mask = [0u64; 16];
         mask[node / 64] |= 1u64 << (node % 64);
         unsafe {
-            mbind(
+            libc::syscall(
+                libc::SYS_mbind,
                 buf.as_mut_ptr() as *mut core::ffi::c_void,
-                buf.len(),
-                MPOL_BIND,
+                buf.len() as libc::c_ulong,
+                MPOL_BIND as libc::c_ulong,
                 mask.as_ptr(),
-                1024,
-                0,
+                1024u64 as libc::c_ulong,
+                0u64 as libc::c_ulong,
             );
         }
     }
