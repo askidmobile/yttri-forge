@@ -138,6 +138,45 @@ fn bind_node(buf: &mut [u8], node: usize) {
     }
 }
 
+/// Создать глобальный Rayon-пул с привязкой каждого потока к своему CPU.
+///
+/// Без привязки потоки мигрируют между сокетами, и «локальная» копия весов
+/// половину времени читается через UPI. Вызывать до первого параллельного
+/// участка.
+#[cfg(feature = "cuda")]
+pub fn init_numa_rayon() {
+    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    DONE.get_or_init(|| {
+        if !numa_dup_enabled() {
+            return;
+        }
+        let n = std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(72);
+        let res = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .start_handler(move |i| {
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    let cpu = i % n;
+                    let mut set = [0u64; 16];
+                    set[cpu / 64] |= 1u64 << (cpu % 64);
+                    libc::sched_setaffinity(
+                        0,
+                        128,
+                        set.as_ptr() as *const libc::cpu_set_t,
+                    );
+                }
+                let _ = i;
+            })
+            .build_global();
+        match res {
+            Ok(()) => log::info!("[moe] NUMA-пул: {n} потоков привязаны к CPU"),
+            Err(e) => log::warn!("[moe] NUMA-пул не создан: {e}"),
+        }
+    });
+}
+
 /// NUMA-узел CPU, на котором сейчас исполняется поток.
 #[cfg(feature = "cuda")]
 pub fn current_numa_node() -> usize {
@@ -351,6 +390,7 @@ impl ExpertMatrix {
         start: usize,
         size: usize,
     ) -> Result<Self> {
+        init_numa_rayon();
         if !matches!(
             dtype,
             GgmlDType::IQ2S
