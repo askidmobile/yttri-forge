@@ -7968,6 +7968,10 @@ impl ModelWeights {
                             )?,
                         },
                     ));
+                    log::info!(
+                        "[moe] store layer {layer_idx}, MOE_HOT_SET={:?}",
+                        std::env::var("MOE_HOT_SET").ok()
+                    );
                     // Статический набор горячих экспертов: файл вида
                     // "layer,e1,e2,..." по строке на слой.
                     if let Ok(path) = std::env::var("MOE_HOT_SET") {
