@@ -1567,6 +1567,9 @@ fn gpu_softmax_topk_mapped(
     let host_weights = stage.mapped_weights.dev_ptr();
     let host_xs = stage.mapped_xs.dev_ptr();
     let export_flag = stage.export_flag.dev_ptr;
+    if std::env::var("YF_MASK_DBG").as_deref() == Ok("1") {
+        eprintln!("[mask-dbg] ptr={mask_ptr}");
+    }
     let func = dev.get_or_load_func(
         "moe_softmax_topk_warp_export_kernel",
         &candle_kernels::MOE_ROUTER,
