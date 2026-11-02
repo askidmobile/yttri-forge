@@ -271,6 +271,9 @@ pub struct ExpertMatrix {
     /// VRAM-пул горячих экспертов и маска резидентов для router.
     hot_pool: Option<cudarc::driver::CudaSlice<u8>>,
     hot_mask: Option<cudarc::driver::CudaSlice<u8>>,
+    /// Адрес пула и слот каждого эксперта (для пересборки таблицы).
+    hot_base: u64,
+    hot_slots: Vec<Option<usize>>,
     table: cudarc::driver::CudaSlice<u64>,
 }
 
@@ -357,6 +360,8 @@ impl ExpertMatrix {
             cpu_data,
             hot_pool: None,
             hot_mask: None,
+            hot_base: 0,
+            hot_slots: Vec::new(),
             table,
         })
     }
@@ -418,6 +423,14 @@ impl ExpertMatrix {
         }
         let mut mask_dev = unsafe { dev.alloc::<u8>(self.n_experts)? };
         dev.memcpy_htod(&mask, &mut mask_dev)?;
+        let mut slots_map = vec![None; self.n_experts];
+        for (slot, &e) in experts.iter().enumerate() {
+            if e < self.n_experts {
+                slots_map[e] = Some(slot);
+            }
+        }
+        self.hot_slots = slots_map;
+        self.hot_base = base;
         self.hot_mask = Some(mask_dev);
         self.hot_pool = Some(pool);
         Ok(())
@@ -444,7 +457,15 @@ impl ExpertMatrix {
     /// Таблица по умолчанию: все эксперты читаются из pinned host-памяти
     /// (zero-copy декод, FR-004).
     fn fill_host_table(&mut self, dev: &candle_core::CudaDevice) -> Result<()> {
-        let host_vec = host_table_entries(self.host.dev_ptr(), self.n_experts, self.expert_bytes);
+        let mut host_vec =
+            host_table_entries(self.host.dev_ptr(), self.n_experts, self.expert_bytes);
+        if self.hot_base != 0 {
+            for (e, slot) in self.hot_slots.iter().enumerate() {
+                if let Some(slot) = slot {
+                    host_vec[e] = self.hot_base + (*slot * self.expert_bytes) as u64;
+                }
+            }
+        }
         dev.memcpy_htod(&host_vec, &mut self.table)?;
         Ok(())
     }
