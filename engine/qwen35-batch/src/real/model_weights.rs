@@ -7968,8 +7968,8 @@ impl ModelWeights {
                             )?,
                         },
                     ));
-                    log::info!(
-                        "[moe] store layer {layer_idx}, MOE_HOT_SET={:?}",
+                    eprintln!(
+                        "[moe-hot] store layer {layer_idx}, MOE_HOT_SET={:?}",
                         std::env::var("MOE_HOT_SET").ok()
                     );
                     // Статический набор горячих экспертов: файл вида
@@ -7982,8 +7982,8 @@ impl ModelWeights {
                                 if layer == Some(layer_idx) {
                                     let experts: Vec<usize> =
                                         it.filter_map(|v| v.trim().parse().ok()).collect();
-                                    log::info!(
-                                        "[moe] hot: layer {layer_idx}, слотов {}",
+                                    eprintln!(
+                                        "[moe-hot] layer {layer_idx}: слотов {}",
                                         experts.len()
                                     );
                                     store
