@@ -2012,10 +2012,20 @@ mod moe_prof {
 
     pub static CALLS: AtomicU64 = AtomicU64::new(0);
     pub static NS: AtomicU64 = AtomicU64::new(0);
+    pub static WCALLS: AtomicU64 = AtomicU64::new(0);
+    pub static WNS: AtomicU64 = AtomicU64::new(0);
 
     pub fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("YF_MOE_PROF").as_deref() == Ok("1"))
+    }
+
+    pub fn record_worker(elapsed_ns: u64) {
+        WNS.fetch_add(elapsed_ns, Ordering::Relaxed);
+        if WCALLS.fetch_add(1, Ordering::Relaxed) % 41 == 40 {
+            let ns = WNS.swap(0, Ordering::Relaxed);
+            eprintln!("[moe-prof] cpu_worker_per_token={:.3}ms", ns as f64 / 1e6);
+        }
     }
 
     pub fn record(elapsed_ns: u64) {
@@ -2059,6 +2069,9 @@ fn async_cpu_sender() -> &'static std::sync::mpsc::Sender<AsyncCpuJob> {
             .name("moe-cpu-async".into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
+                    let base = std::time::Instant::now();
+                    let prof_on = moe_prof::on();
+                    let t_cpu_start = std::sync::atomic::AtomicU64::new(0);
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if let Some(copy_done) = job.copy_done.as_ref() {
                             copy_done.synchronize().map_err(candle_core::Error::wrap)?;
@@ -2074,6 +2087,10 @@ fn async_cpu_sender() -> &'static std::sync::mpsc::Sender<AsyncCpuJob> {
                                 }
                                 std::hint::spin_loop();
                             }
+                        }
+                        if prof_on {
+                            t_cpu_start.store(base.elapsed().as_nanos() as u64,
+                                              std::sync::atomic::Ordering::Relaxed);
                         }
                         let ids = unsafe {
                             std::slice::from_raw_parts(job.ids as *const u32, job.k_topk)
@@ -2097,6 +2114,13 @@ fn async_cpu_sender() -> &'static std::sync::mpsc::Sender<AsyncCpuJob> {
                             )
                         })
                     }));
+                    if prof_on {
+                        let s0 = t_cpu_start.load(std::sync::atomic::Ordering::Relaxed);
+                        if s0 > 0 {
+                            let now = base.elapsed().as_nanos() as u64;
+                            moe_prof::record_worker(now.saturating_sub(s0));
+                        }
+                    }
                     match outcome {
                         Ok(Ok(result)) => unsafe {
                             std::ptr::copy_nonoverlapping(
