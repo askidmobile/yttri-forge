@@ -534,3 +534,123 @@ extern "C" __global__ void moe_softmax_topk_warp_kernel(
         }
     }
 }
+
+// Финальная сумма CPU-routed + GPU-routed + shared читает CPU output
+// непосредственно из mapped host-памяти, без промежуточного H2D.
+extern "C" __global__ void moe_merge_mapped(
+    float* __restrict__ out,
+    const float* __restrict__ gpu_routed,
+    const float* __restrict__ shared,
+    const float* __restrict__ cpu_routed,
+    int n_embd)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < n_embd;
+         i += blockDim.x * gridDim.x) {
+        // Порядок как в прежнем пути: (cpu + gpu) + shared.
+        out[i] = cpu_routed[i] + gpu_routed[i] + shared[i];
+    }
+}
+
+// Один warp считает стабильный softmax+top-k, остальные потоки блока
+// экспортируют activation в mapped host. ids/weights и xs становятся
+// доступны CPU тем же запуском, без отдельного export-kernel.
+extern "C" __global__ void moe_softmax_topk_warp_export_kernel(
+    const float* __restrict__ logits,
+    int32_t* __restrict__ expert_ids,
+    float* __restrict__ weights,
+    const float* __restrict__ xs,
+    unsigned int* __restrict__ host_ids,
+    float* __restrict__ host_weights,
+    float* __restrict__ host_xs,
+    unsigned int* __restrict__ export_flag,
+    int n_experts,
+    int topk,
+    int norm_topk_prob,
+    int n_embd,
+    unsigned int seq)
+{
+    const int tid = threadIdx.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    if (tid < WARP_SIZE) {
+        float wt[WRT_EPT];
+        #pragma unroll
+        for (int i = 0; i < WRT_EPT; i++) {
+            const int e = lane + i * WARP_SIZE;
+            wt[i] = (e < n_experts) ? __ldg(&logits[e]) : -INFINITY;
+        }
+        #pragma unroll
+        for (int i = 0; i < WRT_EPT; i++) if (__isnanf(wt[i])) wt[i] = -FLT_MAX;
+
+        float max_val = -INFINITY;
+        #pragma unroll
+        for (int i = 0; i < WRT_EPT; i++) max_val = fmaxf(max_val, wt[i]);
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1)
+            max_val = fmaxf(max_val, __shfl_xor_sync(0xffffffffu, max_val, m));
+
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < WRT_EPT; i++) {
+            const float e = expf(wt[i] - max_val);
+            wt[i] = e;
+            sum += e;
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, m);
+        const float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+        #pragma unroll
+        for (int i = 0; i < WRT_EPT; i++) wt[i] *= inv_sum;
+
+        float sel_w[WRT_EPT];
+        int sel_e[WRT_EPT];
+        float selected_sum = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < WRT_EPT; k++) {
+            if (k >= topk) break;
+            float best = wt[0];
+            int best_e = lane;
+            #pragma unroll
+            for (int i = 1; i < WRT_EPT; i++) {
+                const int e = lane + i * WARP_SIZE;
+                if (e < n_experts && wt[i] > best) { best = wt[i]; best_e = e; }
+            }
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, best, m);
+                const int oe = __shfl_xor_sync(0xffffffffu, best_e, m);
+                if (ov > best || (ov == best && oe < best_e)) { best = ov; best_e = oe; }
+            }
+            if ((best_e & (WARP_SIZE - 1)) == lane) wt[best_e / WARP_SIZE] = -INFINITY;
+            sel_w[k] = best;
+            sel_e[k] = best_e;
+            selected_sum += best;
+        }
+
+        const float inv_sel =
+            (norm_topk_prob && selected_sum > 0.0f) ? 1.0f / selected_sum : 1.0f;
+        #pragma unroll
+        for (int k = 0; k < WRT_EPT; k++) {
+            if (k >= topk) break;
+            if (lane == 0) {
+                const float w = sel_w[k] * inv_sel;
+                expert_ids[k] = sel_e[k];
+                weights[k] = w;
+                host_ids[k] = sel_e[k];
+                host_weights[k] = w;
+            }
+        }
+    }
+
+    for (int i = tid; i < n_embd; i += blockDim.x) {
+        host_xs[i] = xs[i];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        // Один писатель и один читатель: системного fence достаточно,
+        // атомики на mapped-памяти CUDA не гарантирует.
+        __threadfence_system();
+        *export_flag = seq;
+    }
+}
