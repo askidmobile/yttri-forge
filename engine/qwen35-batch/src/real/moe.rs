@@ -2110,7 +2110,14 @@ fn async_cpu_sender() -> &'static std::sync::mpsc::Sender<AsyncCpuJob> {
                         let xs = unsafe {
                             std::slice::from_raw_parts(job.xs as *const f32, job.n_embd)
                         };
+                        let t_lock = std::time::Instant::now();
                         let store = job.store.lock().expect("expert layer store");
+                        if prof_on {
+                            let ns = t_lock.elapsed().as_nanos() as u64;
+                            if ns > 20_000 {
+                                eprintln!("[moe-prof] lock_wait={:.3}ms", ns as f64 / 1e6);
+                            }
+                        }
                         // Весь слой входит в существующий Rayon pool один раз:
                         // внутренние параллельные фазы переиспользуют workers.
                         rayon::scope(|_| {
