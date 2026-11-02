@@ -404,8 +404,11 @@ impl ExpertMatrix {
             )?;
             mask[e] = 1;
         }
-        let stream = dev.cuda_stream();
-        let (base, _guard) = pool.device_ptr(&stream);
+        let base = {
+            let stream = dev.cuda_stream();
+            let (ptr, _guard) = pool.device_ptr(&stream);
+            ptr
+        };
         for (slot, &e) in experts.iter().enumerate() {
             if e >= self.n_experts {
                 continue;
