@@ -56,17 +56,8 @@ pub fn dispatch_flash_decode(
     let (k_st, k_lay) = k16.storage_and_layout();
     let (v_st, v_lay) = v16.storage_and_layout();
     let q_v = view_f16(&q_st, q_lay.start_offset())?;
-    let (k_v, v_v) = if q8 {
-        (
-            view_u8(&k_st, k_lay.start_offset())?,
-            view_u8(&v_st, v_lay.start_offset())?,
-        )
-    } else {
-        (
-            view_f16(&k_st, k_lay.start_offset())?,
-            view_f16(&v_st, v_lay.start_offset())?,
-        )
-    };
+    let k_v = view_f16(&k_st, k_lay.start_offset())?;
+    let v_v = view_f16(&v_st, v_lay.start_offset())?;
 
     // S: ~1024 токена на чанк, в рамках [8, 64].
     let splits = (kv_len as u32).div_ceil(1024).clamp(8, 64);
@@ -212,8 +203,6 @@ pub fn dispatch_flash_decode_paged_scaled(
     let (k_st, k_lay) = k_pool.storage_and_layout();
     let (v_st, v_lay) = v_pool.storage_and_layout();
     let q_v = view_f16(&q_st, q_lay.start_offset())?;
-    let k_v = view_f16(&k_st, k_lay.start_offset())?;
-    let v_v = view_f16(&v_st, v_lay.start_offset())?;
     let seqlens_ptr = tensor_cuda_ptr(seqlens_k)?;
     let block_table_ptr = tensor_cuda_ptr(block_table)?;
 
@@ -242,21 +231,39 @@ pub fn dispatch_flash_decode_paged_scaled(
             block_dim: (if gqa_mma { 32 } else if gqa_fold { 256 } else { 128 }, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut builder = func.builder();
-        builder.arg(&q_v);
-        builder.arg(&k_v);
-        builder.arg(&v_v);
         if q8 {
-            let ks = view_f16_opt(k_scale)?;
-            let vs = view_f16_opt(v_scale)?;
+            let k_u8 = view_u8(&k_st, k_lay.start_offset())?;
+            let v_u8 = view_u8(&v_st, v_lay.start_offset())?;
+            let ks_t = k_scale.expect("k_scale");
+            let vs_t = v_scale.expect("v_scale");
+            let (ks_st, ks_lay) = ks_t.storage_and_layout();
+            let (vs_st, vs_lay) = vs_t.storage_and_layout();
+            let ks = view_f16(&ks_st, ks_lay.start_offset())?;
+            let vs = view_f16(&vs_st, vs_lay.start_offset())?;
+            let mut builder = func.builder();
+            builder.arg(&q_v);
+            builder.arg(&k_u8);
+            builder.arg(&v_u8);
             builder.arg(&ks);
             builder.arg(&vs);
+            builder.arg(&seqlens_ptr);
+            builder.arg(&block_table_ptr);
+            builder.arg(&mut partials);
+            builder.arg(&params);
+            unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        } else {
+            let k_f16 = view_f16(&k_st, k_lay.start_offset())?;
+            let v_f16 = view_f16(&v_st, v_lay.start_offset())?;
+            let mut builder = func.builder();
+            builder.arg(&q_v);
+            builder.arg(&k_f16);
+            builder.arg(&v_f16);
+            builder.arg(&seqlens_ptr);
+            builder.arg(&block_table_ptr);
+            builder.arg(&mut partials);
+            builder.arg(&params);
+            unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
         }
-        builder.arg(&seqlens_ptr);
-        builder.arg(&block_table_ptr);
-        builder.arg(&mut partials);
-        builder.arg(&params);
-        unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
     {
         let func = dev.get_or_load_func(
@@ -628,15 +635,6 @@ fn view_u8<'a>(
     match st {
         Storage::Cuda(cs) => Ok(cs.as_cuda_slice::<u8>()?.slice(offset..)),
         _ => candle_core::bail!("flash_decode: expected CUDA u8 storage"),
-    }
-}
-
-fn view_f16_opt(t: Option<&Tensor>) -> Result<cudarc::driver::CudaView<'_, half::f16>> {
-    let t = t.ok_or_else(|| candle_core::Error::Msg("нет тензора масштабов".into()))?;
-    let (st, lay) = t.storage_and_layout();
-    match &*st {
-        Storage::Cuda(cs) => Ok(cs.as_cuda_slice::<half::f16>()?.slice(lay.start_offset()..)),
-        _ => candle_core::bail!("flash_decode: expected CUDA f16 storage"),
     }
 }
 
