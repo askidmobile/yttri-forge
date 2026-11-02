@@ -634,6 +634,7 @@ impl Qwen35MoeBlock {
         gpu_experts: usize,
         prepared: Option<(&'static AsyncCpuStage, u32)>,
     ) -> Result<Tensor> {
+        let prof = moe_prof::on().then(std::time::Instant::now);
         if let Some(error) = async_cpu_error().lock().expect("async CPU error").take() {
             candle_core::bail!("CPU-MoE async: {error}");
         }
@@ -748,6 +749,9 @@ impl Qwen35MoeBlock {
             builder.arg(&cpu);
             builder.arg(&n_i);
             unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+            if let Some(t0) = prof {
+                moe_prof::record(t0.elapsed().as_nanos() as u64);
+            }
             Ok(routed)
         } else {
             let dst = crate::real::paged_kv_cuda::tensor_cuda_ptr(&routed)?;
@@ -762,7 +766,11 @@ impl Qwen35MoeBlock {
             if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 candle_core::bail!("CPU-MoE async H2D failed: {rc:?}");
             }
-            routed.broadcast_add(&gpu_routed)?.broadcast_add(&shared)
+            let out = routed.broadcast_add(&gpu_routed)?.broadcast_add(&shared)?;
+            if let Some(t0) = prof {
+                moe_prof::record(t0.elapsed().as_nanos() as u64);
+            }
+            Ok(out)
         }
     }
 
@@ -1990,6 +1998,33 @@ struct AsyncCpuJob {
     k_topk: usize,
     n_embd: usize,
     gpu_experts: usize,
+}
+
+/// Опциональный счётчик host-времени асинхронного MoE.
+///
+/// `YF_MOE_PROF=1` печатает сумму host-времени, потраченного в
+/// `forward_ptx_cuda_async` (router, постановка graph, wait и merge) на
+/// каждый полный токен из 41 слоя. Нужен, чтобы отличить стоимость
+/// постановки работы от времени исполнения на GPU.
+#[cfg(feature = "cuda")]
+mod moe_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("YF_MOE_PROF").as_deref() == Ok("1"))
+    }
+
+    pub fn record(elapsed_ns: u64) {
+        NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+        if CALLS.fetch_add(1, Ordering::Relaxed) % 41 == 40 {
+            let ns = NS.swap(0, Ordering::Relaxed);
+            eprintln!("[moe-prof] host_per_token={:.3}ms", ns as f64 / 1e6);
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
