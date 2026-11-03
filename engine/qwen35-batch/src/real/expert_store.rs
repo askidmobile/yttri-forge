@@ -460,10 +460,18 @@ impl ExpertMatrix {
         let mut host_vec =
             host_table_entries(self.host.dev_ptr(), self.n_experts, self.expert_bytes);
         if self.hot_base != 0 {
+            let mut n = 0;
             for (e, slot) in self.hot_slots.iter().enumerate() {
                 if let Some(slot) = slot {
                     host_vec[e] = self.hot_base + (*slot * self.expert_bytes) as u64;
+                    n += 1;
                 }
+            }
+            if std::env::var("YF_HOT_DBG").as_deref() == Ok("1") {
+                eprintln!(
+                    "[hot-dbg] table residents={n} base={} host={} e0={}",
+                    self.hot_base, self.host.dev_ptr(), host_vec[0]
+                );
             }
         }
         dev.memcpy_htod(&host_vec, &mut self.table)?;
