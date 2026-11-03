@@ -291,6 +291,7 @@ python3 scripts/bench/final_verify.py
 
 - **Уже в коде:** GGUF runtime, CUDA-оптимизации, серверные API, F16-сайдкар, упаковка и чтение `.ytf` v2
 - **Инструкция для пользователей:** [запуск Q4 MoE на RTX 2080 Ti](docs/guides/2026-11-03-rtx2080ti-35b-q4.md) — конфигурация, которая обгоняет llama.cpp на 128k и 256k
+- **Подключение агента:** [pi.dev через SSH-туннель](docs/guides/2026-11-03-pi-dev-remote-stand.md)
 - **Исследования и история решений:** [планы движка](docs/plans/), [исследования сервера](https://github.com/askidmobile/qwen36-server/tree/main/docs/research), [планы сервера](https://github.com/askidmobile/qwen36-server/tree/main/docs/plans), [замеры Q4 против llama.cpp](docs/research/2026-11-02-q4-128k-256k-vs-llama.md), [разбор Strata](docs/research/2026-11-03-strata-deepseek-5090.md)
 - **Пересмотренные идеи:** первоначальный этап W4A16 отмечен в [TASKS.md](TASKS.md) отменённым по результатам эксперимента. Ранний бриф не является обещанием внедрить этот этап или получить указанный в нём прирост
 
