@@ -1303,6 +1303,9 @@ fn indexed_moe_forward_dual_dispatch(
     let out2 = unsafe { dev.alloc::<f32>(outsize)? };
 
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+    if std::env::var("YF_MOE_GPU_PROF").as_deref() == Ok("1") {
+        eprintln!("[moe-gpu] launch n={n} k={k} topk={topk} dtype={w_dtype:?}");
+    }
     let cfg = cudarc::driver::LaunchConfig {
         grid_dim: (n as u32, batch as u32, topk as u32),
         block_dim: (WARP_SIZE as u32, 4, 1),
