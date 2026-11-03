@@ -2031,13 +2031,23 @@ fn async_cpu_sender() -> &'static std::sync::mpsc::Sender<AsyncCpuJob> {
                             let flag = unsafe {
                                 &*std::sync::atomic::AtomicU32::from_ptr(job.export_flag as *mut u32)
                             };
+                            // Флаг лежит в mapped-памяти: каждая проверка — это
+                            // чтение через PCIe. Частый spin на длинном контексте
+                            // забивает канал и мешает attention, поэтому после
+                            // короткой серии попыток отдаём CPU планировщику.
                             let deadline = std::time::Instant::now()
                                 + std::time::Duration::from_secs(5);
+                            let mut spins = 0u32;
                             while flag.load(std::sync::atomic::Ordering::Acquire) != job.seq {
                                 if std::time::Instant::now() > deadline {
                                     candle_core::bail!("CPU-MoE: export flag timeout");
                                 }
-                                std::hint::spin_loop();
+                                spins += 1;
+                                if spins & 0x3f == 0 {
+                                    std::thread::yield_now();
+                                } else {
+                                    std::hint::spin_loop();
+                                }
                             }
                         }
                         let ids = unsafe {
