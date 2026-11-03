@@ -2014,11 +2014,44 @@ fn async_cpu_next_seq() -> u32 {
     SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
+/// Держать Rayon-пул горячим.
+///
+/// Rayon паркует воркеры после ~1 мс простоя. На длинном контексте пауза
+/// между слоями приближается к этому порогу, и каждое пробуждение пула
+/// стоит десятки микросекунд. Фоновый пинг раз в 200 мкс не даёт потокам
+/// уснуть.
+#[cfg(feature = "cuda")]
+fn spawn_keepalive() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        if std::env::var("MOE_KEEPALIVE").as_deref() == Ok("0") {
+            return;
+        }
+        let n = rayon::current_num_threads().max(1);
+        let period_us = std::env::var("MOE_KEEPALIVE_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(50);
+        std::thread::Builder::new()
+            .name("moe-keepalive".into())
+            .spawn(move || loop {
+                rayon::scope(|s| {
+                    for _ in 0..n {
+                        s.spawn(|_| std::hint::spin_loop());
+                    }
+                });
+                std::thread::sleep(std::time::Duration::from_micros(period_us));
+            })
+            .ok();
+    });
+}
+
 #[cfg(feature = "cuda")]
 fn async_cpu_sender() -> &'static std::sync::mpsc::Sender<AsyncCpuJob> {
     static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<AsyncCpuJob>> =
         std::sync::OnceLock::new();
     SENDER.get_or_init(|| {
+        spawn_keepalive();
         let (tx, rx) = std::sync::mpsc::channel::<AsyncCpuJob>();
         std::thread::Builder::new()
             .name("moe-cpu-async".into())
