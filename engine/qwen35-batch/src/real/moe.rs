@@ -2028,6 +2028,10 @@ fn spawn_keepalive() {
             return;
         }
         let n = rayon::current_num_threads().max(1);
+        let period_us = std::env::var("MOE_KEEPALIVE_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(200);
         std::thread::Builder::new()
             .name("moe-keepalive".into())
             .spawn(move || loop {
@@ -2036,7 +2040,7 @@ fn spawn_keepalive() {
                         s.spawn(|_| std::hint::spin_loop());
                     }
                 });
-                std::thread::sleep(std::time::Duration::from_micros(200));
+                std::thread::sleep(std::time::Duration::from_micros(period_us));
             })
             .ok();
     });
